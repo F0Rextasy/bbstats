@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="rimGrad" x1="64" y1="8" x2="64" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#60A5FA" stop-opacity="0.55"/>
+      <stop offset="50%" stop-color="#334155" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#0F172A" stop-opacity="0.8"/>
+    </linearGradient>
+    <linearGradient id="secondB" x1="72" y1="30" x2="98" y2="96" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#34D399"/>
+      <stop offset="100%" stop-color="#0A84FF"/>
+    </linearGradient>
+    <radialGradient id="dotGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#34D399" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#34D399" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#10131A" stroke="url(#rimGrad)" stroke-width="2.5"/>
+  <!-- First lowercase 'b' (ice white) -->
+  <path d="M27 31V93M27 74.5C27 64.8 34.5 57.5 43.8 57.5C53.1 57.5 60.5 64.8 60.5 74.5C60.5 84.2 53.1 91.5 43.8 91.5C34.5 91.5 27 84.2 27 74.5Z"
+        stroke="#F2F6FC" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Second lowercase 'b' (emerald -> blue gradient) -->
+  <path d="M72 31V93M72 74.5C72 64.8 79.5 57.5 88.8 57.5C98.1 57.5 105.5 64.8 105.5 74.5C105.5 84.2 98.1 91.5 88.8 91.5C79.5 91.5 72 84.2 72 74.5Z"
+        stroke="url(#secondB)" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Live telemetry status dot -->
+  <circle cx="103" cy="30" r="14" fill="url(#dotGlow)"/>
+  <circle cx="103" cy="30" r="6.5" fill="#34D399"/>
+</svg>

@@ -1,0 +1,8 @@
+/target
+/bbstats.exe
+/bbstats
+/todo.md
+/plan/shots/
+*.pdb
+*.log
+*.tmp

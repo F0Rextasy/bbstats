@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Build, Clippy & Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit Tests
+        run: cargo test --no-fail-fast
+      - name: Release Build
+        run: cargo build --release --locked
+
+  macos:
+    name: Build, Clippy & Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit Tests
+        run: cargo test --no-fail-fast
+      - name: Release Build & Smoke CLI
+        run: |
+          cargo build --release --locked
+          ./target/release/bbstats --version
+          ./target/release/bbstats --status

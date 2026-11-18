@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Build Release (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Tests
+        run: cargo test --no-fail-fast --locked
+      - name: Build Release Binary
+        run: cargo build --release --locked
+      - name: Package Release Archive & Checksum
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $stage = "dist\bbstats-$tag-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\bbstats.exe $stage\
+          Copy-Item README.md, README.tr.md, CHANGELOG.md, LICENSE $stage\
+          Copy-Item assets\labels.example.toml $stage\
+          $zip = "dist\bbstats-$tag-windows-x86_64.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  bbstats-$tag-windows-x86_64.zip" | Out-File -Encoding ascii dist\SHA256SUMS-windows.txt
+      - name: Upload GitHub Release (Windows)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS-windows.txt
+          generate_release_notes: true
+
+  release-macos:
+    name: Build Release (macOS arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run Tests
+        run: cargo test --no-fail-fast --locked
+      - name: Build Release Binary
+        run: cargo build --release --locked
+      - name: Package Release Archive & Checksum
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          STAGE="dist/bbstats-${TAG}-macos-arm64"
+          mkdir -p "${STAGE}"
+          cp target/release/bbstats "${STAGE}/"
+          cp README.md README.tr.md CHANGELOG.md LICENSE "${STAGE}/"
+          cp assets/labels.example.toml "${STAGE}/"
+          ARCHIVE="dist/bbstats-${TAG}-macos-arm64.tar.gz"
+          tar -C dist -czf "${ARCHIVE}" "bbstats-${TAG}-macos-arm64"
+          shasum -a 256 "${ARCHIVE}" | awk -v f="bbstats-${TAG}-macos-arm64.tar.gz" '{print $1 "  " f}' > dist/SHA256SUMS-macos.txt
+      - name: Upload GitHub Release (macOS)
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS-macos.txt
+          generate_release_notes: true

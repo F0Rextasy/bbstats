@@ -1,0 +1,41 @@
+# bbstats Custom Rules Example
+# Windows: copy desired rules into %APPDATA%\bbstats\labels.toml
+# macOS (planned): ~/.config/bbstats/labels.toml
+
+[[rule]]
+# Case-insensitive substring matched against process cmdline, script path, or working directory.
+match = "worker-bot\\auto_updater"
+project = "WorkerBot"
+job = "Auto Updater"
+icon = "🤖"
+color = "#F5B73B"
+
+# Optional JSON state file binding for processes whose cmdline/cwd is restricted or that emit structured status logs.
+pid_file = "%USERPROFILE%\\.omp\\local\\worker-bot\\auto-state.json"
+pid_key = "pid"
+log_file = "%USERPROFILE%\\.omp\\local\\worker-bot\\auto-console.log"
+
+# Optional folder scan for stopped automation scripts & Task Scheduler watchdog enrichment.
+scan_dir = "%USERPROFILE%\\.omp\\local\\worker-bot"
+scheduled_task = "WorkerBotWatchdog"
+
+# Optional toggle: keep periodic watchdog scripts out of active job rows.
+# hide_transient = true
+
+# Optional launch command & watching when stopped.
+# command = "pythonw auto_updater.py"
+# working_dir = "%USERPROFILE%\\projects\\worker-bot"
+# watch = true
+
+# Optional automatic restart on unexpected non-zero exit (bounded to 3 retries per 10 minutes).
+# auto_restart = true
+
+[[rule]]
+match = "api-server"
+project = "Acme API"
+job = "Backend"
+command = "python -m uvicorn app.main:app --port 8000"
+working_dir = "%USERPROFILE%\\dev\\acme-api"
+log_file = "%USERPROFILE%\\dev\\acme-api\\server.log"
+watch = true
+auto_restart = true
