@@ -57,6 +57,20 @@ impl<'a> DrawCtx<'a> {
         &self.brush
     }
 
+    pub fn with_axis_clip<F>(&self, rect: D2D_RECT_F, f: F) -> windows::core::Result<()>
+    where
+        F: FnOnce() -> windows::core::Result<()>,
+    {
+        unsafe {
+            self.dc.PushAxisAlignedClip(&rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        }
+        let res = f();
+        unsafe {
+            self.dc.PopAxisAlignedClip();
+        }
+        res
+    }
+
     pub fn fill_rounded(
         &self,
         rect: D2D_RECT_F,

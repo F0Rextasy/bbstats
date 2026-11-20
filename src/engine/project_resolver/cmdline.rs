@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 
 use super::filters::{
     is_docker_process, is_generic_container_dir, is_generic_dir, is_ide_or_shell_name,
-    is_user_home_dir, normalize_path_str,
+    is_user_home_dir, normalize_path_str, path_str_starts_with_dir,
 };
 use super::manifests::dir_name_or;
-use crate::model::ProcessRole;
+use crate::model::{Language, ProcessRole};
 
 #[derive(Debug, Clone)]
 pub struct ParsedCommand {
@@ -120,7 +120,9 @@ pub fn analyze_command_and_paths(
         };
     }
 
-    if effective_exe.starts_with("python") || effective_exe == "uvicorn.exe" {
+    let exe_base = effective_exe.strip_suffix(".exe").unwrap_or(&effective_exe);
+
+    if exe_base.starts_with("python") || exe_base == "uvicorn" {
         let (role, label) = if lower_cmd.contains("uvicorn") || lower_cmd.contains("fastapi") {
             (ProcessRole::ApiBackend, "Python API".to_string())
         } else if lower_cmd.contains("poller") || lower_cmd.contains("bot") {
@@ -151,7 +153,7 @@ pub fn analyze_command_and_paths(
         };
     }
 
-    if matches!(effective_exe.as_str(), "java.exe" | "javaw.exe") {
+    if matches!(exe_base, "java" | "javaw") {
         let spring_name = args
             .iter()
             .find_map(|a| a.strip_prefix("-Dspring.application.name=").map(str::to_string));
@@ -174,7 +176,7 @@ pub fn analyze_command_and_paths(
         };
     }
 
-    if effective_exe == "dotnet.exe" {
+    if exe_base == "dotnet" {
         let project_seed = args
             .windows(2)
             .find(|w| w[0] == "--project" || w[0] == "-p")
@@ -199,10 +201,10 @@ pub fn analyze_command_and_paths(
     }
 
     if matches!(
-        effective_exe.as_str(),
-        "postgres.exe" | "mysqld.exe" | "redis-server.exe" | "mongod.exe" | "surreal.exe"
+        exe_base,
+        "postgres" | "mysqld" | "redis-server" | "mongod" | "surreal"
     ) {
-        let label = effective_exe.trim_end_matches(".exe").to_string();
+        let label = exe_base.to_string();
         return ParsedCommand {
             role: ProcessRole::DatabaseOrCache,
             role_label: format!("Database ({label})"),
@@ -299,34 +301,38 @@ pub(super) fn unwrap_shell_wrapper(args: &[String]) -> UnwrappedCmd {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    if exe0 == "cmd.exe" || exe0 == "cmd" {
-        if let Some(c_idx) = args
-            .iter()
+    let shell_flag_pos = if exe0 == "cmd.exe" || exe0 == "cmd" {
+        args.iter()
             .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))
-        {
-            let rest = &args[c_idx + 1..];
-            if !rest.is_empty() {
-                // If `cmd /c "node foo.js --port 18911"`, split the single quoted string too.
-                let expanded = if rest.len() == 1 && rest[0].contains(' ') {
-                    split_cmdline_args(&rest[0])
-                } else {
-                    rest.to_vec()
-                };
-                let inner_exe = expanded.first().and_then(|a| {
-                    a.rsplit(['/', '\\']).next().map(|s| {
-                        let low = s.to_ascii_lowercase();
-                        if low.ends_with(".exe") {
-                            low
-                        } else {
-                            format!("{low}.exe")
-                        }
-                    })
-                });
-                return UnwrappedCmd {
-                    inner_exe,
-                    args: expanded,
-                };
-            }
+    } else if matches!(exe0.as_str(), "sh" | "bash" | "zsh") {
+        args.iter().position(|a| a == "-c")
+    } else {
+        None
+    };
+
+    if let Some(c_idx) = shell_flag_pos {
+        let rest = &args[c_idx + 1..];
+        if !rest.is_empty() {
+            // If `cmd /c "node foo.js --port 18911"` or `sh -c "node foo.js"`, split the quoted string too.
+            let expanded = if rest.len() == 1 && rest[0].contains(' ') {
+                split_cmdline_args(&rest[0])
+            } else {
+                rest.to_vec()
+            };
+            let inner_exe = expanded.first().and_then(|a| {
+                a.rsplit(['/', '\\']).next().map(|s| {
+                    let low = s.to_ascii_lowercase();
+                    if low.ends_with(".exe") {
+                        low
+                    } else {
+                        format!("{low}.exe")
+                    }
+                })
+            });
+            return UnwrappedCmd {
+                inner_exe,
+                args: expanded,
+            };
         }
     }
 
@@ -352,6 +358,7 @@ pub fn format_job_title(
     exe_name: &str,
     fallback_dir: Option<&Path>,
     is_scheduled_task: bool,
+    lang: Language,
 ) -> String {
     let base_title = if let Some(script_path) = &parsed.script_path {
         let stem = script_path
@@ -378,7 +385,7 @@ pub fn format_job_title(
         let last_seg = mod_name.rsplit('.').next().unwrap_or(mod_name);
         humanize_identifier(last_seg, project_name, folder_name)
     } else if is_scheduled_task {
-        "Zamanlanmış görev".to_string()
+        lang.pick("Scheduled task", "Zamanlanmış görev").to_string()
     } else {
         let short_exe = exe_name
             .strip_suffix(".exe")
@@ -630,7 +637,7 @@ pub(super) fn infer_project_dir_from_paths(
         if let Some(cwd_dir) = cwd.filter(|d| !is_generic_dir(d)) {
             let cwd_norm = normalize_path_str(cwd_dir);
             let sp_norm = normalize_path_str(sp);
-            if sp_norm.starts_with(&cwd_norm)
+            if path_str_starts_with_dir(&sp_norm, &cwd_norm)
                 && !is_user_home_dir(cwd_dir)
                 && !is_generic_container_dir(cwd_dir)
             {
@@ -751,7 +758,7 @@ pub(super) fn split_cmdline_preserving_quotes(s: &str) -> Vec<String> {
     res
 }
 
-pub(super) fn split_cmdline_args(s: &str) -> Vec<String> {
+pub fn split_cmdline_args(s: &str) -> Vec<String> {
     let mut res = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;

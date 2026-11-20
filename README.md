@@ -83,8 +83,8 @@
 
 | Platform | Status | Interface & Rendering | Telemetry & Autostart |
 |---|---|---|---|
-| **Windows 10 / 11 (`x86_64`)** | Supported (`v0.1.0`) | Direct3D11 + Direct2D + DirectWrite + WinRT Composition (`WS_EX_TOOLWINDOW`, Acrylic backdrop) | NT PEB inspection, IP Helper TCP/UDP ports, Tray `Shell_NotifyIconW`, Registry Run |
-| **macOS (`arm64` / `x86_64`)** | Supported (`v0.1.0`) | Native ANSI Dynamic Island live terminal HUD (`bbstats`, `--watch`, `--status`, `--dump-snapshot`) | `ps` / `sysctl` / `vm_stat` / `lsof` port & CWD telemetry, `SIGTERM`→`SIGKILL`, Docker Unix socket, `~/Library/LaunchAgents` |
+| **Windows 10 / 11 (`x86_64`)** | Supported (`v0.2.0`) | Direct3D11 + Direct2D + DirectWrite + WinRT Composition (`WS_EX_TOOLWINDOW`, Acrylic backdrop) | NT PEB inspection, IP Helper TCP/UDP ports, Tray `Shell_NotifyIconW`, Registry Run |
+| **macOS (`arm64` / `x86_64`)** | Supported (`v0.2.0`) | Native ANSI Dynamic Island live terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`, `--dump-snapshot`) | `ps` / `sysctl` / `vm_stat` / `lsof` port & CWD telemetry, `kqueue` exit watcher, `SIGTERM`→`SIGKILL`, Docker Unix socket, `~/Library/LaunchAgents` |
 
 ---
 
@@ -125,17 +125,22 @@ cargo run --release -- --watch
 Without disturbing a running instance, you can inspect telemetry or render showcases directly from the CLI:
 
 ```powershell
+# Print version or CLI usage flags (Windows & macOS)
+bbstats --version
+bbstats --help
+
 # Print live detected projects, jobs, ports, and last log lines to stdout (Windows & macOS)
 bbstats --dump-snapshot
 
-# Single-shot formatted HUD table (macOS)
+# Single-shot formatted HUD table or headless LaunchAgent daemon mode (macOS)
 bbstats --status
+bbstats --daemon
 
 # Render deterministic clean showcase screenshots to out\shots (--lang en | tr, Windows)
-.\target\release\bbstats.exe --dump-shot out\shots --lang en
+cargo run --features screenshots -- --dump-shot out\shots --lang en
 
 # Render screenshots using your live running processes (Windows)
-.\target\release\bbstats.exe --dump-shot out\shots --live
+cargo run --features screenshots -- --dump-shot out\shots --live
 ```
 
 ---

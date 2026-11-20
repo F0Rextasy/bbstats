@@ -2,10 +2,41 @@ use std::path::Path;
 
 use crate::model::ProcessRole;
 
+pub(super) fn path_str_starts_with_dir(path_norm: &str, dir_norm: &str) -> bool {
+    let dir_trimmed = dir_norm.trim_end_matches('\\');
+    if dir_trimmed.is_empty() {
+        return false;
+    }
+    let path_trimmed = path_norm.trim_end_matches('\\');
+    path_trimmed == dir_trimmed
+        || (path_trimmed.starts_with(dir_trimmed)
+            && path_trimmed.as_bytes().get(dir_trimmed.len()) == Some(&b'\\'))
+}
+
+fn has_unix_system_prefix(s: &str) -> bool {
+    s.starts_with("\\system\\")
+        || s == "\\system"
+        || s.starts_with("\\library\\")
+        || s == "\\library"
+        || s.starts_with("\\usr\\")
+        || s == "\\usr"
+        || s.starts_with("\\bin\\")
+        || s == "\\bin"
+        || s.starts_with("\\sbin\\")
+        || s == "\\sbin"
+        || s.starts_with("\\applications\\")
+        || s == "\\applications"
+        || s.starts_with("\\private\\var\\")
+        || s.starts_with("\\opt\\homebrew\\")
+        || s.contains("\\library\\caches\\")
+        || s.contains("\\library\\application support\\")
+}
+
 pub(super) fn is_system_or_app_location(image_path: Option<&Path>, cwd: Option<&Path>) -> bool {
     for p in [image_path, cwd].into_iter().flatten() {
         let s = p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-        if s.contains("\\windows\\")
+        if has_unix_system_prefix(&s)
+            || s.contains("\\windows\\")
             || s.ends_with("\\windows")
             || s.contains("\\systemapps\\")
             || s.contains("\\program files")
@@ -34,7 +65,8 @@ pub(super) fn is_user_project_location(
             continue;
         };
         let s = p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-        if s.contains("\\windows\\")
+        if has_unix_system_prefix(&s)
+            || s.contains("\\windows\\")
             || s.ends_with("\\windows")
             || s.contains("\\program files")
             || s.contains("\\programdata")
@@ -52,8 +84,9 @@ pub(super) fn is_user_project_location(
             continue;
         }
         if let Some(home) = user_home {
-            let home_low = home.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-            if s.starts_with(&home_low) && s.len() > home_low.len() + 1 {
+            let s_norm = normalize_path_str(p);
+            let home_norm = normalize_path_str(home);
+            if s_norm != home_norm && path_str_starts_with_dir(&s_norm, &home_norm) {
                 return true;
             }
         }
@@ -98,17 +131,18 @@ pub(super) fn is_ide_or_sidecar_process(
     image_path: Option<&Path>,
     cwd: Option<&Path>,
 ) -> bool {
+    let base = lower_exe.strip_suffix(".exe").unwrap_or(lower_exe);
     if matches!(
-        lower_exe,
-        "code.exe"
-            | "cursor.exe"
-            | "windsurf.exe"
-            | "antigravity.exe"
-            | "devenv.exe"
-            | "rust-analyzer.exe"
-            | "clangd.exe"
-            | "pylance.exe"
-    ) || lower_exe.starts_with("language_server")
+        base,
+        "code"
+            | "cursor"
+            | "windsurf"
+            | "antigravity"
+            | "devenv"
+            | "rust-analyzer"
+            | "clangd"
+            | "pylance"
+    ) || base.starts_with("language_server")
     {
         return true;
     }
@@ -141,90 +175,120 @@ pub(super) fn is_ide_or_sidecar_process(
 }
 
 pub(super) fn is_interactive_shell_process(lower_exe: &str, cmdline: Option<&str>) -> bool {
+    let base = lower_exe.strip_suffix(".exe").unwrap_or(lower_exe);
     if !matches!(
-        lower_exe,
-        "powershell.exe" | "pwsh.exe" | "cmd.exe" | "windowsterminal.exe" | "wt.exe" | "bash.exe"
+        base,
+        "powershell" | "pwsh" | "cmd" | "windowsterminal" | "wt" | "bash" | "zsh" | "sh" | "fish"
     ) {
         return false;
     }
     let lower_cmd = cmdline.unwrap_or("").to_ascii_lowercase();
-    if lower_exe == "cmd.exe" {
+    if base == "cmd" {
         return !lower_cmd.contains("/c ");
     }
-    if lower_exe == "powershell.exe" || lower_exe == "pwsh.exe" {
+    if base == "powershell" || base == "pwsh" {
         if lower_cmd.contains("-noexit") {
             return true;
         }
         return !lower_cmd.contains(".ps1") && !lower_cmd.contains("-file ");
     }
+    if matches!(base, "bash" | "zsh" | "sh" | "fish") {
+        return !lower_cmd.contains(" -c ");
+    }
     true
 }
 
 pub(super) fn is_fast_skip_noise(lower_exe: &str, pid: u32, self_pid: u32, session_id: u32) -> bool {
-    if pid <= 4 || pid == self_pid || lower_exe == "bbstats.exe" || lower_exe == "bbstats" {
+    let base = lower_exe.strip_suffix(".exe").unwrap_or(lower_exe);
+    if pid <= 4 || pid == self_pid || base == "bbstats" {
         return true;
     }
     if session_id == 0 && !is_docker_process(lower_exe) && !is_known_dev_runtime(lower_exe) {
         return true;
     }
     matches!(
-        lower_exe,
+        base,
         "system idle process"
             | "system"
             | "registry"
             | "memcompression"
-            | "smss.exe"
-            | "csrss.exe"
-            | "wininit.exe"
-            | "services.exe"
-            | "lsass.exe"
-            | "winlogon.exe"
-            | "dwm.exe"
-            | "svchost.exe"
-            | "sihost.exe"
-            | "fontdrvhost.exe"
-            | "runtimebroker.exe"
-            | "searchindexer.exe"
-            | "searchhost.exe"
-            | "dllhost.exe"
-            | "ctfmon.exe"
-            | "taskhostw.exe"
-            | "shellexperiencehost.exe"
-            | "startmenuexperiencehost.exe"
-            | "applicationframehost.exe"
-            | "textinputhost.exe"
-            | "lockapp.exe"
-            | "msmpeng.exe"
-            | "securityhealthservice.exe"
-            | "widgets.exe"
-            | "widgetservice.exe"
-            | "audiodg.exe"
-            | "spoolsv.exe"
-            | "explorer.exe"
-            | "conhost.exe"
-            | "openconsole.exe"
-            | "radeonsoftware.exe"
-            | "amdrsserv.exe"
-            | "atiesrxx.exe"
-            | "atieclxx.exe"
-            | "amdfendrsr.exe"
-            | "nvcontainer.exe"
-            | "nvdisplay.container.exe"
-            | "chrome.exe"
-            | "msedge.exe"
-            | "msedgewebview2.exe"
-            | "firefox.exe"
-            | "discord.exe"
-            | "spotify.exe"
-            | "onedrive.exe"
-            | "antigravity.exe"
-            | "code.exe"
-            | "cursor.exe"
-            | "tern.exe"
-            | "kitty.exe"
-            | "alacritty.exe"
-            | "wezterm-gui.exe"
-    ) || lower_exe.starts_with("language_server")
+            | "smss"
+            | "csrss"
+            | "wininit"
+            | "services"
+            | "lsass"
+            | "winlogon"
+            | "dwm"
+            | "svchost"
+            | "sihost"
+            | "fontdrvhost"
+            | "runtimebroker"
+            | "searchindexer"
+            | "searchhost"
+            | "dllhost"
+            | "ctfmon"
+            | "taskhostw"
+            | "shellexperiencehost"
+            | "startmenuexperiencehost"
+            | "applicationframehost"
+            | "textinputhost"
+            | "lockapp"
+            | "msmpeng"
+            | "securityhealthservice"
+            | "widgets"
+            | "widgetservice"
+            | "audiodg"
+            | "spoolsv"
+            | "explorer"
+            | "conhost"
+            | "openconsole"
+            | "radeonsoftware"
+            | "amdrsserv"
+            | "atiesrxx"
+            | "atieclxx"
+            | "amdfendrsr"
+            | "nvcontainer"
+            | "nvdisplay.container"
+            | "chrome"
+            | "msedge"
+            | "msedgewebview2"
+            | "firefox"
+            | "discord"
+            | "spotify"
+            | "onedrive"
+            | "antigravity"
+            | "code"
+            | "cursor"
+            | "tern"
+            | "kitty"
+            | "alacritty"
+            | "wezterm-gui"
+            | "launchd"
+            | "kernel_task"
+            | "windowserver"
+            | "loginwindow"
+            | "sysmond"
+            | "usereventagent"
+            | "mdworker"
+            | "mdworker_shared"
+            | "mds"
+            | "mds_stores"
+            | "spotlight"
+            | "finder"
+            | "dock"
+            | "systemuiserver"
+            | "cfprefsd"
+            | "distnoted"
+            | "trustd"
+            | "nsurlsessiond"
+            | "controlcenter"
+            | "cloudd"
+            | "bird"
+            | "terminal"
+            | "iterm2"
+            | "warp"
+            | "ghostty"
+    ) || base.starts_with("language_server")
 }
 
 
@@ -248,23 +312,41 @@ pub(super) fn is_stop_directory(dir: &Path, user_home: Option<&Path>) -> bool {
             return true;
         }
     }
-    let s = dir.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-    s.ends_with(":\\windows")
+    let s = dir
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
+    s.is_empty()
+        || s.ends_with(":\\windows")
         || s.ends_with(":\\windows\\system32")
         || s.ends_with(":\\program files")
         || s.ends_with(":\\program files (x86)")
         || s.ends_with(":\\users")
-        || s.ends_with("\\users")
+        || s == "\\users"
+        || s == "\\applications"
+        || s == "\\library"
+        || s == "\\system"
+        || s == "\\volumes"
         || s.ends_with("\\desktop")
         || s.ends_with("\\documents")
 }
 
 pub(super) fn is_generic_dir(dir: &Path) -> bool {
-    let s = dir.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    let s = dir
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
     s.ends_with("\\system32")
         || s.ends_with("\\windows")
         || s.ends_with("\\temp")
         || s.ends_with("\\tmp")
+        || s == "\\tmp"
+        || s == "\\var\\tmp"
+        || s == "\\private\\tmp"
+        || s == "\\etc"
+        || s == "\\usr"
 }
 
 pub(super) fn is_wsl_vm_name(name: &str) -> bool {
@@ -328,30 +410,38 @@ pub(super) fn is_known_dev_runtime(lower_exe: &str) -> bool {
 }
 
 pub(super) fn is_ide_or_shell_name(lower_exe: &str) -> bool {
+    let base = lower_exe.strip_suffix(".exe").unwrap_or(lower_exe);
     matches!(
-        lower_exe,
-        "code.exe"
-            | "cursor.exe"
-            | "windsurf.exe"
-            | "antigravity.exe"
-            | "devenv.exe"
-            | "windowsterminal.exe"
-            | "wt.exe"
-            | "tern.exe"
-            | "kitty.exe"
-            | "alacritty.exe"
-            | "wezterm-gui.exe"
-            | "pwsh.exe"
-            | "powershell.exe"
-            | "cmd.exe"
-            | "explorer.exe"
+        base,
+        "code"
+            | "cursor"
+            | "windsurf"
+            | "antigravity"
+            | "devenv"
+            | "windowsterminal"
+            | "wt"
+            | "tern"
+            | "kitty"
+            | "alacritty"
+            | "wezterm-gui"
+            | "terminal"
+            | "iterm2"
+            | "warp"
+            | "ghostty"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
+            | "bash"
+            | "zsh"
+            | "sh"
+            | "fish"
+            | "explorer"
     )
 }
 
 pub(super) fn is_helper_process(lower_exe: &str, role: ProcessRole) -> bool {
-    matches!(
-        lower_exe,
-        "conhost.exe" | "openconsole.exe" | "esbuild.exe" | "rustc.exe"
-    ) || matches!(role, ProcessRole::IdeTooling)
+    let base = lower_exe.strip_suffix(".exe").unwrap_or(lower_exe);
+    matches!(base, "conhost" | "openconsole" | "esbuild" | "rustc")
+        || matches!(role, ProcessRole::IdeTooling)
 }
 

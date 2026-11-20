@@ -8,8 +8,9 @@ use crate::engine::known_jobs::KnownJobsSnapshot;
 use crate::engine::labels::expand_win_env_vars;
 use crate::engine::project_resolver::{LogTailCache, ProjectResolver};
 use crate::model::{
-    Alert, AlertKind, BindScope, Job, JobId, PollingMode, PortBinding, ProcInfo, ProcessKey,
-    ProcessRole, ProjectGroup, ProjectId, ProjectStatus, Snapshot, SortMode, TransportProto,
+    Alert, AlertKind, BindScope, Job, JobId, Language, PollingMode, PortBinding, ProcInfo,
+    ProcessKey, ProcessRole, ProjectGroup, ProjectId, ProjectStatus, Snapshot, SortMode,
+    TransportProto,
 };
 
 const SHORT_JOB_DEBOUNCE_SECS: u64 = 8;
@@ -22,6 +23,7 @@ pub(super) struct ProjectRuntimeState {
     pub(super) last_known_name: String,
     pub(super) last_known_root: Option<PathBuf>,
     pub(super) last_known_branch: Option<String>,
+    pub(super) last_seen: Option<Instant>,
     pub(super) cpu_history: [u8; 30],
     pub(super) ram_history_mb: [u16; 30],
     pub(super) high_cpu_since: Option<Instant>,
@@ -35,7 +37,7 @@ pub(super) struct ProjectRuntimeState {
 #[derive(Debug, Clone)]
 pub(super) struct CrashedJobRecord {
     pub(super) until: Instant,
-    pub(super) crash_summary: String,
+    pub(super) exit_code: i32,
     pub(super) project_id: ProjectId,
     pub(super) project_name: String,
     pub(super) title: String,
@@ -77,6 +79,7 @@ pub(super) fn build_snapshot(
     polling_mode: PollingMode,
     self_pid: u32,
     ancestors: &HashSet<u32>,
+    lang: Language,
 ) -> Snapshot {
     let now = Instant::now();
     let now_ms = unix_now_ms();
@@ -95,6 +98,7 @@ pub(super) fn build_snapshot(
         icon: Option<String>,
         color: Option<String>,
         root: Option<PathBuf>,
+        git_branch: Option<String>,
         match_hint: String,
         log_path: Option<PathBuf>,
         inline_last_log: Option<String>,
@@ -104,7 +108,6 @@ pub(super) fn build_snapshot(
         procs: Vec<ProcInfo>,
         cpu: f32,
         ram: u64,
-        disk_bps: u64,
         ports: Vec<PortBinding>,
         uptime: u64,
         primary_key: ProcessKey,
@@ -125,8 +128,6 @@ pub(super) fn build_snapshot(
         ports: Vec<PortBinding>,
         cpu: f32,
         ram: u64,
-        disk_bps: u64,
-        helper_count: u16,
         proc_count: u16,
         has_non_compiler: bool,
     }
@@ -146,7 +147,6 @@ pub(super) fn build_snapshot(
 
         let net = ports_by_pid.get(&proc.key.pid);
         let proc_ports = net.map(|n| n.ports.clone()).unwrap_or_default();
-        let tcp_conns = net.map(|n| n.active_tcp_connections).unwrap_or(0);
         let can_kill = !meta.is_critical_system
             && is_kill_allowed_static(
                 proc.key.pid,
@@ -166,10 +166,7 @@ pub(super) fn build_snapshot(
             working_dir: meta.working_dir.clone(),
             cpu: proc.cpu_percent,
             ram: proc.private_ram_bytes,
-            disk_read_bps: proc.disk_read_bps,
-            disk_write_bps: proc.disk_write_bps,
             ports: proc_ports.clone(),
-            active_tcp_connections: tcp_conns,
             uptime_secs: proc.uptime_secs,
             is_helper_collapsed: meta.is_wrapper_or_helper,
             is_critical_system: meta.is_critical_system,
@@ -187,6 +184,7 @@ pub(super) fn build_snapshot(
             icon: meta.job_icon.clone(),
             color: meta.job_color.clone(),
             root: meta.project_root.clone(),
+            git_branch: meta.git_branch.clone(),
             match_hint: meta.match_hint.clone(),
             log_path: meta.log_path.clone(),
             inline_last_log: meta.inline_last_log.clone(),
@@ -198,7 +196,6 @@ pub(super) fn build_snapshot(
             procs: Vec::new(),
             cpu: 0.0,
             ram: 0,
-            disk_bps: 0,
             ports: Vec::new(),
             uptime: proc.uptime_secs,
             primary_key: proc.key,
@@ -210,10 +207,6 @@ pub(super) fn build_snapshot(
 
         acc.cpu += proc.cpu_percent;
         acc.ram = acc.ram.saturating_add(proc.private_ram_bytes);
-        acc.disk_bps = acc
-            .disk_bps
-            .saturating_add(proc.disk_read_bps)
-            .saturating_add(proc.disk_write_bps);
         acc.uptime = acc.uptime.max(proc.uptime_secs);
         acc.can_kill |= can_kill;
         acc.can_restart |= meta.restart_recipe.is_some();
@@ -302,7 +295,14 @@ pub(super) fn build_snapshot(
             (Some((Some(f_line), _)), None) => Some(f_line),
             (_, inline) => inline,
         };
-        let crash_summary = job_crashes.get(&jacc.id).map(|c| c.crash_summary.clone());
+        let crash_summary = job_crashes.get(&jacc.id).map(|c| {
+            format!(
+                "{} · {} {}",
+                lang.pick("Crashed", "Çöktü"),
+                lang.pick("code", "kod"),
+                c.exit_code
+            )
+        });
 
         let status = if crash_summary.is_some() {
             ProjectStatus::Crashed
@@ -311,12 +311,6 @@ pub(super) fn build_snapshot(
         } else {
             ProjectStatus::Healthy
         };
-
-        let helper_cnt = jacc
-            .procs
-            .iter()
-            .filter(|p| p.is_helper_collapsed)
-            .count() as u16;
 
         let job_procs = jacc.procs;
         let proc_cnt = job_procs.len() as u16;
@@ -353,7 +347,7 @@ pub(super) fn build_snapshot(
         let pacc = proj_map.entry(jacc.project).or_insert_with(|| ProjectAcc {
             name: jacc.project_name,
             root: jacc.root,
-            git_branch: None,
+            git_branch: jacc.git_branch.clone(),
             icon: jacc.icon,
             color: jacc.color,
             jobs: Vec::new(),
@@ -361,18 +355,17 @@ pub(super) fn build_snapshot(
             ports: Vec::new(),
             cpu: 0.0,
             ram: 0,
-            disk_bps: 0,
-            helper_count: 0,
             proc_count: 0,
             has_non_compiler: false,
         });
 
         pacc.cpu += job.cpu;
         pacc.ram = pacc.ram.saturating_add(job.ram);
-        pacc.disk_bps = pacc.disk_bps.saturating_add(jacc.disk_bps);
-        pacc.helper_count = pacc.helper_count.saturating_add(helper_cnt);
         pacc.proc_count = pacc.proc_count.saturating_add(proc_cnt);
         pacc.has_non_compiler |= job_has_non_compiler;
+        if pacc.git_branch.is_none() && jacc.git_branch.is_some() {
+            pacc.git_branch = jacc.git_branch;
+        }
         if pacc.icon.is_none() && job.icon.is_some() {
             pacc.icon = job.icon.clone();
         }
@@ -419,8 +412,6 @@ pub(super) fn build_snapshot(
                 ports: Vec::new(),
                 cpu: 0.0,
                 ram: 0,
-                disk_bps: 0,
-                helper_count: 0,
                 proc_count: 0,
                 has_non_compiler: false,
             });
@@ -439,7 +430,12 @@ pub(super) fn build_snapshot(
             uptime: 0,
             status: ProjectStatus::Crashed,
             last_log: None,
-            crash_summary: Some(rec.crash_summary.clone()),
+            crash_summary: Some(format!(
+                "{} · {} {}",
+                lang.pick("Crashed", "Çöktü"),
+                lang.pick("code", "kod"),
+                rec.exit_code
+            )),
             root: rec.root.clone(),
             primary_key: rec.primary_key,
             match_hint: rec.match_hint.clone(),
@@ -478,8 +474,6 @@ pub(super) fn build_snapshot(
                 ports: Vec::new(),
                 cpu: 0.0,
                 ram: 0,
-                disk_bps: 0,
-                helper_count: 0,
                 proc_count: 0,
                 has_non_compiler: false,
             });
@@ -532,7 +526,7 @@ pub(super) fn build_snapshot(
             .project
             .as_deref()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or("Özel İşler")
+            .unwrap_or_else(|| lang.pick("Custom Jobs", "Özel İşler"))
             .to_string();
 
         if active_hints.iter().any(|h| h.contains(&needle_low) || needle_low.contains(h))
@@ -572,7 +566,10 @@ pub(super) fn build_snapshot(
         let sub = if let Some(ref cmd) = rule.command {
             format!("{proj_name} › {cmd}")
         } else {
-            format!("{proj_name} › İzlenen iş ({needle})")
+            format!(
+                "{proj_name} › {} ({needle})",
+                lang.pick("Watched job", "İzlenen iş")
+            )
         };
 
         let pacc = proj_map.entry(proj_id.clone()).or_insert_with(|| ProjectAcc {
@@ -586,8 +583,6 @@ pub(super) fn build_snapshot(
             ports: Vec::new(),
             cpu: 0.0,
             ram: 0,
-            disk_bps: 0,
-            helper_count: 0,
             proc_count: 0,
             has_non_compiler: false,
         });
@@ -639,8 +634,6 @@ pub(super) fn build_snapshot(
             ports: Vec::new(),
             cpu: 0.0,
             ram: 0,
-            disk_bps: 0,
-            helper_count: 0,
             proc_count: 0,
             has_non_compiler: false,
         });
@@ -709,6 +702,7 @@ pub(super) fn build_snapshot(
         st.hidden = hidden_keys.contains(&key_l);
         st.display_name_override = alias_keys.get(&id.0).cloned();
         st.last_known_name = pacc.name.clone();
+        st.last_seen = Some(now);
         if pacc.root.is_some() {
             st.last_known_root = pacc.root.clone();
         }
@@ -734,6 +728,18 @@ pub(super) fn build_snapshot(
                 .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(120));
             if dur >= Duration::from_secs(15) && cooldown_ok {
                 st.last_high_cpu_alert = Some(now);
+                let message = match lang {
+                    Language::En => format!(
+                        "{display_name} high CPU ({:.0}% for {}s)",
+                        pacc.cpu,
+                        dur.as_secs()
+                    ),
+                    Language::Tr => format!(
+                        "{display_name} yüksek CPU ({}sn boyunca %{:.0})",
+                        dur.as_secs(),
+                        pacc.cpu
+                    ),
+                };
                 alerts.insert(
                     0,
                     Alert {
@@ -744,11 +750,7 @@ pub(super) fn build_snapshot(
                             cpu_percent: pacc.cpu,
                             duration_secs: dur.as_secs(),
                         },
-                        message: format!(
-                            "{display_name} high CPU ({:.0}% for {}s)",
-                            pacc.cpu,
-                            dur.as_secs()
-                        ),
+                        message,
                         timestamp_ms: now_ms,
                         dismissed: false,
                     },
@@ -769,6 +771,11 @@ pub(super) fn build_snapshot(
                         .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(120));
                     if cooldown_ok {
                         st.last_mem_alert = Some(now);
+                        let gb = pacc.ram as f64 / (1024.0 * 1024.0 * 1024.0);
+                        let message = match lang {
+                            Language::En => format!("{display_name} memory spike ({gb:.1} GB)"),
+                            Language::Tr => format!("{display_name} bellek sıçraması ({gb:.1} GB)"),
+                        };
                         alerts.insert(
                             0,
                             Alert {
@@ -776,10 +783,7 @@ pub(super) fn build_snapshot(
                                 project_id: id.clone(),
                                 project_name: display_name.clone(),
                                 kind: AlertKind::MemorySpike { ram_bytes: pacc.ram },
-                                message: format!(
-                                    "{display_name} memory spike ({:.1} GB)",
-                                    pacc.ram as f64 / (1024.0 * 1024.0 * 1024.0)
-                                ),
+                                message,
                                 timestamp_ms: now_ms,
                                 dismissed: false,
                             },
@@ -828,12 +832,10 @@ pub(super) fn build_snapshot(
             status,
             cpu: pacc.cpu,
             ram: pacc.ram,
-            disk_bps: pacc.disk_bps,
             ports: pacc.ports,
             jobs: pacc.jobs,
             watchdog_note,
             procs: pacc.procs,
-            helper_count: pacc.helper_count,
             cpu_history: st.cpu_history,
             ram_history_mb: st.ram_history_mb,
         });
@@ -858,12 +860,10 @@ pub(super) fn build_snapshot(
                 status: ProjectStatus::Stopped,
                 cpu: 0.0,
                 ram: 0,
-                disk_bps: 0,
                 ports: Vec::new(),
                 jobs: Vec::new(),
                 watchdog_note: known_snap.watchdog_notes.get(id).cloned(),
                 procs: Vec::new(),
-                helper_count: 0,
                 cpu_history: st.cpu_history,
                 ram_history_mb: st.ram_history_mb,
             });
@@ -893,6 +893,7 @@ pub(super) fn build_snapshot(
         alerts: alerts.clone(),
         all_procs: Vec::new(),
         active_terminal: None,
+        last_action_error: None,
     }
 }
 

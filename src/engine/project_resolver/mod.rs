@@ -16,9 +16,9 @@ use crate::engine::collector::CollectedProcess;
 use crate::engine::labels::{expand_win_env_vars, LabelRule, LabelsStore, StateFileBinding};
 use crate::engine::win_nt::{
     inspect_process_peb, list_wsl_distros_from_registry, query_docker_containers_pipe,
-    DockerContainerSummary,
+    DockerContainerSummary, PebInspection,
 };
-use crate::model::{JobId, ProcessKey, ProcessRole, ProjectId};
+use crate::model::{JobId, Language, ProcessKey, ProcessRole, ProjectId};
 
 mod cmdline;
 mod filters;
@@ -26,6 +26,8 @@ mod manifests;
 mod redact;
 
 pub use cmdline::{analyze_command_and_paths, extract_log_redirect_path, format_job_title};
+#[cfg(target_os = "windows")]
+pub use cmdline::split_cmdline_args;
 pub use manifests::{inspect_directory_manifests, tail_last_4kb_line};
 pub use redact::sanitize_cmdline;
 
@@ -46,6 +48,9 @@ use redact::strip_shell_redirects;
 
 const MAX_WALK_LEVELS: usize = 6;
 const PATH_CACHE_TTL: Duration = Duration::from_secs(300);
+const PATH_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(45);
+const MAX_PATH_CACHE_ENTRIES: usize = 512;
+const MAX_LOG_TAIL_CACHE_ENTRIES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceSource {
@@ -112,6 +117,12 @@ pub struct CachedRoot {
     cached_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+enum PathCacheEntry {
+    Found(CachedRoot),
+    Missing(Instant),
+}
+
 /// Caches last-line reads of `>> file.log` redirects (last 4 KB, max once per 5s when expanded).
 pub struct LogTailCache {
     entries: HashMap<PathBuf, (Instant, Option<String>, Option<SystemTime>)>,
@@ -144,6 +155,16 @@ impl LogTailCache {
         }
         let line = tail_last_4kb_line(path);
         let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+        if !self.entries.contains_key(path) && self.entries.len() >= MAX_LOG_TAIL_CACHE_ENTRIES {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (ts, _, _))| *ts)
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
         self.entries
             .insert(path.to_path_buf(), (now, line.clone(), mtime));
         (line, mtime)
@@ -154,7 +175,7 @@ impl LogTailCache {
 pub struct ProjectResolver {
     meta_cache: HashMap<ProcessKey, Arc<ProcessMetadata>>,
     ignored_keys: HashSet<ProcessKey>,
-    path_cache: HashMap<PathBuf, Option<CachedRoot>>,
+    path_cache: HashMap<PathBuf, PathCacheEntry>,
     docker_cache: Vec<DockerContainerSummary>,
     last_docker_poll: Option<Instant>,
     wsl_distros_cache: Vec<String>,
@@ -164,11 +185,14 @@ pub struct ProjectResolver {
     last_state_poll: Option<Instant>,
     user_home: Option<PathBuf>,
     self_pid: u32,
+    language: Language,
 }
 
 impl ProjectResolver {
     pub fn new(self_pid: u32) -> Self {
-        let user_home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let user_home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
         let labels = LabelsStore::new();
         let state_bindings: HashMap<u32, StateFileBinding> = labels
             .read_pid_bindings()
@@ -188,6 +212,15 @@ impl ProjectResolver {
             last_state_poll: Some(Instant::now()),
             user_home,
             self_pid,
+            language: Language::En,
+        }
+    }
+
+    pub fn set_language(&mut self, lang: Language) {
+        if self.language != lang {
+            self.language = lang;
+            self.meta_cache.clear();
+            self.ignored_keys.clear();
         }
     }
 
@@ -221,13 +254,6 @@ impl ProjectResolver {
         self.meta_cache.clear();
         self.ignored_keys.clear();
         res
-    }
-
-    pub fn reload_labels(&mut self, force: bool) {
-        if self.labels.reload_if_changed(force) {
-            self.meta_cache.clear();
-            self.ignored_keys.clear();
-        }
     }
 
     pub fn invalidate_all(&mut self) {
@@ -292,10 +318,11 @@ impl ProjectResolver {
         self.ignored_keys
             .retain(|k| active_by_pid.get(&k.pid).is_some_and(|p| p.key == *k));
 
-        let docker_running = procs.iter().any(|p| {
-            let low = p.image_name.to_ascii_lowercase();
-            low == "dockerd.exe" || low == "com.docker.backend.exe"
-        });
+        let docker_running = procs
+            .iter()
+            .any(|p| is_docker_process(&p.image_name.to_ascii_lowercase()));
+        #[cfg(not(target_os = "windows"))]
+        let docker_running = docker_running || crate::engine::win_nt::docker_socket_exists();
         if allow_docker_pipe && docker_running {
             let should_poll = self
                 .last_docker_poll
@@ -327,6 +354,49 @@ impl ProjectResolver {
             }
         }
 
+        // Evict previously ignored processes if they open a listening port or spawn a real child.
+        self.ignored_keys.retain(|k| {
+            if has_listening_port(k.pid) {
+                return false;
+            }
+            if active_by_pid
+                .get(&k.pid)
+                .is_some_and(|p| p.image_name.eq_ignore_ascii_case("cmd.exe"))
+                && children_by_pid.get(&k.pid).is_some_and(|kids| {
+                    kids.iter().any(|c| {
+                        !c.image_name.eq_ignore_ascii_case("conhost.exe")
+                            && !c.image_name.eq_ignore_ascii_case("openconsole.exe")
+                    })
+                })
+            {
+                return false;
+            }
+            true
+        });
+
+        #[cfg(not(target_os = "windows"))]
+        let prefetched_pebs = {
+            let pids: Vec<u32> = procs
+                .iter()
+                .filter(|p| {
+                    !self.ignored_keys.contains(&p.key)
+                        && !self.meta_cache.contains_key(&p.key)
+                        && (self.state_bindings.contains_key(&p.key.pid)
+                            || has_listening_port(p.key.pid)
+                            || !is_fast_skip_noise(
+                                &p.image_name.to_ascii_lowercase(),
+                                p.key.pid,
+                                self.self_pid,
+                                p.session_id,
+                            ))
+                })
+                .map(|p| p.key.pid)
+                .collect();
+            crate::engine::win_nt::prefetch_unix_pebs(&pids)
+        };
+        #[cfg(target_os = "windows")]
+        let prefetched_pebs: HashMap<u32, PebInspection> = HashMap::new();
+
         // First pass: resolve every newly seen ProcessKey individually.
         let mut newly_added = Vec::new();
         for proc in procs {
@@ -337,7 +407,12 @@ impl ProjectResolver {
                 .get(&proc.parent_pid)
                 .filter(|p| p.key.create_time_100ns <= proc.key.create_time_100ns)
                 .map(|p| p.image_name.as_str());
-            let meta = self.resolve_single_process(proc, has_listening_port(proc.key.pid), parent_name);
+            let meta = self.resolve_single_process(
+                proc,
+                has_listening_port(proc.key.pid),
+                parent_name,
+                prefetched_pebs.get(&proc.key.pid),
+            );
             newly_added.push(proc.key);
             self.meta_cache.insert(proc.key, Arc::new(meta));
         }
@@ -481,6 +556,7 @@ impl ProjectResolver {
         proc: &CollectedProcess,
         has_port: bool,
         parent_name: Option<&str>,
+        prefetched_peb: Option<&PebInspection>,
     ) -> ProcessMetadata {
         let lower_name = proc.image_name.to_ascii_lowercase();
         let is_critical = proc.key.pid <= 4
@@ -490,8 +566,15 @@ impl ProjectResolver {
 
         // State-file PID binding takes precedence even when PEB/WMI cmdline is completely unreadable.
         if let Some(binding) = self.state_bindings.get(&proc.key.pid).cloned() {
-            let peb = inspect_process_peb(proc.key.pid);
-            return self.resolve_from_state_binding(proc, &binding, &peb, is_critical);
+            let owned_peb;
+            let peb = match prefetched_peb {
+                Some(p) => p,
+                None => {
+                    owned_peb = inspect_process_peb(proc.key.pid);
+                    &owned_peb
+                }
+            };
+            return self.resolve_from_state_binding(proc, &binding, peb, is_critical);
         }
 
         // Self & immediate OS/driver/browser/IDE noise fast-skip (zero PEB read!),
@@ -572,8 +655,15 @@ impl ProjectResolver {
             };
         }
 
-        let peb = inspect_process_peb(proc.key.pid);
-        self.resolve_from_peb(proc, has_port, parent_name, &peb)
+        let peb_owned;
+        let peb = match prefetched_peb {
+            Some(p) => p,
+            None => {
+                peb_owned = inspect_process_peb(proc.key.pid);
+                &peb_owned
+            }
+        };
+        self.resolve_from_peb(proc, has_port, parent_name, peb)
     }
 
     /// Resolves a process bound via `labels.toml` `pid_file` even when PEB cmdline/cwd are unreadable.
@@ -600,7 +690,7 @@ impl ProjectResolver {
         let next_hint = binding
             .next_run
             .as_deref()
-            .map(|nr| format!(" · sonraki {nr}"))
+            .map(|nr| format!(" · {} {nr}", self.language.pick("next", "sonraki")))
             .unwrap_or_default();
         let job_subtitle = format!("{project_name} › ...\\{folder_short}{next_hint}");
         let job_id = JobId(format!(
@@ -683,9 +773,7 @@ impl ProjectResolver {
             cmdline: peb.cmdline.clone(),
             peb_readable: peb.peb_readable,
             virtual_env: peb.virtual_env.clone(),
-            conda_env: peb.conda_env.clone(),
             compose_project_env: peb.compose_project_env.clone(),
-            npm_package_name: peb.npm_package_name.clone(),
         };
         #[cfg(not(target_os = "windows"))]
         let peb = &normalized_peb;
@@ -868,6 +956,7 @@ impl ProjectResolver {
             &proc.image_name,
             project_root.as_deref().or(peb.working_dir.as_deref()),
             is_scheduled_task,
+            self.language,
         );
         let mut job_icon = None;
         let mut job_color = None;
@@ -987,9 +1076,18 @@ impl ProjectResolver {
                 .strip_suffix(".exe")
                 .or_else(|| proc.image_name.strip_suffix(".EXE"))
                 .unwrap_or(&proc.image_name);
-            let parent_label = parent_name.unwrap_or("bilinmiyor");
-            job_title = format!("{short_exe} · komut satırı okunamadı");
-            job_subtitle = format!("Erişim kısıtlı · üst: {parent_label} · PID {}", proc.key.pid);
+            let parent_label = parent_name.unwrap_or(self.language.pick("unknown", "bilinmiyor"));
+            job_title = format!(
+                "{short_exe} · {}",
+                self.language
+                    .pick("command line unavailable", "komut satırı okunamadı")
+            );
+            job_subtitle = format!(
+                "{} · {}: {parent_label} · PID {}",
+                self.language.pick("Access restricted", "Erişim kısıtlı"),
+                self.language.pick("parent", "üst"),
+                proc.key.pid
+            );
         }
 
         // Whitelist-first visibility:
@@ -1115,25 +1213,40 @@ impl ProjectResolver {
                 continue;
             }
 
-            if let Some(cached) = self.path_cache.get(&cur) {
-                if let Some(entry) = cached {
-                    if entry.cached_at.elapsed() < PATH_CACHE_TTL {
-                        return Some(entry.clone());
-                    }
-                } else {
+            match self.path_cache.get(&cur) {
+                Some(PathCacheEntry::Found(entry)) if entry.cached_at.elapsed() < PATH_CACHE_TTL => {
+                    return Some(entry.clone());
+                }
+                Some(PathCacheEntry::Missing(since))
+                    if since.elapsed() < PATH_NEGATIVE_CACHE_TTL =>
+                {
                     let Some(parent) = cur.parent() else {
                         break;
                     };
                     cur = parent.to_path_buf();
                     continue;
                 }
+                _ => {}
+            }
+
+            if self.path_cache.len() >= MAX_PATH_CACHE_ENTRIES && !self.path_cache.contains_key(&cur)
+            {
+                self.path_cache.retain(|_, v| match v {
+                    PathCacheEntry::Found(e) => e.cached_at.elapsed() < PATH_CACHE_TTL,
+                    PathCacheEntry::Missing(since) => since.elapsed() < PATH_NEGATIVE_CACHE_TTL,
+                });
+                if self.path_cache.len() >= MAX_PATH_CACHE_ENTRIES {
+                    self.path_cache.clear();
+                }
             }
 
             if let Some(found) = inspect_directory_manifests(&cur) {
-                self.path_cache.insert(cur.clone(), Some(found.clone()));
+                self.path_cache
+                    .insert(cur.clone(), PathCacheEntry::Found(found.clone()));
                 return Some(found);
             } else {
-                self.path_cache.insert(cur.clone(), None);
+                self.path_cache
+                    .insert(cur.clone(), PathCacheEntry::Missing(Instant::now()));
             }
 
             let Some(parent) = cur.parent() else {
@@ -1159,8 +1272,6 @@ mod tests {
             image_name: exe.to_string(),
             cpu_percent: 1.0,
             private_ram_bytes: 16 * 1024 * 1024,
-            disk_read_bps: 0,
-            disk_write_bps: 0,
             uptime_secs: 120,
         }
     }
@@ -1375,14 +1486,21 @@ mod tests {
         assert_eq!(meta.project_display_name, "WorkerBot");
         assert_eq!(meta.job_title, "Auto update botu");
         assert_eq!(meta.inline_last_log.as_deref(), Some("19:14 checked 12 series"));
-        assert!(meta.job_subtitle.contains("sonraki 19:30"));
+        assert!(meta.job_subtitle.contains("next 19:30"));
 
         // Generic unreadable cmdline fallback on a port-listening notable runtime process.
         let mut other = mk_collected(44444, 555, "python.exe");
         other.private_ram_bytes = 48 * 1024 * 1024;
         let other_meta = resolver.resolve_from_peb(&other, true, Some("svchost.exe"), &empty_peb);
         assert!(!other_meta.is_ignored_noise);
-        assert!(other_meta.job_title.contains("komut satırı okunamadı"));
+        assert!(other_meta.job_title.contains("command line unavailable"));
+
+        // Switching language updates resolved subtitles & fallback titles in Turkish too.
+        resolver.set_language(Language::Tr);
+        let meta_tr = resolver.resolve_from_peb(&proc, false, None, &empty_peb);
+        assert!(meta_tr.job_subtitle.contains("sonraki 19:30"));
+        let other_tr = resolver.resolve_from_peb(&other, true, Some("svchost.exe"), &empty_peb);
+        assert!(other_tr.job_title.contains("komut satırı okunamadı"));
 
         let _ = fs::remove_dir_all(&base);
     }
@@ -1556,5 +1674,20 @@ mod tests {
         assert_eq!(meta_w.log_path.as_deref(), Some(watch_log.as_path()));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn evicts_ignored_key_when_listening_port_opens_later() {
+        let mut resolver = ProjectResolver::new(999_999);
+        let node = mk_collected(4444, 4, "node.exe");
+        let key = node.key;
+
+        // Tick 1: node has no listening port and no readable user cwd -> ignored.
+        resolver.ignored_keys.insert(key);
+        // Tick 2: node starts listening -> evicted from ignored_keys and resolved.
+        resolver.resolve_tick(&[node], false, &|pid| pid == 4444);
+
+        assert!(!resolver.ignored_keys.contains(&key));
+        assert!(resolver.cached_meta(&key).is_some_and(|m| !m.is_ignored_noise));
     }
 }

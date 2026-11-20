@@ -179,11 +179,15 @@ pub fn attach_and_run(hwnd: HWND, app: Rc<RefCell<App>>) {
             let borrowed = &*ptr;
             borrowed.borrow().cfg.hotkey
         };
-        let _ = register_hotkey(hwnd, hotkey);
+        if let Err(err) = register_hotkey(hwnd, hotkey) {
+            crate::config::log_error(&format!("hotkey registration failed: {err}"));
+            let borrowed = &*ptr;
+            borrowed.borrow_mut().ui.hotkey_failed = true;
+        }
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

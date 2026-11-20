@@ -34,8 +34,8 @@ use crate::engine::project_resolver::{
 use crate::engine::terminal::{inspect_terminal_output, ManagedJobStore};
 use crate::engine::win_nt::current_pid;
 use crate::model::{
-    Alert, AlertKind, EngineCmd, JobId, PollingMode, ProcInfo, ProcessKey, ProcessRole, ProjectId,
-    Snapshot, SortMode,
+    Alert, AlertKind, EngineCmd, JobId, Language, PollingMode, ProcInfo, ProcessKey, ProcessRole,
+    ProjectId, Snapshot, SortMode,
 };
 
 pub type WakeCallback = Arc<dyn Fn() + Send + Sync>;
@@ -45,6 +45,7 @@ use snapshot::{build_snapshot, unix_now_ms, CrashedJobRecord, ProjectRuntimeStat
 enum EngineMsg {
     Cmd(EngineCmd),
     Exited(ExitEvent),
+    ActionError(String),
 }
 
 /// Thread-safe handle held by the UI layer to read the latest `Snapshot` and send `EngineCmd`s.
@@ -160,6 +161,10 @@ struct EngineRuntime {
     next_alert_id: u64,
     tick_counter: u64,
     last_summary_sig: (u16, u16, u16, usize, i32, u64),
+    language: Language,
+    vanished_since: HashMap<ProcessKey, Instant>,
+    last_action_error: Option<(u64, String)>,
+    next_error_id: u64,
 }
 
 impl EngineRuntime {
@@ -207,7 +212,17 @@ impl EngineRuntime {
             next_alert_id: 1,
             tick_counter: 0,
             last_summary_sig: (0, 0, 0, 0, -1, 0),
+            language: Language::En,
+            vanished_since: HashMap::new(),
+            last_action_error: None,
+            next_error_id: 0,
         }
+    }
+
+    fn record_action_error(&mut self, msg: String) {
+        crate::config::log_error(&msg);
+        self.next_error_id += 1;
+        self.last_action_error = Some((self.next_error_id, msg));
     }
 
     fn current_interval(&self) -> Duration {
@@ -258,6 +273,10 @@ impl EngineRuntime {
         match msg {
             EngineMsg::Exited(ev) => {
                 self.handle_process_exit(ev);
+                true
+            }
+            EngineMsg::ActionError(err) => {
+                self.record_action_error(err);
                 true
             }
             EngineMsg::Cmd(cmd) => match cmd {
@@ -333,7 +352,10 @@ impl EngineRuntime {
                     project_order,
                     job_order,
                     sort_mode,
+                    language,
                 } => {
+                    self.language = language;
+                    self.resolver.set_language(language);
                     self.pinned_keys = pinned_projects
                         .into_iter()
                         .map(|s| s.to_ascii_lowercase())
@@ -436,10 +458,6 @@ impl EngineRuntime {
                     self.start_custom_job(&job_id);
                     true
                 }
-                EngineCmd::ReloadLabels => {
-                    self.resolver.reload_labels(true);
-                    true
-                }
                 EngineCmd::ForceRescan => {
                     self.resolver.invalidate_all();
                     true
@@ -449,6 +467,7 @@ impl EngineRuntime {
     }
 
     fn handle_process_exit(&mut self, ev: ExitEvent) {
+        self.vanished_since.remove(&ev.key);
         self.exit_watcher.unwatch(&ev.key);
         let Some(watched) = self.watched_meta.remove(&ev.key) else {
             return;
@@ -488,14 +507,13 @@ impl EngineRuntime {
         self.project_states.entry(proj_id.clone()).or_default().crashed_until =
             Some(Instant::now() + Duration::from_secs(300));
 
-        let crash_summary = format!("Çöktü · kod {}", ev.exit_code);
         let can_restart = watched.meta.restart_recipe.is_some()
             || self.restart_recipes.contains_key(&watched.meta.job_id);
         self.job_crashes.insert(
             watched.meta.job_id.clone(),
             CrashedJobRecord {
                 until: Instant::now() + Duration::from_secs(300),
-                crash_summary,
+                exit_code: ev.exit_code,
                 project_id: proj_id.clone(),
                 project_name: proj_name.clone(),
                 title: watched.meta.job_title.clone(),
@@ -514,7 +532,7 @@ impl EngineRuntime {
         let port_hint = watched
             .ports
             .first()
-            .map(|p| format!(" · :{p} kapalı"))
+            .map(|p| format!(" · :{p} {}", self.language.pick("down", "kapalı")))
             .unwrap_or_default();
         let job_name = watched.meta.job_title.clone();
         let auto_suffix = if watched.meta.auto_restart && can_restart {
@@ -525,12 +543,26 @@ impl EngineRuntime {
                     true,
                     |cmd, cwd| managed.spawn_with_capture(cmd, cwd),
                 );
-                " · otomatik yeniden başlatılıyor"
+                self.language
+                    .pick(" · auto-restarting", " · otomatik yeniden başlatılıyor")
             } else {
-                " · otomatik yeniden başlatma sınırı (3/10dk) aşıldı"
+                self.language.pick(
+                    " · auto-restart limit (3/10m) reached",
+                    " · otomatik yeniden başlatma sınırı (3/10dk) aşıldı",
+                )
             }
         } else {
             ""
+        };
+        let message = match self.language {
+            Language::En => format!(
+                "{proj_name} › {job_name} crashed (code {}{port_hint}){auto_suffix}",
+                ev.exit_code
+            ),
+            Language::Tr => format!(
+                "{proj_name} › {job_name} çöktü (kod {}{port_hint}){auto_suffix}",
+                ev.exit_code
+            ),
         };
         let alert = Alert {
             id: self.next_alert_id,
@@ -542,10 +574,7 @@ impl EngineRuntime {
                 exit_code: ev.exit_code,
                 can_restart,
             },
-            message: format!(
-                "{proj_name} › {job_name} çöktü (kod {}{port_hint}){auto_suffix}",
-                ev.exit_code
-            ),
+            message,
             timestamp_ms: unix_now_ms(),
             dismissed: false,
         };
@@ -622,16 +651,7 @@ impl EngineRuntime {
             });
 
         let current_keys: HashSet<ProcessKey> = collected.processes.iter().map(|p| p.key).collect();
-        let vanished: Vec<ProcessKey> = self
-            .watched_meta
-            .keys()
-            .filter(|k| !current_keys.contains(k))
-            .copied()
-            .collect();
-        for key in vanished {
-            self.watched_meta.remove(&key);
-            self.exit_watcher.unwatch(&key);
-        }
+        self.reconcile_vanished_watched(&current_keys, now);
 
         let self_pid = current_pid();
         let ancestors = compute_self_ancestors(&collected.processes, self_pid);
@@ -666,9 +686,11 @@ impl EngineRuntime {
         self.update_restart_recipes(&collected.processes, now);
 
         // Known stopped jobs & periodic watchdog info (cheap, 60s TTL, only while expanded).
-        let known_ref = self
-            .known_scanner
-            .get_or_refresh(allow_expanded_io, self.resolver.labels());
+        let known_ref = self.known_scanner.get_or_refresh(
+            allow_expanded_io,
+            self.resolver.labels(),
+            self.language,
+        );
 
         let sys_cpu_sample = collected.system_cpu_percent.round().clamp(0.0, 100.0) as u8;
         let sys_ram_pct = if collected.system_ram_total_bytes > 0 {
@@ -713,7 +735,23 @@ impl EngineRuntime {
             self.mode,
             self_pid,
             &ancestors,
+            self.language,
         );
+
+        if self.project_states.len() > 64 {
+            let active_ids: HashSet<ProjectId> =
+                snapshot.projects.iter().map(|p| p.id.clone()).collect();
+            self.project_states.retain(|id, st| {
+                active_ids.contains(id)
+                    || st.pinned
+                    || st.hidden
+                    || st.display_name_override.is_some()
+                    || st
+                        .last_seen
+                        .is_some_and(|t| now.saturating_duration_since(t) < Duration::from_secs(1800))
+            });
+        }
+        snapshot.last_action_error = self.last_action_error.clone();
 
         // Only compute terminal output lazily while Detail is actively open.
         if allow_expanded_io {
@@ -765,7 +803,6 @@ impl EngineRuntime {
                 .map(|p| {
                     let net = self.last_ports.get(&p.key.pid);
                     let ports = net.map(|n| n.ports.clone()).unwrap_or_default();
-                    let conns = net.map(|n| n.active_tcp_connections).unwrap_or(0);
                     let meta = self.resolver.cached_meta(&p.key);
                     ProcInfo {
                         key: p.key,
@@ -779,14 +816,13 @@ impl EngineRuntime {
                         working_dir: meta.and_then(|m| m.working_dir.clone()),
                         cpu: p.cpu_percent,
                         ram: p.private_ram_bytes,
-                        disk_read_bps: p.disk_read_bps,
-                        disk_write_bps: p.disk_write_bps,
                         ports,
-                        active_tcp_connections: conns,
                         uptime_secs: p.uptime_secs,
                         is_helper_collapsed: meta.is_some_and(|m| m.is_wrapper_or_helper),
                         is_critical_system: meta.is_some_and(|m| m.is_critical_system)
-                            || crate::engine::actions::is_hard_blacklisted_name(&p.image_name)
+                            || crate::engine::actions::is_hard_blacklisted_name(
+                                &p.image_name.to_ascii_lowercase(),
+                            )
                             || p.key.pid <= 4,
                         can_kill: meta.is_none_or(|m| !m.is_critical_system)
                             && is_kill_allowed_static(
@@ -996,8 +1032,14 @@ impl EngineRuntime {
         }
 
         if !async_port_wait || expected_ports.is_empty() {
+            let mut errs = Vec::new();
             for rec in &recipes {
-                let _ = spawn_sync(&rec.recipe.raw_cmdline, &rec.recipe.working_dir);
+                if let Err(err) = spawn_sync(&rec.recipe.raw_cmdline, &rec.recipe.working_dir) {
+                    errs.push(err);
+                }
+            }
+            for err in errs {
+                self.record_action_error(err);
             }
             return;
         }
@@ -1015,29 +1057,72 @@ impl EngineRuntime {
                     thread::sleep(Duration::from_millis(100));
                 }
                 for rec in &recipes {
-                    let _ = managed.spawn_with_capture(&rec.recipe.raw_cmdline, &rec.recipe.working_dir);
+                    if let Err(err) =
+                        managed.spawn_with_capture(&rec.recipe.raw_cmdline, &rec.recipe.working_dir)
+                    {
+                        let _ = tx.send(EngineMsg::ActionError(err));
+                    }
                 }
                 let _ = tx.send(EngineMsg::Cmd(EngineCmd::ForceRescan));
             });
     }
 
-    fn start_custom_job(&self, job_id: &JobId) {
+    fn reconcile_vanished_watched(&mut self, current_keys: &HashSet<ProcessKey>, now: Instant) {
+        self.vanished_since.retain(|k, _| !current_keys.contains(k));
+        let vanished: Vec<ProcessKey> = self
+            .watched_meta
+            .keys()
+            .filter(|k| !current_keys.contains(k))
+            .copied()
+            .collect();
+        for key in vanished {
+            if let Some(code) = self
+                .exit_watcher
+                .poll_exit_code(&key)
+                .or_else(|| self.managed_jobs.take_exit_code(key.pid))
+            {
+                self.vanished_since.remove(&key);
+                self.handle_process_exit(ExitEvent { key, exit_code: code });
+            } else {
+                let since = *self.vanished_since.entry(key).or_insert(now);
+                if now.saturating_duration_since(since) >= Duration::from_secs(3) {
+                    self.watched_meta.remove(&key);
+                    self.vanished_since.remove(&key);
+                    self.exit_watcher.unwatch(&key);
+                }
+            }
+        }
+    }
+
+    fn start_custom_job(&mut self, job_id: &JobId) {
         let j_low = job_id.0.to_ascii_lowercase();
-        let rule = self.resolver.labels().rules().iter().find(|r| {
-            let needle = r.match_substr.trim().to_ascii_lowercase();
-            !needle.is_empty()
-                && r.command.as_ref().is_some_and(|c| !c.trim().is_empty())
-                && (j_low == format!("custom:{needle}") || j_low.contains(&needle))
-        });
+        let rule = self
+            .resolver
+            .labels()
+            .rules()
+            .iter()
+            .find(|r| {
+                let needle = r.match_substr.trim().to_ascii_lowercase();
+                !needle.is_empty()
+                    && r.command.as_ref().is_some_and(|c| !c.trim().is_empty())
+                    && (j_low == format!("custom:{needle}") || j_low.contains(&needle))
+            })
+            .cloned();
         if let Some(rule) = rule {
             if let Some(ref cmd) = rule.command {
                 let cwd = rule
                     .working_dir
                     .as_deref()
                     .map(|w| PathBuf::from(expand_win_env_vars(w)))
-                    .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+                    .or_else(|| {
+                        std::env::var_os("USERPROFILE")
+                            .or_else(|| std::env::var_os("HOME"))
+                            .map(PathBuf::from)
+                    })
                     .unwrap_or_else(|| PathBuf::from("."));
-                let _ = self.managed_jobs.spawn_with_capture(cmd, &cwd);
+                if let Err(err) = self.managed_jobs.spawn_with_capture(cmd, &cwd) {
+                    self.record_action_error(err);
+                }
             }
         }
     }
@@ -1082,8 +1167,6 @@ mod tests {
             image_name: name.to_string(),
             cpu_percent: 2.0,
             private_ram_bytes: 20 * 1024 * 1024,
-            disk_read_bps: 0,
-            disk_write_bps: 0,
             uptime_secs: uptime,
         };
 
@@ -1186,7 +1269,6 @@ mod tests {
                     is_listening: true,
                     suggested_url: Some("http://localhost:18911".to_string()),
                 }],
-                active_tcp_connections: 0,
             },
         );
 
@@ -1222,6 +1304,7 @@ mod tests {
             PollingMode::ExpandedActive,
             999_999,
             &HashSet::new(),
+            Language::En,
         );
 
         // Short-lived 3s job (`studio`) must be debounced out!
@@ -1292,6 +1375,7 @@ mod tests {
             PollingMode::ExpandedActive,
             999_999,
             &HashSet::new(),
+            Language::En,
         );
 
         assert_eq!(snap.projects.len(), 1);
@@ -1347,8 +1431,6 @@ mod tests {
             image_name: "python.exe".to_string(),
             cpu_percent: 0.2,
             private_ram_bytes: 32 * 1024 * 1024,
-            disk_read_bps: 0,
-            disk_write_bps: 0,
             uptime_secs: 600,
         };
         let snap2 = build_snapshot(
@@ -1375,6 +1457,7 @@ mod tests {
             PollingMode::ExpandedActive,
             999_999,
             &HashSet::new(),
+            Language::En,
         );
         assert_eq!(snap2.projects.len(), 1);
         assert_eq!(snap2.projects[0].jobs.len(), 1, "must deduplicate active state-bound job vs known stopped job");
@@ -1530,6 +1613,7 @@ mod tests {
             PollingMode::ExpandedActive,
             999_999,
             &HashSet::new(),
+            Language::En,
         );
 
         assert_eq!(snap.projects.len(), 2);
@@ -1663,8 +1747,6 @@ mod tests {
             image_name: "pythonw.exe".to_string(),
             cpu_percent: 1.0,
             private_ram_bytes: 20 * 1024 * 1024,
-            disk_read_bps: 0,
-            disk_write_bps: 0,
             uptime_secs: 60,
         };
         let p_child = CollectedProcess {
@@ -1674,8 +1756,6 @@ mod tests {
             image_name: "pythonw.exe".to_string(),
             cpu_percent: 2.0,
             private_ram_bytes: 30 * 1024 * 1024,
-            disk_read_bps: 0,
-            disk_write_bps: 0,
             uptime_secs: 60,
         };
 
@@ -1738,6 +1818,7 @@ mod tests {
             PollingMode::ExpandedActive,
             999_999,
             &HashSet::new(),
+            Language::En,
         );
         assert_eq!(snap.projects.len(), 1);
         assert_eq!(snap.projects[0].status, ProjectStatus::Crashed);
@@ -1745,7 +1826,7 @@ mod tests {
         assert_eq!(snap.projects[0].jobs[0].status, ProjectStatus::Crashed);
         assert_eq!(
             snap.projects[0].jobs[0].crash_summary.as_deref(),
-            Some("Çöktü · kod 1")
+            Some("Crashed · code 1")
         );
         assert!(snap.projects[0].jobs[0].can_restart);
         let filtered = crate::ui::layout::filter_project_jobs(&snap, "acme");
@@ -1805,6 +1886,7 @@ mod tests {
             project_order: Vec::new(),
             job_order: Vec::new(),
             sort_mode: SortMode::Custom,
+            language: Language::En,
         }));
         let snap_hidden = build_snapshot(
             &[],
@@ -1830,6 +1912,7 @@ mod tests {
             PollingMode::ExpandedActive,
             999_999,
             &HashSet::new(),
+            Language::En,
         );
         assert!(snap_hidden.projects.is_empty());
 
@@ -1841,6 +1924,7 @@ mod tests {
             project_order: Vec::new(),
             job_order: Vec::new(),
             sort_mode: SortMode::Custom,
+            language: Language::En,
         }));
         let snap_restored = build_snapshot(
             &[],
@@ -1866,6 +1950,7 @@ mod tests {
             PollingMode::ExpandedActive,
             999_999,
             &HashSet::new(),
+            Language::En,
         );
         assert_eq!(snap_restored.projects.len(), 1);
         assert_eq!(snap_restored.projects[0].name, "HiddenProj");
@@ -1887,5 +1972,68 @@ mod tests {
 
         // Expired attempts (> 10 minutes old) are pruned so auto-restart works again later.
         assert!(rt.record_and_should_auto_restart(&job_id, t0 + Duration::from_secs(601)));
+    }
+
+    #[test]
+    fn reconcile_vanished_watched_preserves_meta_until_grace_or_exit() {
+        let latest = Arc::new(Mutex::new(Arc::new(Snapshot::default())));
+        let wake: WakeCallback = Arc::new(|| {});
+        let (tx, _rx) = mpsc::channel();
+        let mut rt = EngineRuntime::new(latest, wake, tx);
+
+        let key = ProcessKey::new(777_001, 42);
+        let key_stale = ProcessKey::new(777_002, 43);
+        let mk_snap = |job: &str| WatchedProcessSnapshot {
+            meta: Arc::new(ProcessMetadata {
+                image_name: "python.exe".to_string(),
+                working_dir: None,
+                sanitized_cmdline: None,
+                access_limited: false,
+                project_id: ProjectId("path:c:\\dev\\race".to_string()),
+                project_display_name: "RaceProj".to_string(),
+                project_root: None,
+                git_branch: None,
+                job_id: JobId(job.to_string()),
+                job_title: "Worker".to_string(),
+                job_subtitle: "RaceProj".to_string(),
+                job_icon: None,
+                job_color: None,
+                match_hint: "worker.py".to_string(),
+                log_path: None,
+                inline_last_log: None,
+                custom_command: None,
+                is_watched: true,
+                role: ProcessRole::WorkerOrQueue,
+                role_label: "Worker".to_string(),
+                inference_source: crate::engine::project_resolver::InferenceSource::ManifestPyProject,
+                is_ignored_noise: false,
+                is_wrapper_or_helper: false,
+                is_critical_system: false,
+                restart_recipe: None,
+                auto_restart: false,
+            }),
+            had_port: true,
+            uptime_secs: 30,
+            ports: vec![9000],
+        };
+        rt.watched_meta.insert(key, mk_snap("job::1"));
+        rt.watched_meta.insert(key_stale, mk_snap("job::2"));
+
+        let empty = HashSet::new();
+        let t0 = Instant::now();
+        rt.reconcile_vanished_watched(&empty, t0);
+        // Within 3s grace period, watched_meta is NOT prematurely wiped.
+        assert!(rt.watched_meta.contains_key(&key));
+        assert!(rt.watched_meta.contains_key(&key_stale));
+
+        // Late exit event arrives 500ms later -> crash recorded!
+        rt.reconcile_vanished_watched(&empty, t0 + Duration::from_millis(500));
+        rt.handle_process_exit(ExitEvent { key, exit_code: 1 });
+        assert!(rt.job_crashes.contains_key(&JobId("job::1".to_string())));
+        assert_eq!(rt.alerts.len(), 1);
+
+        // Stale vanished entry with no exit event is evicted once 3s grace expires.
+        rt.reconcile_vanished_watched(&empty, t0 + Duration::from_secs(4));
+        assert!(!rt.watched_meta.contains_key(&key_stale));
     }
 }

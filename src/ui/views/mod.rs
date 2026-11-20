@@ -367,7 +367,6 @@ mod tests {
                 status: ProjectStatus::Crashed,
                 cpu: 0.0,
                 ram: 0,
-                disk_bps: 0,
                 ports: Vec::new(),
                 jobs: vec![Job {
                     id: JobId("j".to_string()),
@@ -396,7 +395,6 @@ mod tests {
                 }],
                 watchdog_note: None,
                 procs: Vec::new(),
-                helper_count: 0,
                 cpu_history: [0; 30],
                 ram_history_mb: [0; 30],
             }],

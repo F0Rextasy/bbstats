@@ -12,27 +12,31 @@ fn main() {
     let manifest_root = PathBuf::from(&manifest_dir);
     let manifest = manifest_root.join("assets").join("app.manifest");
     println!("cargo:rerun-if-changed={}", manifest.display());
-    println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-    let rel_manifest = Path::new("assets").join("app.manifest");
-    if rel_manifest.is_file() {
-        println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:assets\\app.manifest");
-    } else {
-        println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+        let rel_manifest = Path::new("assets").join("app.manifest");
+        if rel_manifest.is_file() {
+            println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:assets\\app.manifest");
+        } else {
+            println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", manifest.display());
+        }
     }
 
     let sizes = [16u32, 32u32, 48u32];
     let dibs: Vec<(u32, Vec<u8>)> = sizes.iter().map(|&sz| (sz, build_icon_dib(sz))).collect();
 
     let ico_path = manifest_root.join("assets").join("bbstats.ico");
-    let ico_bytes = build_ico_file(&dibs);
-    let needs_ico_write = fs::read(&ico_path)
-        .map(|existing| existing != ico_bytes)
-        .unwrap_or(true);
-    if needs_ico_write {
-        if let Some(parent) = ico_path.parent() {
-            let _ = fs::create_dir_all(parent);
+    if env::var_os("BBSTATS_REGEN_ICO").is_some() || !ico_path.is_file() {
+        let ico_bytes = build_ico_file(&dibs);
+        let needs_ico_write = fs::read(&ico_path)
+            .map(|existing| existing != ico_bytes)
+            .unwrap_or(true);
+        if needs_ico_write {
+            if let Some(parent) = ico_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(&ico_path, &ico_bytes).expect("failed to write assets/bbstats.ico");
         }
-        fs::write(&ico_path, &ico_bytes).expect("failed to write assets/bbstats.ico");
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

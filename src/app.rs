@@ -2,7 +2,7 @@
 
 use crate::config::{autostart, AppConfig, DockPosition, HotkeyPreset};
 use crate::engine::EngineHandle;
-use crate::model::{AlertKind, EngineCmd, PollingMode, Snapshot, SortMode};
+use crate::model::{Alert, AlertKind, EngineCmd, PollingMode, Snapshot, SortMode};
 use crate::platform::dpi::{dip_to_px, is_reduced_motion, window_dpi};
 use crate::platform::fullscreen::is_fullscreen_active;
 use crate::platform::hotkey::register_hotkey;
@@ -25,11 +25,36 @@ use crate::ui::views::{render_ui, MorphParams};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Instant;
-use windows::core::PCWSTR;
+use std::time::{Duration, Instant};
+use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Foundation::{GlobalFree, HWND};
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
-use windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED;
+use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
+
+const D2DERR_RECREATE_TARGET: HRESULT = HRESULT(0x8899_000C_u32 as i32);
+
+#[inline]
+fn is_device_lost_error(code: HRESULT) -> bool {
+    code == DXGI_ERROR_DEVICE_REMOVED
+        || code == DXGI_ERROR_DEVICE_RESET
+        || code == D2DERR_RECREATE_TARGET
+}
+
+fn collect_unnotified_crash_alerts<'a>(
+    alerts: &'a [Alert],
+    last_id: &mut u64,
+) -> Vec<&'a Alert> {
+    let mut out = Vec::new();
+    for a in alerts.iter().rev() {
+        if !a.dismissed && a.id > *last_id {
+            *last_id = a.id;
+            if matches!(a.kind, AlertKind::Crash { .. }) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
@@ -83,10 +108,12 @@ pub struct App {
 
     animating: bool,
     last_anim_tick: Instant,
+    last_hover_render: Instant,
     mouse_tracked: bool,
     last_mouse_dip: (f32, f32),
     last_collapsed_sig: Option<u64>,
     last_notified_alert_id: u64,
+    last_seen_action_error_id: u64,
     pub menu_open: bool,
 }
 
@@ -134,12 +161,26 @@ impl App {
             win_rect_px: init_rect,
             animating: false,
             last_anim_tick: Instant::now(),
+            last_hover_render: Instant::now(),
             mouse_tracked: false,
             last_mouse_dip: (0.0, 0.0),
             last_collapsed_sig: None,
             last_notified_alert_id: 0,
+            last_seen_action_error_id: 0,
             menu_open: false,
         };
+        if let Some(ref err) = app.cfg.load_error {
+            crate::config::log_error(err);
+            let msg = app
+                .cfg
+                .language
+                .pick(
+                    "Corrupt config.toml backed up to .bak",
+                    "Bozuk config.toml .bak olarak yedeklendi",
+                )
+                .to_string();
+            app.set_toast(msg);
+        }
         app.sync_engine_intervals();
         app.sync_config_to_engine();
         set_window_topmost(app.hwnd, app.cfg.always_on_top);
@@ -151,24 +192,53 @@ impl App {
         app
     }
 
+    fn set_toast(&mut self, msg: String) {
+        self.ui.toast = Some((msg, Instant::now()));
+    }
+
+    fn save_cfg_or_toast(&mut self) {
+        if let Err(err) = self.cfg.save() {
+            crate::config::log_error(&format!("config save failed: {err}"));
+            let msg = self
+                .cfg
+                .language
+                .pick("Could not save settings.", "Ayarlar kaydedilemedi.")
+                .to_string();
+            self.set_toast(msg);
+        }
+    }
+
     pub fn on_snapshot(&mut self) {
         self.snap = self.engine.latest();
-        for a in &self.snap.alerts {
-            if !a.dismissed && a.id > self.last_notified_alert_id {
-                self.last_notified_alert_id = a.id;
-                if self.cfg.notify_on_crash && matches!(a.kind, AlertKind::Crash { .. }) {
-                    self.tray.show_balloon(
-                        self.cfg
-                            .language
-                            .pick("bbstats — Process Crashed", "bbstats — Süreç Çöktü"),
-                        &a.message,
-                    );
-                }
+        let toast_expired = self
+            .ui
+            .toast
+            .as_ref()
+            .is_some_and(|(_, ts)| ts.elapsed().as_secs() >= 5);
+        if toast_expired {
+            self.ui.toast = None;
+        }
+        let unnotified =
+            collect_unnotified_crash_alerts(&self.snap.alerts, &mut self.last_notified_alert_id);
+        if self.cfg.notify_on_crash {
+            for a in unnotified {
+                self.tray.show_balloon(
+                    self.cfg
+                        .language
+                        .pick("bbstats — Process Crashed", "bbstats — Süreç Çöktü"),
+                    &a.message,
+                );
+            }
+        }
+        if let Some((err_id, ref err_msg)) = self.snap.last_action_error {
+            if err_id > self.last_seen_action_error_id {
+                self.last_seen_action_error_id = err_id;
+                self.set_toast(err_msg.clone());
             }
         }
         if matches!(self.ui.mode, ViewMode::Collapsed) && !self.animating {
             let sig = collapsed_visual_sig(&self.snap);
-            if self.last_collapsed_sig == Some(sig) {
+            if self.last_collapsed_sig == Some(sig) && !toast_expired {
                 return;
             }
             self.last_collapsed_sig = Some(sig);
@@ -582,7 +652,26 @@ impl App {
         }
     }
 
+    fn recreate_graphics_resources(&mut self) -> windows::core::Result<()> {
+        let surf_w_px = self.win_rect_px.2.max(1);
+        let surf_h_px = self.win_rect_px.3.max(1);
+        self.device.recreate()?;
+        self.comp
+            .recreate_surface(&self.device, surf_w_px, surf_h_px)
+    }
+
     pub fn render_frame(&mut self) -> windows::core::Result<()> {
+        match self.render_frame_once() {
+            Ok(()) => Ok(()),
+            Err(e) if is_device_lost_error(e.code()) => {
+                self.recreate_graphics_resources()?;
+                self.render_frame_once()
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn render_frame_once(&mut self) -> windows::core::Result<()> {
         let w_dip = self.w_dip.value.max(40.0);
         let h_dip = self.h_dip.value.max(24.0);
         let r_dip = self.radius_dip.value.max(4.0);
@@ -611,16 +700,7 @@ impl App {
             r_px,
         )?;
 
-        let dc = match self.comp.begin_draw(self.dpi, off_x_dip, off_y_dip) {
-            Ok(dc) => dc,
-            Err(e) if e.code() == DXGI_ERROR_DEVICE_REMOVED => {
-                self.device.recreate()?;
-                self.comp
-                    .recreate_surface(&self.device, surf_w_px, surf_h_px)?;
-                self.comp.begin_draw(self.dpi, off_x_dip, off_y_dip)?
-            }
-            Err(e) => return Err(e),
-        };
+        let dc = self.comp.begin_draw(self.dpi, off_x_dip, off_y_dip)?;
 
         unsafe {
             dc.Clear(Some(&D2D1_COLOR_F {
@@ -664,16 +744,7 @@ impl App {
         );
 
         let end_res = self.comp.end_draw();
-        if let Err(e) = draw_res.and(end_res) {
-            if e.code() == DXGI_ERROR_DEVICE_REMOVED {
-                self.device.recreate()?;
-                self.comp
-                    .recreate_surface(&self.device, surf_w_px, surf_h_px)?;
-            } else {
-                return Err(e);
-            }
-        }
-        Ok(())
+        draw_res.and(end_res)
     }
 
     #[inline]
@@ -751,9 +822,13 @@ impl App {
         if moved_enough {
             self.ui.hover_pos_dip = next_pos;
         }
+        let throttle_ok =
+            hover_changed || self.last_hover_render.elapsed() >= Duration::from_millis(16);
         if (hover_changed || moved_enough)
+            && throttle_ok
             && (!matches!(self.ui.mode, ViewMode::Collapsed) || self.cfg.idle_opacity >= 0.25)
         {
+            self.last_hover_render = Instant::now();
             let _ = self.render_frame();
         }
     }
@@ -1049,14 +1124,20 @@ impl App {
                     self.set_mode(ViewMode::Expanded, true);
                 }
             }
+            v if v == VK_TAB.0 && matches!(self.ui.mode, ViewMode::Expanded) => {
+                self.ui.search_focused = !self.ui.search_focused;
+                self.ui.text_all_selected = false;
+                let _ = self.render_frame();
+            }
             v if v == VK_DELETE.0
                 && matches!(self.ui.mode, ViewMode::Expanded)
-                && !self.ui.search_focused =>
+                && (!self.ui.search_focused || self.ui.search_query.is_empty()) =>
             {
                 let jid = filter_project_jobs(&self.snap, &self.ui.search_query)
                     .into_iter()
                     .flat_map(|(_, jobs)| jobs.into_iter())
                     .nth(self.ui.selected_index)
+                    .filter(|j| j.can_kill)
                     .map(|j| j.id.clone());
                 if let Some(id) = jid {
                     self.ui.pending_kill = Some(PendingKill::Job(id));
@@ -1083,6 +1164,7 @@ impl App {
                 .into_iter()
                 .flat_map(|(_, jobs)| jobs.into_iter())
                 .nth(self.ui.selected_index)
+                .filter(|j| j.can_kill)
                 .map(|j| j.id.clone());
             if let Some(id) = jid {
                 self.ui.pending_kill = Some(PendingKill::Job(id));
@@ -1091,15 +1173,12 @@ impl App {
             return true;
         }
         if vk == VK_P.0 {
-            let info = filter_project_jobs(&self.snap, &self.ui.search_query)
+            let id = filter_project_jobs(&self.snap, &self.ui.search_query)
                 .into_iter()
-                .flat_map(|(p, jobs)| jobs.into_iter().map(move |_| (p.id.clone(), !p.pinned)))
+                .flat_map(|(p, jobs)| jobs.into_iter().map(move |_| p.id.clone()))
                 .nth(self.ui.selected_index);
-            if let Some((id, pinned)) = info {
-                self.engine.send(EngineCmd::SetPinned {
-                    project_id: id,
-                    pinned,
-                });
+            if let Some(id) = id {
+                self.execute_hit_action(HitAction::TogglePinProject(id));
             }
             return true;
         }
@@ -1237,7 +1316,7 @@ impl App {
                     if next {
                         self.cfg.pinned_projects.push(id.0.clone());
                     }
-                    let _ = self.cfg.save();
+                    self.save_cfg_or_toast();
                     self.engine.send(EngineCmd::SetPinned {
                         project_id: id,
                         pinned: next,
@@ -1246,9 +1325,8 @@ impl App {
             }
             HitAction::CycleSortMode => {
                 self.cfg.sort_mode = self.cfg.sort_mode.next();
-                let _ = self.cfg.save();
+                self.save_cfg_or_toast();
                 self.sync_config_to_engine();
-                self.engine.send(EngineCmd::ForceRescan);
                 let _ = self.render_frame();
             }
             HitAction::MoveProjectOrder(id, delta) => {
@@ -1256,9 +1334,8 @@ impl App {
                     self.snap.projects.iter().map(|p| p.id.0.clone()).collect();
                 if reorder_vec(&mut self.cfg.project_order, &current_ids, &id.0, delta) {
                     self.cfg.sort_mode = SortMode::Custom;
-                    let _ = self.cfg.save();
+                    self.save_cfg_or_toast();
                     self.sync_config_to_engine();
-                    self.engine.send(EngineCmd::ForceRescan);
                 }
             }
             HitAction::MoveJobOrder(key, delta) => {
@@ -1277,9 +1354,8 @@ impl App {
                     .collect();
                 if reorder_vec(&mut self.cfg.job_order, &current_ids, &key, delta) {
                     self.cfg.sort_mode = SortMode::Custom;
-                    let _ = self.cfg.save();
+                    self.save_cfg_or_toast();
                     self.sync_config_to_engine();
-                    self.engine.send(EngineCmd::ForceRescan);
                 }
             }
             HitAction::OpenPort { port, url } => {
@@ -1298,7 +1374,7 @@ impl App {
                 {
                     self.cfg.hidden_projects.push(id.0.clone());
                 }
-                let _ = self.cfg.save();
+                self.save_cfg_or_toast();
                 self.sync_config_to_engine();
                 let leave_detail = matches!(
                     &self.ui.mode,
@@ -1312,7 +1388,7 @@ impl App {
             HitAction::RestoreHiddenProjects => {
                 if !self.cfg.hidden_projects.is_empty() {
                     self.cfg.hidden_projects.clear();
-                    let _ = self.cfg.save();
+                    self.save_cfg_or_toast();
                     self.sync_config_to_engine();
                     self.engine.send(EngineCmd::ForceRescan);
                     let _ = self.render_frame();
@@ -1371,7 +1447,7 @@ impl App {
                     if !new_name.is_empty() {
                         if let Some(pid) = draft.project_id {
                             self.cfg.project_aliases.insert(pid.0.clone(), new_name.clone());
-                            let _ = self.cfg.save();
+                            self.save_cfg_or_toast();
                             self.engine.send(EngineCmd::SetAlias {
                                 project_id: pid,
                                 custom_name: Some(new_name),
@@ -1540,7 +1616,8 @@ impl App {
             HitAction::SetLanguage(lang) => {
                 if self.cfg.language != lang {
                     self.cfg.language = lang;
-                    let _ = self.cfg.save();
+                    self.save_cfg_or_toast();
+                    self.sync_config_to_engine();
                     let _ = self.render_frame();
                 }
             }
@@ -1549,7 +1626,8 @@ impl App {
                 self.monitors = enumerate_monitors();
                 if !self.monitors.is_empty() {
                     self.cfg.monitor_index = (self.cfg.monitor_index + 1) % self.monitors.len();
-                    let _ = self.cfg.save();
+                    self.dpi = self.monitors[self.cfg.monitor_index].dpi;
+                    self.save_cfg_or_toast();
                     self.recompute_targets(false);
                     let _ = self.render_frame();
                 }
@@ -1557,7 +1635,7 @@ impl App {
             HitAction::ToggleAlwaysOnTop => self.toggle_always_on_top(),
             HitAction::ToggleAcrylic => {
                 self.cfg.acrylic_enabled = !self.cfg.acrylic_enabled;
-                let _ = self.cfg.save();
+                self.save_cfg_or_toast();
                 let _ = self.render_frame();
             }
             HitAction::AdjustIdleOpacity(delta) => {
@@ -1565,7 +1643,7 @@ impl App {
                 if self.cfg.idle_opacity < 0.03 {
                     self.cfg.idle_opacity = 0.0;
                 }
-                let _ = self.cfg.save();
+                self.save_cfg_or_toast();
                 let _ = self.render_frame();
             }
             HitAction::AdjustOpacity(delta) => {
@@ -1573,19 +1651,19 @@ impl App {
                 if !matches!(self.ui.mode, ViewMode::Collapsed) {
                     self.bg_alpha.snap(self.cfg.glass_opacity);
                 }
-                let _ = self.cfg.save();
+                self.save_cfg_or_toast();
                 let _ = self.render_frame();
             }
             HitAction::ToggleFullscreenHide => {
                 self.cfg.hide_on_fullscreen = !self.cfg.hide_on_fullscreen;
-                let _ = self.cfg.save();
+                self.save_cfg_or_toast();
                 self.sync_fullscreen_timer();
                 self.check_fullscreen();
                 let _ = self.render_frame();
             }
             HitAction::ToggleCrashNotify => {
                 self.cfg.notify_on_crash = !self.cfg.notify_on_crash;
-                let _ = self.cfg.save();
+                self.save_cfg_or_toast();
                 let _ = self.render_frame();
             }
             HitAction::ToggleHotkeyPreset => {
@@ -1593,15 +1671,21 @@ impl App {
                     HotkeyPreset::AltSpace => HotkeyPreset::CtrlShiftP,
                     HotkeyPreset::CtrlShiftP => HotkeyPreset::AltSpace,
                 };
-                let _ = register_hotkey(self.hwnd, self.cfg.hotkey);
-                let _ = self.cfg.save();
+                match register_hotkey(self.hwnd, self.cfg.hotkey) {
+                    Ok(()) => self.ui.hotkey_failed = false,
+                    Err(err) => {
+                        crate::config::log_error(&format!("hotkey registration failed: {err}"));
+                        self.ui.hotkey_failed = true;
+                    }
+                }
+                self.save_cfg_or_toast();
                 let _ = self.render_frame();
             }
             HitAction::ToggleAutostart => self.toggle_autostart(),
             HitAction::AdjustPeekDelay(delta) => {
                 let next = (self.cfg.hover_peek_delay_ms as i32 + delta).clamp(80, 600);
                 self.cfg.hover_peek_delay_ms = next as u32;
-                let _ = self.cfg.save();
+                self.save_cfg_or_toast();
                 let _ = self.render_frame();
             }
         }
@@ -1613,7 +1697,7 @@ impl App {
         }
         self.cfg.dock_position = pos;
         self.last_collapsed_sig = None;
-        let _ = self.cfg.save();
+        self.save_cfg_or_toast();
         // Animate the move across the screen using spring.morph!
         self.recompute_targets(false);
         let _ = self.render_frame();
@@ -1623,7 +1707,7 @@ impl App {
         let next = !self.cfg.autostart;
         if autostart::set_autostart_enabled(next).is_ok() {
             self.cfg.autostart = next;
-            let _ = self.cfg.save();
+            self.save_cfg_or_toast();
             let _ = self.render_frame();
         }
     }
@@ -1631,7 +1715,7 @@ impl App {
     pub fn toggle_always_on_top(&mut self) {
         self.cfg.always_on_top = !self.cfg.always_on_top;
         set_window_topmost(self.hwnd, self.cfg.always_on_top);
-        let _ = self.cfg.save();
+        self.save_cfg_or_toast();
         let _ = self.render_frame();
     }
 
@@ -1643,7 +1727,7 @@ impl App {
             TrayAction::ToggleAutostart => self.toggle_autostart(),
             TrayAction::ToggleFullscreenHide => {
                 self.cfg.hide_on_fullscreen = !self.cfg.hide_on_fullscreen;
-                let _ = self.cfg.save();
+                self.save_cfg_or_toast();
                 self.sync_fullscreen_timer();
                 self.check_fullscreen();
             }
@@ -1726,6 +1810,7 @@ impl App {
             project_order: self.cfg.project_order.clone(),
             job_order: self.cfg.job_order.clone(),
             sort_mode: self.cfg.sort_mode,
+            language: self.cfg.language,
         });
     }
 }
@@ -1751,7 +1836,7 @@ fn reorder_vec(order: &mut Vec<String>, visible_ids: &[String], target: &str, de
 }
 
 fn derive_match_hint(raw: &str) -> String {
-    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    let tokens = crate::engine::project_resolver::split_cmdline_args(raw);
     if tokens.is_empty() {
         return String::new();
     }
@@ -1781,7 +1866,7 @@ fn derive_match_hint(raw: &str) -> String {
 }
 
 fn derive_workdir_from_cmd(raw: &str) -> Option<String> {
-    for tok in raw.split_whitespace() {
+    for tok in crate::engine::project_resolver::split_cmdline_args(raw) {
         let clean = tok.trim_matches(|c| c == '"' || c == '\'');
         let p = std::path::Path::new(clean);
         if p.is_absolute() {
@@ -2049,7 +2134,64 @@ mod tests {
             derive_match_hint(r#"python "C:\work\my_bot.py" --port 8080"#),
             "my_bot.py"
         );
+        assert_eq!(
+            derive_match_hint(r#"python "C:\My Work\Projects\worker bot.py" --port 8080"#),
+            "worker bot.py"
+        );
         assert_eq!(derive_match_hint("redis-server.exe"), "redis-server.exe");
+    }
+
+    #[test]
+    fn collect_unnotified_crash_alerts_delivers_all_simultaneous_crashes_in_order() {
+        use crate::model::{JobId, ProjectId};
+        let alerts = vec![
+            Alert {
+                id: 3,
+                project_id: ProjectId("p3".into()),
+                project_name: "P3".into(),
+                kind: AlertKind::Crash {
+                    pid: 30,
+                    process_name: "node".into(),
+                    exit_code: 1,
+                    can_restart: false,
+                },
+                message: "P3 crashed".into(),
+                timestamp_ms: 300,
+                dismissed: false,
+            },
+            Alert {
+                id: 2,
+                project_id: ProjectId("p2".into()),
+                project_name: "P2".into(),
+                kind: AlertKind::HighCpu {
+                    cpu_percent: 95.0,
+                    duration_secs: 20,
+                },
+                message: "P2 cpu".into(),
+                timestamp_ms: 200,
+                dismissed: false,
+            },
+            Alert {
+                id: 1,
+                project_id: ProjectId("p1".into()),
+                project_name: "P1".into(),
+                kind: AlertKind::Crash {
+                    pid: 10,
+                    process_name: "python".into(),
+                    exit_code: 2,
+                    can_restart: true,
+                },
+                message: "P1 crashed".into(),
+                timestamp_ms: 100,
+                dismissed: false,
+            },
+        ];
+        let _ = JobId("unused".into());
+        let mut last_id = 0;
+        let out = collect_unnotified_crash_alerts(&alerts, &mut last_id);
+        assert_eq!(last_id, 3);
+        let ids: Vec<u64> = out.iter().map(|a| a.id).collect();
+        assert_eq!(ids, vec![1, 3]);
     }
 
     #[test]

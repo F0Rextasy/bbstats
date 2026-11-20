@@ -62,6 +62,9 @@ pub struct UiState {
     pub detail_tab_t: f32,
     pub detail_tab_dir: f32,
     pub pending_kill: Option<PendingKill>,
+    pub hotkey_failed: bool,
+    #[cfg(target_os = "windows")]
+    pub toast: Option<(String, std::time::Instant)>,
 }
 
 impl Default for UiState {
@@ -87,6 +90,9 @@ impl Default for UiState {
             detail_tab_t: 1.0,
             detail_tab_dir: 1.0,
             pending_kill: None,
+            hotkey_failed: false,
+            #[cfg(target_os = "windows")]
+            toast: None,
         }
     }
 }
@@ -292,7 +298,18 @@ pub fn target_dimensions(
         ViewMode::Detail { project_id, job_id } => {
             let proj_opt = snap.projects.iter().find(|p| &p.id == project_id);
             let proc_count = proj_opt
-                .map(|p| p.procs.len())
+                .map(|p| {
+                    if p.jobs.len() > 1 {
+                        if let Some(jid) = job_id {
+                            if let Some(j) = p.jobs.iter().find(|j| &j.id == jid) {
+                                return j.procs.len();
+                            }
+                        } else if let Some(j) = p.jobs.first() {
+                            return j.procs.len();
+                        }
+                    }
+                    p.procs.len()
+                })
                 .unwrap_or(1)
                 .clamp(1, 4) as f32;
             let tab_rows = proj_opt
@@ -406,12 +423,10 @@ mod tests {
                 status: ProjectStatus::Healthy,
                 cpu: 0.0,
                 ram: 0,
-                disk_bps: 0,
                 ports: Vec::new(),
                 jobs,
                 watchdog_note: None,
                 procs: Vec::new(),
-                helper_count: 0,
                 cpu_history: [0; 30],
                 ram_history_mb: [0; 30],
             }],

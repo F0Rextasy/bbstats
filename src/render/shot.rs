@@ -58,10 +58,7 @@ pub fn build_demo_snapshot() -> Snapshot {
         working_dir: Some(PathBuf::from(root)),
         cpu,
         ram: ram_mb * mb,
-        disk_read_bps: 0,
-        disk_write_bps: 0,
         ports,
-        active_tcp_connections: 4,
         uptime_secs: uptime,
         is_helper_collapsed: false,
         is_critical_system: false,
@@ -178,7 +175,6 @@ pub fn build_demo_snapshot() -> Snapshot {
         status: ProjectStatus::Healthy,
         cpu: 11.4,
         ram: 492 * mb,
-        disk_bps: 0,
         ports: vec![mk_port(8080), mk_port(5173), mk_port(9091)],
         jobs: vec![
             mk_job(
@@ -226,7 +222,6 @@ pub fn build_demo_snapshot() -> Snapshot {
         ],
         watchdog_note: None,
         procs: acme_all_procs,
-        helper_count: 1,
         cpu_history: [
             6, 8, 9, 14, 18, 13, 11, 10, 15, 22, 19, 14, 12, 10, 13, 16, 20, 17, 13, 11, 12, 15,
             18, 16, 13, 11, 12, 14, 12, 11,
@@ -294,7 +289,6 @@ pub fn build_demo_snapshot() -> Snapshot {
         status: ProjectStatus::Healthy,
         cpu: 19.6,
         ram: 488 * mb,
-        disk_bps: 0,
         ports: vec![mk_port(9090)],
         jobs: vec![
             mk_job(
@@ -328,7 +322,6 @@ pub fn build_demo_snapshot() -> Snapshot {
         ],
         watchdog_note: None,
         procs: ml_procs,
-        helper_count: 1,
         cpu_history: [
             12, 15, 22, 28, 31, 24, 18, 16, 20, 27, 34, 29, 22, 19, 17, 25, 30, 26, 21, 18, 20, 24,
             28, 25, 22, 19, 21, 23, 21, 20,
@@ -381,7 +374,6 @@ pub fn build_demo_snapshot() -> Snapshot {
         status: ProjectStatus::Healthy,
         cpu: 3.1,
         ram: 198 * mb,
-        disk_bps: 0,
         ports: vec![mk_port(5432), mk_port(6379)],
         jobs: vec![
             mk_job(
@@ -415,7 +407,6 @@ pub fn build_demo_snapshot() -> Snapshot {
         ],
         watchdog_note: None,
         procs: infra_procs,
-        helper_count: 0,
         cpu_history: [3; 30],
         ram_history_mb: [
             190, 191, 192, 192, 194, 194, 195, 195, 196, 196, 196, 197, 197, 197, 198, 198, 198,
@@ -464,6 +455,7 @@ pub fn build_demo_snapshot() -> Snapshot {
         alerts: Vec::new(),
         all_procs: Vec::new(),
         active_terminal: Some(terminal),
+        last_action_error: None,
     }
 }
 
@@ -550,7 +542,6 @@ pub fn dump_shots(
                 status: ProjectStatus::Crashed,
                 cpu: 0.0,
                 ram: 0,
-                disk_bps: 0,
                 ports: Vec::new(),
                 jobs: vec![crate::model::Job {
                     id: crash_jid,
@@ -581,7 +572,6 @@ pub fn dump_shots(
                 }],
                 watchdog_note: None,
                 procs: Vec::new(),
-                helper_count: 0,
                 cpu_history: [8, 12, 19, 44, 68, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 ram_history_mb: [64; 30],
             },
@@ -630,7 +620,6 @@ pub fn dump_shots(
                 status: ProjectStatus::Healthy,
                 cpu: 4.2,
                 ram: 128 * 1024 * 1024,
-                disk_bps: 0,
                 ports: Vec::new(),
                 jobs: vec![crate::model::Job {
                     id: synth_jid.clone(),
@@ -659,7 +648,6 @@ pub fn dump_shots(
                 }],
                 watchdog_note: None,
                 procs: Vec::new(),
-                helper_count: 0,
                 cpu_history: [6; 30],
                 ram_history_mb: [96; 30],
             });

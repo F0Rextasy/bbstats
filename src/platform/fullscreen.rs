@@ -15,13 +15,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Returns `true` if a fullscreen game, presentation, or borderless fullscreen video is active.
 pub fn is_fullscreen_active(own_hwnd: HWND) -> bool {
     unsafe {
+        let fg = GetForegroundWindow();
+        let own_mon = MonitorFromWindow(own_hwnd, MONITOR_DEFAULTTONEAREST);
+        if !fg.0.is_null() && MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST) != own_mon {
+            return false;
+        }
+
         if let Ok(state) = SHQueryUserNotificationState() {
             if state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE {
                 return true;
             }
         }
 
-        let fg = GetForegroundWindow();
         if fg.0.is_null() || fg == own_hwnd || !IsWindowVisible(fg).as_bool() {
             return false;
         }

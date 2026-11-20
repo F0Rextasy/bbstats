@@ -95,7 +95,12 @@ pub(super) fn render_detail(
         false,
     )?;
     if let Some(ref root) = proj.root {
-        let path_rect = rect(82.0, 24.0, w - 144.0, 40.0);
+        let path_right = if proj.git_branch.is_some() {
+            w - 236.0
+        } else {
+            w - 144.0
+        };
+        let path_rect = rect(82.0, 24.0, path_right, 40.0);
         ctx.draw_text(
             &format!("{} ↗", root.display()),
             &fonts.row_secondary,
@@ -104,6 +109,17 @@ pub(super) fn render_detail(
             false,
         )?;
         hit_map.push(next_id(), path_rect, HitAction::OpenProjectFolder(proj.id.clone()));
+    }
+    if let Some(ref branch) = proj.git_branch {
+        let badge_w = ((branch.chars().count().min(12) as f32) * 5.8 + 14.0).clamp(44.0, 86.0);
+        let badge_left = if proj.root.is_some() {
+            w - 144.0 - badge_w
+        } else {
+            82.0
+        };
+        let b_rect = rect(badge_left, 24.0, badge_left + badge_w, 39.0);
+        ctx.fill_rounded(b_rect, 4.0, BG_ELEVATED)?;
+        ctx.draw_text(branch, &fonts.mono_badge, b_rect, TEXT_SECONDARY, true)?;
     }
 
     let hide_rect = rect(w - 136.0, 9.0, w - 108.0, 35.0);
@@ -160,21 +176,73 @@ pub(super) fn render_detail(
     }
 
     let stop_rect = rect(w - 40.0, 9.0, w - 12.0, 35.0);
-    ctx.fill_rounded(stop_rect, 8.0, ACCENT_DANGER_BG)?;
-    ctx.draw_text("■", &fonts.mono_badge, stop_rect, ACCENT_DANGER, false)?;
-    hit_map.push(next_id(), stop_rect, HitAction::RequestKillProject(proj.id.clone()));
+    let scope_job = if proj.jobs.len() > 1 {
+        active_job
+    } else {
+        None
+    };
+    let stop_enabled = scope_job.is_none_or(|j| j.can_kill);
+    ctx.fill_rounded(
+        stop_rect,
+        8.0,
+        if stop_enabled {
+            ACCENT_DANGER_BG
+        } else {
+            BG_ELEVATED
+        },
+    )?;
+    ctx.draw_text(
+        "■",
+        &fonts.mono_badge,
+        stop_rect,
+        if stop_enabled { ACCENT_DANGER } else { TEXT_MUTED },
+        false,
+    )?;
+    if let Some(j) = scope_job {
+        if j.can_kill {
+            hit_map.push(next_id(), stop_rect, HitAction::RequestKillJob(j.id.clone()));
+        }
+    } else {
+        hit_map.push(next_id(), stop_rect, HitAction::RequestKillProject(proj.id.clone()));
+    }
 
     ctx.draw_hairline(12.0, 44.0, w - 12.0)?;
 
     let mut y_cursor = 50.0;
-    if matches!(&state.pending_kill, Some(PendingKill::Project(id)) if id == &proj.id) {
+    let confirm_target =
+        if matches!(&state.pending_kill, Some(PendingKill::Project(id)) if id == &proj.id) {
+            Some((
+                match lang {
+                    Language::En => format!("Stop {} processes in {}?", proj.procs.len(), proj.name),
+                    Language::Tr => {
+                        format!("{} içindeki {} süreç durdurulsun mu?", proj.name, proj.procs.len())
+                    }
+                },
+                HitAction::ConfirmKillProject(proj.id.clone()),
+            ))
+        } else {
+            active_job
+                .filter(|j| {
+                    matches!(&state.pending_kill, Some(PendingKill::Job(jid)) if jid == &j.id)
+                })
+                .map(|j| {
+                    (
+                        match lang {
+                            Language::En => {
+                                format!("Stop {} processes in {}?", j.procs.len(), j.title)
+                            }
+                            Language::Tr => {
+                                format!("{} içindeki {} süreç durdurulsun mu?", j.title, j.procs.len())
+                            }
+                        },
+                        HitAction::ConfirmKillJob(j.id.clone()),
+                    )
+                })
+        };
+    if let Some((kill_msg, confirm_action)) = confirm_target {
         let bar = rect(12.0, y_cursor, w - 12.0, y_cursor + 32.0);
         ctx.fill_rounded(bar, 8.0, ACCENT_DANGER_BG)?;
         ctx.stroke_rounded(bar, 8.0, ACCENT_DANGER, 1.0)?;
-        let kill_msg = match lang {
-            Language::En => format!("Stop {} processes in {}?", proj.procs.len(), proj.name),
-            Language::Tr => format!("{} içindeki {} süreç durdurulsun mu?", proj.name, proj.procs.len()),
-        };
         ctx.draw_text(
             &kill_msg,
             &fonts.row_secondary,
@@ -191,7 +259,7 @@ pub(super) fn render_detail(
             BG_OVERLAY,
             false,
         )?;
-        hit_map.push(next_id(), ok_r, HitAction::ConfirmKillProject(proj.id.clone()));
+        hit_map.push(next_id(), ok_r, confirm_action);
 
         let cn_r = rect(w - 72.0, y_cursor + 4.0, w - 18.0, y_cursor + 28.0);
         ctx.fill_rounded(cn_r, 6.0, BG_ELEVATED_HOVER)?;
@@ -486,10 +554,13 @@ fn render_detail_body<F: FnMut() -> u32>(
             wrapped_lines.push((line.clone(), col));
         } else {
             let mut chunk = String::with_capacity(max_cols);
+            let mut col_cnt = 0usize;
             for ch in line.chars() {
                 chunk.push(ch);
-                if chunk.chars().count() >= max_cols {
+                col_cnt += 1;
+                if col_cnt >= max_cols {
                     wrapped_lines.push((std::mem::take(&mut chunk), col));
+                    col_cnt = 0;
                 }
             }
             if !chunk.is_empty() {
@@ -521,12 +592,6 @@ fn render_detail_body<F: FnMut() -> u32>(
             false,
         )?;
     } else {
-        unsafe {
-            ctx.dc.PushAxisAlignedClip(
-                &rect(term_box.left + 4.0, term_box.top + 4.0, term_box.right - 4.0, term_box.bottom - 4.0),
-                windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-            );
-        }
         // Bottom-anchored when `term_scroll_offset == 0.0` (scrolling up increases offset toward older lines).
         let bottom_y = term_box.bottom - 6.0 + state.term_scroll_offset;
         let text_right = if state.term_max_scroll > 0.0 {
@@ -534,22 +599,25 @@ fn render_detail_body<F: FnMut() -> u32>(
         } else {
             term_box.right - 10.0
         };
-        for (rev_idx, (line, col)) in wrapped_lines.iter().rev().enumerate() {
-            let ly = bottom_y - (rev_idx as f32 + 1.0) * line_h;
-            if ly + line_h <= term_box.top + 2.0 || ly >= term_box.bottom - 2.0 {
-                continue;
-            }
-            ctx.draw_text(
-                line,
-                &fonts.term_line,
-                rect(term_box.left + 10.0, ly, text_right, ly + line_h),
-                *col,
-                true,
-            )?;
-        }
-        unsafe {
-            ctx.dc.PopAxisAlignedClip();
-        }
+        ctx.with_axis_clip(
+            rect(term_box.left + 4.0, term_box.top + 4.0, term_box.right - 4.0, term_box.bottom - 4.0),
+            || {
+                for (rev_idx, (line, col)) in wrapped_lines.iter().rev().enumerate() {
+                    let ly = bottom_y - (rev_idx as f32 + 1.0) * line_h;
+                    if ly + line_h <= term_box.top + 2.0 || ly >= term_box.bottom - 2.0 {
+                        continue;
+                    }
+                    ctx.draw_text(
+                        line,
+                        &fonts.term_line,
+                        rect(term_box.left + 10.0, ly, text_right, ly + line_h),
+                        *col,
+                        true,
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
 
         if state.term_max_scroll > 0.0 {
             let track_top = term_box.top + 6.0;
@@ -574,12 +642,18 @@ fn render_detail_body<F: FnMut() -> u32>(
 
     y_cursor += term_h + 10.0;
 
+    let displayed_procs: &[crate::model::ProcInfo] = if proj.jobs.len() > 1 {
+        active_job.map(|j| j.procs.as_slice()).unwrap_or(&proj.procs)
+    } else {
+        &proj.procs
+    };
+
     // Underlying Raw Processes Tree (hidden in main list, inspectable here)
     ctx.draw_text(
         &format!(
             "{} ({})",
             lang.pick("SUBPROCESSES", "ALT SÜREÇLER"),
-            proj.procs.len()
+            displayed_procs.len()
         ),
         &fonts.section_hdr,
         rect(14.0, y_cursor, 300.0, y_cursor + 20.0),
@@ -591,18 +665,12 @@ fn render_detail_body<F: FnMut() -> u32>(
     hit_map.scroll_viewport = Some(rect(0.0, list_top, w, list_bot));
 
     let row_h = 46.0;
-    let total_h = proj.procs.len() as f32 * row_h;
+    let total_h = displayed_procs.len() as f32 * row_h;
     state.max_scroll = (total_h - (list_bot - list_top)).max(0.0);
     state.scroll_offset = state.scroll_offset.clamp(0.0, state.max_scroll);
 
-    unsafe {
-        ctx.dc.PushAxisAlignedClip(
-            &rect(0.0, list_top, w, list_bot),
-            windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        );
-    }
-
-    for (idx, pr) in proj.procs.iter().enumerate() {
+    ctx.with_axis_clip(rect(0.0, list_top, w, list_bot), || {
+        for (idx, pr) in displayed_procs.iter().enumerate() {
         let y = list_top - state.scroll_offset + idx as f32 * row_h;
         if y + row_h < list_top || y > list_bot {
             continue;
@@ -668,9 +736,11 @@ fn render_detail_body<F: FnMut() -> u32>(
                 .suggested_url
                 .clone()
                 .unwrap_or_else(|| format!("http://localhost:{}", port.port));
-            hit_map.push_with_rclick(
+            hit_map.push_with_rclick_clipped(
                 pid_hit,
                 p_rect,
+                list_top,
+                list_bot,
                 HitAction::OpenPort {
                     port: port.port,
                     url: port.suggested_url.clone(),
@@ -701,9 +771,11 @@ fn render_detail_body<F: FnMut() -> u32>(
                     .suggested_url
                     .clone()
                     .unwrap_or_else(|| format!("http://localhost:{}", port.port));
-                hit_map.push_with_rclick(
+                hit_map.push_with_rclick_clipped(
                     pid_hit,
                     p_rect,
+                    list_top,
+                    list_bot,
                     HitAction::OpenPort {
                         port: port.port,
                         url: port.suggested_url.clone(),
@@ -736,12 +808,12 @@ fn render_detail_body<F: FnMut() -> u32>(
             let ok_r = rect(w - 118.0, y + 9.0, w - 66.0, y + 33.0);
             ctx.fill_rounded(ok_r, 6.0, ACCENT_DANGER)?;
             ctx.draw_text("Kill", &fonts.mono_badge, ok_r, BG_OVERLAY, false)?;
-            hit_map.push(next_id(), ok_r, HitAction::ConfirmKillProcess(pr.key));
+            hit_map.push_clipped(next_id(), ok_r, list_top, list_bot, HitAction::ConfirmKillProcess(pr.key));
 
             let cn_r = rect(w - 62.0, y + 9.0, w - 18.0, y + 33.0);
             ctx.fill_rounded(cn_r, 6.0, BG_ELEVATED_HOVER)?;
             ctx.draw_text("No", &fonts.mono_badge, cn_r, TEXT_PRIMARY, false)?;
-            hit_map.push(next_id(), cn_r, HitAction::CancelKillConfirm);
+            hit_map.push_clipped(next_id(), cn_r, list_top, list_bot, HitAction::CancelKillConfirm);
         } else if pr.is_critical_system || !pr.can_kill {
             let lk_r = rect(w - 60.0, y + 9.0, w - 18.0, y + 33.0);
             ctx.fill_rounded(lk_r, 6.0, BG_OVERLAY)?;
@@ -750,13 +822,11 @@ fn render_detail_body<F: FnMut() -> u32>(
             let k_r = rect(w - 44.0, y + 9.0, w - 18.0, y + 33.0);
             ctx.fill_rounded(k_r, 6.0, ACCENT_DANGER_BG)?;
             ctx.draw_text("■", &fonts.mono_badge, k_r, ACCENT_DANGER, false)?;
-            hit_map.push(next_id(), k_r, HitAction::RequestKillProcess(pr.key));
+            hit_map.push_clipped(next_id(), k_r, list_top, list_bot, HitAction::RequestKillProcess(pr.key));
         }
     }
-
-    unsafe {
-        ctx.dc.PopAxisAlignedClip();
-    }
+    Ok(())
+    })?;
 
     Ok(())
 }

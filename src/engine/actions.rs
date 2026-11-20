@@ -23,8 +23,11 @@ use crate::engine::collector::CollectedProcess;
 use crate::engine::win_nt::{current_pid, is_process_critical_kernel};
 #[cfg(target_os = "windows")]
 use crate::engine::win_nt::{
-    get_exit_code, open_process_for_terminate, open_process_for_wait, OwnedHandle,
+    get_exit_code, is_process_alive_handle, open_process_for_terminate, open_process_for_wait,
+    OwnedHandle,
 };
+#[cfg(not(target_os = "windows"))]
+use crate::engine::win_nt::verify_unix_process_key;
 use crate::model::ProcessKey;
 
 /// Hardcoded critical OS/session processes that must NEVER be terminated by bbstats.
@@ -234,10 +237,10 @@ pub fn execute_safe_kill_many(
 
     #[cfg(target_os = "windows")]
     {
-        // First ask any GUI top-level windows to close cleanly.
+        // First ask any GUI top-level windows to close cleanly (only after verifying ProcessKey).
         let mut sent_wm_close = false;
         for key in &targets {
-            if send_wm_close_to_pid(key.pid) {
+            if open_process_for_wait(*key).is_some() && send_wm_close_to_pid(key.pid) {
                 sent_wm_close = true;
             }
         }
@@ -245,7 +248,7 @@ pub fn execute_safe_kill_many(
             std::thread::sleep(Duration::from_millis(250));
         }
 
-        // Force-terminate any remaining targets bottom-up after re-checking kernel criticality.
+        // Force-terminate any remaining targets bottom-up after re-checking identity & kernel criticality.
         for key in &targets {
             let Some(proc_info) = by_key.get(key) else {
                 continue;
@@ -259,9 +262,9 @@ pub fn execute_safe_kill_many(
             ) {
                 continue;
             }
-            if let Some(h) = open_process_for_terminate(key.pid) {
+            if let Some(h) = open_process_for_terminate(*key) {
                 // If process already exited cleanly from WM_CLOSE, skip TerminateProcess.
-                if get_exit_code(h.raw()) == Some(259) {
+                if is_process_alive_handle(h.raw()) {
                     unsafe {
                         let _ = TerminateProcess(h.raw(), 1);
                     }
@@ -272,7 +275,7 @@ pub fn execute_safe_kill_many(
 
     #[cfg(not(target_os = "windows"))]
     {
-        // Send graceful SIGTERM first across all targets.
+        // Send graceful SIGTERM first across verified targets.
         let mut sent_term = false;
         for key in &targets {
             if let Some(proc_info) = by_key.get(key) {
@@ -282,7 +285,8 @@ pub fn execute_safe_kill_many(
                     &proc_info.image_name,
                     self_pid,
                     &ancestors,
-                ) && unsafe { libc::kill(key.pid as libc::pid_t, libc::SIGTERM) } == 0
+                ) && verify_unix_process_key(*key)
+                    && unsafe { libc::kill(key.pid as libc::pid_t, libc::SIGTERM) } == 0
                 {
                     sent_term = true;
                 }
@@ -291,7 +295,7 @@ pub fn execute_safe_kill_many(
         if sent_term {
             std::thread::sleep(Duration::from_millis(250));
         }
-        // Follow up with SIGKILL for any process still alive.
+        // Follow up with SIGKILL only after re-verifying process identity against PID reuse.
         for key in &targets {
             if let Some(proc_info) = by_key.get(key) {
                 if is_kill_allowed(
@@ -300,7 +304,8 @@ pub fn execute_safe_kill_many(
                     &proc_info.image_name,
                     self_pid,
                     &ancestors,
-                ) && unsafe { libc::kill(key.pid as libc::pid_t, 0) } == 0
+                ) && verify_unix_process_key(*key)
+                    && unsafe { libc::kill(key.pid as libc::pid_t, 0) } == 0
                 {
                     unsafe {
                         let _ = libc::kill(key.pid as libc::pid_t, libc::SIGKILL);
@@ -396,12 +401,12 @@ mod watcher_imp {
             }
         }
 
-        /// Registers a passive wait on `key` if not already watched.
+        /// Registers a passive wait on `key` after verifying process creation time.
         pub fn ensure_watched(&mut self, key: ProcessKey) {
             if self.entries.contains_key(&key) || key.pid <= 4 {
                 return;
             }
-            let Some(proc_handle) = open_process_for_wait(key.pid) else {
+            let Some(proc_handle) = open_process_for_wait(key) else {
                 return;
             };
 
@@ -441,6 +446,17 @@ mod watcher_imp {
             );
         }
 
+        /// Queries an already-watched handle synchronously if the process disappeared before
+        /// the thread-pool `Exited` message was drained.
+        pub fn poll_exit_code(&self, key: &ProcessKey) -> Option<i32> {
+            let entry = self.entries.get(key)?;
+            if is_process_alive_handle(entry._proc_handle.raw()) {
+                None
+            } else {
+                Some(get_exit_code(entry._proc_handle.raw()).unwrap_or(1))
+            }
+        }
+
         /// Unregisters and frees a watched entry once its exit event has been processed or the process is ignored.
         pub fn unwatch(&mut self, key: &ProcessKey) {
             if let Some(entry) = self.entries.remove(key) {
@@ -474,11 +490,161 @@ mod watcher_imp {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod watcher_imp {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    fn decode_wait_status(wstatus: i32) -> i32 {
+        let sig = wstatus & 0x7f;
+        if sig == 0 {
+            (wstatus >> 8) & 0xff
+        } else if sig != 0x7f {
+            128 + sig
+        } else {
+            1
+        }
+    }
+
+    /// Event-driven exit watcher backed by macOS `kqueue` (`EVFILT_PROC` + `NOTE_EXITSTATUS`).
+    pub struct ExitWatcher {
+        kq: i32,
+        watched: Arc<Mutex<HashMap<u32, ProcessKey>>>,
+        stop: Arc<AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl ExitWatcher {
+        pub fn new(on_exit: ExitCallback) -> Self {
+            let kq = unsafe { libc::kqueue() };
+            let watched = Arc::new(Mutex::new(HashMap::with_capacity(64)));
+            let stop = Arc::new(AtomicBool::new(false));
+
+            let join = if kq >= 0 {
+                let w_bg = Arc::clone(&watched);
+                let s_bg = Arc::clone(&stop);
+                std::thread::Builder::new()
+                    .name("bbstats-kqueue".to_string())
+                    .spawn(move || {
+                        let mut events: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
+                        let timeout = libc::timespec {
+                            tv_sec: 0,
+                            tv_nsec: 200_000_000,
+                        };
+                        while !s_bg.load(Ordering::Acquire) {
+                            let n = unsafe {
+                                libc::kevent(
+                                    kq,
+                                    std::ptr::null(),
+                                    0,
+                                    events.as_mut_ptr(),
+                                    events.len() as i32,
+                                    &timeout,
+                                )
+                            };
+                            if n <= 0 {
+                                continue;
+                            }
+                            for ev in &events[..n as usize] {
+                                let pid = ev.ident as u32;
+                                let key_opt = w_bg.lock().ok().and_then(|mut m| m.remove(&pid));
+                                if let Some(key) = key_opt {
+                                    let exit_code = decode_wait_status(ev.data as i32);
+                                    on_exit(ExitEvent { key, exit_code });
+                                }
+                            }
+                        }
+                    })
+                    .ok()
+            } else {
+                None
+            };
+
+            Self {
+                kq,
+                watched,
+                stop,
+                join,
+            }
+        }
+
+        pub fn ensure_watched(&mut self, key: ProcessKey) {
+            if self.kq < 0 || key.pid <= 1 {
+                return;
+            }
+            if let Ok(mut map) = self.watched.lock() {
+                if map.get(&key.pid) == Some(&key) {
+                    return;
+                }
+                map.insert(key.pid, key);
+            } else {
+                return;
+            }
+            let kev = libc::kevent {
+                ident: key.pid as libc::uintptr_t,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT | libc::NOTE_EXITSTATUS,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            let rc = unsafe { libc::kevent(self.kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            if rc < 0 {
+                if let Ok(mut map) = self.watched.lock() {
+                    if map.get(&key.pid) == Some(&key) {
+                        map.remove(&key.pid);
+                    }
+                }
+            }
+        }
+
+        pub fn poll_exit_code(&self, _key: &ProcessKey) -> Option<i32> {
+            None
+        }
+
+        pub fn unwatch(&mut self, key: &ProcessKey) {
+            if let Ok(mut map) = self.watched.lock() {
+                if map.get(&key.pid) == Some(key) {
+                    map.remove(&key.pid);
+                }
+            }
+            if self.kq >= 0 && key.pid > 1 {
+                let kev = libc::kevent {
+                    ident: key.pid as libc::uintptr_t,
+                    filter: libc::EVFILT_PROC,
+                    flags: libc::EV_DELETE,
+                    fflags: 0,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                unsafe {
+                    let _ = libc::kevent(self.kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
+                }
+            }
+        }
+    }
+
+    impl Drop for ExitWatcher {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+            if self.kq >= 0 {
+                unsafe {
+                    libc::close(self.kq);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 mod watcher_imp {
     use super::*;
 
-    /// Lightweight non-Windows `ExitWatcher` tracking watched keys.
+    /// Lightweight non-Windows/non-macOS `ExitWatcher` fallback.
     pub struct ExitWatcher {
         _on_exit: ExitCallback,
     }
@@ -489,6 +655,10 @@ mod watcher_imp {
         }
 
         pub fn ensure_watched(&mut self, _key: ProcessKey) {}
+
+        pub fn poll_exit_code(&self, _key: &ProcessKey) -> Option<i32> {
+            None
+        }
 
         pub fn unwatch(&mut self, _key: &ProcessKey) {}
     }
@@ -508,8 +678,6 @@ mod tests {
             image_name: name.to_string(),
             cpu_percent: 0.0,
             private_ram_bytes: 0,
-            disk_read_bps: 0,
-            disk_write_bps: 0,
             uptime_secs: 10,
         }
     }

@@ -13,8 +13,8 @@ pub fn tail_last_4kb_line(path: &Path) -> Option<String> {
     }
     let start = len.saturating_sub(4096);
     file.seek(SeekFrom::Start(start)).ok()?;
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    file.read_to_end(&mut buf).ok()?;
+    let mut buf = Vec::with_capacity((len - start).min(4096) as usize);
+    file.take(4096).read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
     let last = text
         .lines()
@@ -38,15 +38,24 @@ pub fn inspect_directory_manifests(dir: &Path) -> Option<CachedRoot> {
     let pkg_json = dir.join("package.json");
     if pkg_json.is_file() {
         if let Ok(text) = fs::read_to_string(&pkg_json) {
-            let pkg_name = extract_json_field(&text, "name")
+            let pkg_val = serde_json::from_str::<serde_json::Value>(&text).ok();
+            let pkg_name = pkg_val
+                .as_ref()
+                .and_then(|v| json_nonempty_str(v, "name"))
                 .map(|n| clean_pkg_name(&n))
                 .or_else(|| {
-                    extract_json_field(&text, "description")
-                        .filter(|d| !d.is_empty() && d.len() <= 32)
+                    pkg_val
+                        .as_ref()
+                        .and_then(|v| json_nonempty_str(v, "description"))
+                        .filter(|d| d.len() <= 32)
                 })
                 .unwrap_or_else(|| dir_name_or(dir, "node-project"));
-            let display = check_monorepo_parent_name(dir).unwrap_or(pkg_name);
-            let root = check_monorepo_parent_root(dir).unwrap_or_else(|| dir.to_path_buf());
+            let (display, root) = if let Some(ws_root) = check_monorepo_parent_root(dir) {
+                let ws_name = monorepo_root_name(&ws_root).unwrap_or(pkg_name);
+                (ws_name, ws_root)
+            } else {
+                (pkg_name, dir.to_path_buf())
+            };
             return Some(CachedRoot {
                 project_name: display,
                 root_path: root,
@@ -214,14 +223,21 @@ pub fn inspect_directory_manifests(dir: &Path) -> Option<CachedRoot> {
     None
 }
 
-pub(super) fn check_monorepo_parent_name(dir: &Path) -> Option<String> {
-    let ws_root = check_monorepo_parent_root(dir)?;
-    let p = ws_root.join("package.json");
-    let txt = fs::read_to_string(p).ok()?;
+fn json_nonempty_str(val: &serde_json::Value, key: &str) -> Option<String> {
+    val.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn monorepo_root_name(ws_root: &Path) -> Option<String> {
+    let txt = fs::read_to_string(ws_root.join("package.json")).ok()?;
+    let val = serde_json::from_str::<serde_json::Value>(&txt).ok()?;
     Some(
-        extract_json_field(&txt, "name")
+        json_nonempty_str(&val, "name")
             .map(|n| clean_pkg_name(&n))
-            .unwrap_or_else(|| dir_name_or(&ws_root, "workspace")),
+            .unwrap_or_else(|| dir_name_or(ws_root, "workspace")),
     )
 }
 
@@ -231,7 +247,10 @@ pub(super) fn check_monorepo_parent_root(dir: &Path) -> Option<PathBuf> {
         let p = cur.join("package.json");
         if p.is_file() {
             if let Ok(txt) = fs::read_to_string(&p) {
-                if txt.contains("\"workspaces\"") {
+                if serde_json::from_str::<serde_json::Value>(&txt)
+                    .ok()
+                    .is_some_and(|v| v.get("workspaces").is_some())
+                {
                     return Some(cur.to_path_buf());
                 }
             }
@@ -297,26 +316,10 @@ pub(super) fn read_git_branch(dir: &Path) -> Option<String> {
     let trimmed = head.trim();
     if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
         Some(branch.to_string())
-    } else if trimmed.len() >= 7 {
-        Some(trimmed[..7].to_string())
+    } else if trimmed.chars().count() >= 7 {
+        Some(trimmed.chars().take(7).collect())
     } else {
         None
-    }
-}
-
-
-pub(super) fn extract_json_field(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let idx = json.find(&needle)?;
-    let rest = json[idx + needle.len()..].trim_start();
-    let rest = rest.strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    let val = rest[..end].trim();
-    if val.is_empty() {
-        None
-    } else {
-        Some(val.to_string())
     }
 }
 

@@ -5,7 +5,9 @@ pub mod autostart;
 use crate::model::{Language, SortMode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
 #[cfg(target_os = "windows")]
@@ -74,6 +76,9 @@ pub struct AppConfig {
     pub project_order: Vec<String>,
     pub job_order: Vec<String>,
     pub project_aliases: HashMap<String, String>,
+    #[serde(skip)]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub load_error: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -99,8 +104,42 @@ impl Default for AppConfig {
             project_order: Vec::new(),
             job_order: Vec::new(),
             project_aliases: HashMap::new(),
+            load_error: None,
         }
     }
+}
+
+/// Appends a bounded diagnostic entry to `bbstats.log` inside the config directory.
+pub fn log_error(msg: &str) {
+    let Some(dir) = AppConfig::config_path().parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let log_path = dir.join("bbstats.log");
+    const MAX_LOG_BYTES: u64 = 128 * 1024;
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() >= MAX_LOG_BYTES {
+            let _ = std::fs::rename(&log_path, dir.join("bbstats.log.old"));
+        }
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = writeln!(f, "[{ts}] {msg}");
+    }
+}
+
+/// Backs up a corrupt TOML file to `*.toml.bak` without overwriting user edits.
+pub(crate) fn backup_corrupt_toml(path: &Path) -> PathBuf {
+    let bak = path.with_extension("toml.bak");
+    let _ = std::fs::copy(path, &bak);
+    bak
 }
 
 impl AppConfig {
@@ -125,23 +164,58 @@ impl AppConfig {
         base.join("bbstats").join("config.toml")
     }
 
-    /// Loads config from `AppConfig::config_path()`, or returns defaults if missing/invalid.
+    /// Loads config from `AppConfig::config_path()`, backing up corrupt files instead of silently resetting them.
     pub fn load() -> Self {
-        let path = Self::config_path();
-        let mut cfg = match std::fs::read_to_string(&path) {
-            Ok(raw) => toml::from_str::<AppConfig>(&raw).unwrap_or_default(),
-            Err(_) => Self::default(),
-        };
-        cfg.idle_opacity = cfg.idle_opacity.clamp(0.0, 0.95);
-        cfg.glass_opacity = cfg.glass_opacity.clamp(0.25, 0.98);
-        cfg.hover_peek_delay_ms = cfg.hover_peek_delay_ms.clamp(80, 600);
+        let mut cfg = Self::load_from_path(&Self::config_path());
         cfg.autostart = autostart::is_autostart_enabled();
         cfg
     }
 
-    /// Atomically writes config to `AppConfig::config_path()`.
+    pub fn load_from_path(path: &Path) -> Self {
+        let mut cfg = match std::fs::read_to_string(path) {
+            Ok(raw) if !raw.trim().is_empty() => match toml::from_str::<AppConfig>(&raw) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    let bak = backup_corrupt_toml(path);
+                    let msg = format!(
+                        "config.toml parse error ({}); backed up to {}",
+                        err,
+                        bak.display()
+                    );
+                    log_error(&msg);
+                    Self {
+                        load_error: Some(msg),
+                        ..Self::default()
+                    }
+                }
+            },
+            _ => Self::default(),
+        };
+        cfg.idle_opacity = cfg.idle_opacity.clamp(0.0, 0.95);
+        cfg.glass_opacity = cfg.glass_opacity.clamp(0.25, 0.98);
+        cfg.hover_peek_delay_ms = cfg.hover_peek_delay_ms.clamp(80, 600);
+        cfg.collapsed_poll_ms = cfg.collapsed_poll_ms.clamp(500, 30_000);
+        cfg.expanded_poll_ms = cfg.expanded_poll_ms.clamp(250, 10_000);
+        cfg
+    }
+
+    /// Atomically writes config to `AppConfig::config_path()`, refusing to overwrite a corrupt file on disk.
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::config_path();
+        self.save_to_path(&Self::config_path())
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        if let Ok(existing) = std::fs::read_to_string(path) {
+            if !existing.trim().is_empty() && toml::from_str::<AppConfig>(&existing).is_err() {
+                let bak = backup_corrupt_toml(path);
+                let msg = format!(
+                    "Refusing to overwrite corrupt config.toml (preserved at {})",
+                    bak.display()
+                );
+                log_error(&msg);
+                return Err(msg);
+            }
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create_dir_all failed: {e}"))?;
@@ -180,7 +254,7 @@ impl AppConfig {
 
         #[cfg(not(target_os = "windows"))]
         {
-            std::fs::rename(&tmp, &path).map_err(|e| format!("rename config failed: {e}"))?;
+            std::fs::rename(&tmp, path).map_err(|e| format!("rename config failed: {e}"))?;
         }
         Ok(())
     }
@@ -220,5 +294,26 @@ mod tests {
             decoded.project_aliases.get("path:c:\\foo").map(String::as_str),
             Some("My App")
         );
+    }
+
+    #[test]
+    fn corrupt_config_is_backed_up_and_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("bbstats_cfg_corrupt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        let bad_toml = "language = [broken\n";
+        std::fs::write(&cfg_path, bad_toml).unwrap();
+
+        let loaded = AppConfig::load_from_path(&cfg_path);
+        assert!(loaded.load_error.is_some());
+        let bak_path = dir.join("config.toml.bak");
+        assert_eq!(std::fs::read_to_string(&bak_path).unwrap(), bad_toml);
+
+        // Refusing to overwrite preserves the user's broken file until fixed.
+        assert!(loaded.save_to_path(&cfg_path).is_err());
+        assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), bad_toml);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -3,19 +3,16 @@
 use crate::config::{AppConfig, DockPosition};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, POINT};
-use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
-};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD,
     NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    SetForegroundWindow, TrackPopupMenuEx, HICON, ICONINFO, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    WM_APP,
+    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, LoadImageW,
+    SetForegroundWindow, TrackPopupMenuEx, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, MF_CHECKED,
+    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
 };
 
 pub const WM_APP_TRAY: u32 = WM_APP + 10;
@@ -48,7 +45,7 @@ pub struct TrayIcon {
 
 impl TrayIcon {
     pub fn new(hwnd: HWND) -> Self {
-        let icon = create_pill_icon();
+        let icon = load_tray_icon();
         let mut tray = Self {
             hwnd,
             icon,
@@ -252,179 +249,21 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn sdf_letter_b(
-    fx: f32,
-    fy: f32,
-    stem_x: f32,
-    top_y: f32,
-    bot_y: f32,
-    bowl_cx: f32,
-    bowl_cy: f32,
-    bowl_r: f32,
-    stroke: f32,
-) -> f32 {
-    let half = stroke * 0.5;
-    let y0 = top_y + half;
-    let y1 = (bot_y - half).max(y0);
-    let dy_stem = fy - fy.clamp(y0, y1);
-    let d_stem = (fx - stem_x).hypot(dy_stem) - half;
-    let d_bowl = ((fx - bowl_cx).hypot(fy - bowl_cy) - bowl_r).abs() - half;
-    d_stem.min(d_bowl)
-}
-
-/// Renders a crisp 32x32 ARGB obsidian squircle icon featuring the `bb` monogram and live dot.
-fn create_pill_icon() -> HICON {
-    const W: i32 = 32;
-    const H: i32 = 32;
-
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: W,
-            biHeight: -H, // top-down
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
+/// Loads the embedded Win32 resource icon (`MAKEINTRESOURCEW(1)`) compiled by `build.rs`.
+fn load_tray_icon() -> HICON {
     unsafe {
-        let mut bits_ptr: *mut core::ffi::c_void = core::ptr::null_mut();
-        let hdc = CreateCompatibleDC(None);
-        let hbm_color: HBITMAP =
-            match CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) {
-                Ok(h) => h,
-                Err(_) => {
-                    let _ = DeleteDC(hdc);
-                    return HICON::default();
-                }
-            };
-
-        if !bits_ptr.is_null() {
-            let pixels = std::slice::from_raw_parts_mut(bits_ptr as *mut u32, (W * H) as usize);
-            let s = W as f32;
-            let margin = s * 0.06;
-            let half = s * 0.5 - margin;
-            let radius = s * 0.24;
-            let cx = s * 0.5;
-            let cy = s * 0.5;
-
-            let stroke = s * 0.088;
-            let top_y = s * 0.22;
-            let bot_y = s * 0.74;
-            let bowl_cy = s * 0.58;
-            let bowl_r = s * 0.115;
-            let dot_cx = s * 0.80;
-            let dot_cy = s * 0.26;
-            let dot_r = s * 0.055;
-
-            for y in 0..H {
-                for x in 0..W {
-                    let fx = x as f32 + 0.5;
-                    let fy = y as f32 + 0.5;
-
-                    let qx = (fx - cx).abs() - (half - radius);
-                    let qy = (fy - cy).abs() - (half - radius);
-                    let sdf = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
-
-                    let cov = (0.7 - sdf).clamp(0.0, 1.0);
-                    if cov <= 0.0 {
-                        pixels[(y * W + x) as usize] = 0;
-                        continue;
-                    }
-
-                    let mut r = 16.0_f32;
-                    let mut g = 19.0_f32;
-                    let mut b = 26.0_f32;
-
-                    if sdf > -1.45 {
-                        let border_t = ((sdf + 1.45) / 1.45).clamp(0.0, 1.0);
-                        let top_mix = ((1.0 - fy / s) * 0.8 + 0.2).clamp(0.2, 1.0);
-                        r += (82.0 - r) * border_t * top_mix;
-                        g += (142.0 - g) * border_t * top_mix;
-                        b += (210.0 - b) * border_t * top_mix;
-                    }
-
-                    let b1_cov = (0.6
-                        - sdf_letter_b(
-                            fx,
-                            fy,
-                            s * 0.205,
-                            top_y,
-                            bot_y,
-                            s * 0.32,
-                            bowl_cy,
-                            bowl_r,
-                            stroke,
-                        ))
-                    .clamp(0.0, 1.0);
-                    if b1_cov > 0.0 {
-                        r += (242.0 - r) * b1_cov;
-                        g += (246.0 - g) * b1_cov;
-                        b += (252.0 - b) * b1_cov;
-                    }
-
-                    let b2_cov = (0.6
-                        - sdf_letter_b(
-                            fx,
-                            fy,
-                            s * 0.565,
-                            top_y,
-                            bot_y,
-                            s * 0.68,
-                            bowl_cy,
-                            bowl_r,
-                            stroke,
-                        ))
-                    .clamp(0.0, 1.0);
-                    if b2_cov > 0.0 {
-                        let gt = ((fy - top_y) / (bot_y - top_y).max(1.0)).clamp(0.0, 1.0);
-                        let tr = 52.0 + (10.0 - 52.0) * gt;
-                        let tg = 211.0 + (132.0 - 211.0) * gt;
-                        let tb = 153.0 + (255.0 - 153.0) * gt;
-                        r += (tr - r) * b2_cov;
-                        g += (tg - g) * b2_cov;
-                        b += (tb - b) * b2_cov;
-                    }
-
-                    let d_dot = (fx - dot_cx).hypot(fy - dot_cy) - dot_r;
-                    let glow = (1.0 - (d_dot / (dot_r * 2.2))).clamp(0.0, 1.0) * 0.30;
-                    if glow > 0.0 {
-                        r = r * (1.0 - glow) + 52.0 * glow;
-                        g = g * (1.0 - glow) + 211.0 * glow;
-                        b = b * (1.0 - glow) + 153.0 * glow;
-                    }
-                    let dot_cov = (0.6 - d_dot).clamp(0.0, 1.0);
-                    if dot_cov > 0.0 {
-                        r += (52.0 - r) * dot_cov;
-                        g += (211.0 - g) * dot_cov;
-                        b += (153.0 - b) * dot_cov;
-                    }
-
-                    let a = (cov * 255.0).round() as u32;
-                    let pr = ((r * cov).round() as u32).min(255);
-                    let pg = ((g * cov).round() as u32).min(255);
-                    let pb = ((b * cov).round() as u32).min(255);
-                    pixels[(y * W + x) as usize] = (a << 24) | (pr << 16) | (pg << 8) | pb;
-                }
-            }
-        }
-
-        let hbm_mask = CreateBitmap(W, H, 1, 1, None);
-        let ii = ICONINFO {
-            fIcon: true.into(),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: hbm_mask,
-            hbmColor: hbm_color,
+        let Ok(hinst) = GetModuleHandleW(None) else {
+            return HICON::default();
         };
-        let icon = CreateIconIndirect(&ii).unwrap_or_default();
-        let _ = DeleteObject(hbm_color);
-        let _ = DeleteObject(hbm_mask);
-        let _ = DeleteDC(hdc);
-        icon
+        LoadImageW(
+            hinst,
+            PCWSTR(std::ptr::without_provenance(1)),
+            IMAGE_ICON,
+            32,
+            32,
+            LR_DEFAULTCOLOR,
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default()
     }
 }

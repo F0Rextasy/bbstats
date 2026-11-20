@@ -1,6 +1,6 @@
 [package]
 name = "bbstats"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 build = "build.rs"
 description = "Dynamic Island background process & developer project telemetry monitor"
@@ -10,8 +10,13 @@ readme = "README.md"
 keywords = ["process-monitor", "telemetry", "dynamic-island", "developer-tools"]
 categories = ["command-line-utilities", "development-tools", "os"]
 
+[features]
+default = []
+screenshots = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 
 [target.'cfg(not(windows))'.dependencies]
@@ -31,27 +36,20 @@ features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
-    "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Diagnostics_Debug",
-    "Win32_System_Diagnostics_ToolHelp",
-    "Win32_System_IO",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Pipes",
-    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
-    "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Composition",
-    "Win32_UI_Accessibility",
     "Win32_UI_Controls",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -64,7 +62,6 @@ features = [
     "UI",
     "UI_Composition",
     "UI_Composition_Desktop",
-    "UI_Composition_Effects",
     "UI_ViewManagement",
 ]
 

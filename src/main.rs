@@ -19,6 +19,69 @@ fn main() {
     unix_main();
 }
 
+fn start_engine_and_wait_first_snapshot(
+    mode: model::PollingMode,
+    sync_cmd: Option<model::EngineCmd>,
+) -> engine::EngineHandle {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    let pair = Arc::new((Mutex::new(false), Condvar::new()));
+    let pair_bg = Arc::clone(&pair);
+    let wake_cb: engine::WakeCallback = Arc::new(move || {
+        let (lock, cv) = &*pair_bg;
+        if let Ok(mut ready) = lock.lock() {
+            *ready = true;
+            cv.notify_all();
+        }
+    });
+    let eng = engine::start_engine(wake_cb);
+    if let Some(cmd) = sync_cmd {
+        eng.send(cmd);
+    }
+    eng.send(model::EngineCmd::SetPollingMode(mode));
+
+    let (lock, cv) = &*pair;
+    let deadline = Instant::now() + Duration::from_millis(2500);
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while !*guard {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        guard = cv
+            .wait_timeout(guard, rem)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+    eng
+}
+
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn fatal_startup_error(msg: &str) {
+    crate::config::log_error(msg);
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let title: Vec<u16> = "bbstats — Startup Error\0".encode_utf16().collect();
+    let body: Vec<u16> = format!("{msg}\0").encode_utf16().collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn windows_main() {
     use crate::app::App;
@@ -39,10 +102,133 @@ fn windows_main() {
     use std::sync::Arc;
     use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
 
+    let mut args = std::env::args().skip(1);
+    if let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                attach_parent_console();
+                println!("bbstats {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            "--help" | "-h" => {
+                attach_parent_console();
+                println!(
+                    "bbstats {} — developer project & background process telemetry",
+                    env!("CARGO_PKG_VERSION")
+                );
+                println!();
+                println!("USAGE:");
+                println!("  bbstats                         Launch the desktop Dynamic Island overlay");
+                println!("  bbstats --dump-snapshot [FILE]  Print or write plain-text telemetry snapshot");
+                println!("  bbstats --dump-shot [DIR]       Render overlay PNG screenshots (requires 'screenshots' feature)");
+                println!("  bbstats --version               Print version information");
+                println!("  bbstats --help                  Print this help message");
+                return;
+            }
+            "--dump-snapshot" => {
+                attach_parent_console();
+                let out_file = args.next().map(std::path::PathBuf::from);
+                let eng =
+                    start_engine_and_wait_first_snapshot(model::PollingMode::ExpandedActive, None);
+                let snap = eng.latest();
+                let text = engine::format_snapshot_text(&snap);
+                if let Some(path) = out_file {
+                    if let Err(e) = std::fs::write(&path, &text) {
+                        eprintln!("Failed to write {}: {e}", path.display());
+                        eng.send(model::EngineCmd::Shutdown);
+                        std::process::exit(1);
+                    }
+                } else {
+                    use std::io::Write;
+                    let _ = std::io::stdout().write_all(text.as_bytes());
+                    let _ = std::io::stdout().flush();
+                }
+                eng.send(model::EngineCmd::Shutdown);
+                return;
+            }
+            "--dump-shot" => {
+                attach_parent_console();
+                #[cfg(not(feature = "screenshots"))]
+                {
+                    let _ = args.count();
+                    eprintln!(
+                        "bbstats was built without the 'screenshots' feature. Rebuild with: cargo build --features screenshots"
+                    );
+                    std::process::exit(2);
+                }
+                #[cfg(feature = "screenshots")]
+                {
+                    enable_per_monitor_v2();
+                    unsafe {
+                        if let Err(e) = RoInitialize(RO_INIT_SINGLETHREADED) {
+                            eprintln!("RoInitialize failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    let cfg = AppConfig::load();
+                    let monitors = enumerate_monitors();
+                    let mut out_path = std::path::PathBuf::from("plan\\shots");
+                    let mut use_live = false;
+                    let mut lang_override: Option<model::Language> = None;
+                    while let Some(extra) = args.next() {
+                        if extra == "--live" {
+                            use_live = true;
+                        } else if extra == "--lang" {
+                            if let Some(val) = args.next() {
+                                lang_override = match val.to_ascii_lowercase().as_str() {
+                                    "tr" => Some(model::Language::Tr),
+                                    "en" => Some(model::Language::En),
+                                    _ => lang_override,
+                                };
+                            }
+                        } else if let Some(val) = extra.strip_prefix("--lang=") {
+                            lang_override = match val.to_ascii_lowercase().as_str() {
+                                "tr" => Some(model::Language::Tr),
+                                "en" => Some(model::Language::En),
+                                _ => lang_override,
+                            };
+                        } else {
+                            out_path = std::path::PathBuf::from(extra);
+                        }
+                    }
+                    if let Ok(device) = RenderDevice::new() {
+                        let (snap, mut shot_cfg) = if use_live {
+                            let eng = start_engine_and_wait_first_snapshot(
+                                model::PollingMode::ExpandedActive,
+                                None,
+                            );
+                            let s = eng.latest();
+                            eng.send(model::EngineCmd::Shutdown);
+                            ((*s).clone(), cfg)
+                        } else {
+                            (render::shot::build_demo_snapshot(), AppConfig::default())
+                        };
+                        if let Some(lang) = lang_override {
+                            shot_cfg.language = lang;
+                        }
+                        let _ = render::shot::dump_shots(
+                            &out_path,
+                            &device,
+                            &snap,
+                            &shot_cfg,
+                            &monitors,
+                        );
+                    }
+                    unsafe {
+                        RoUninitialize();
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+
     enable_per_monitor_v2();
 
     unsafe {
-        if RoInitialize(RO_INIT_SINGLETHREADED).is_err() {
+        if let Err(e) = RoInitialize(RO_INIT_SINGLETHREADED) {
+            fatal_startup_error(&format!("WinRT RoInitialize failed: {e}"));
             return;
         }
     }
@@ -51,83 +237,6 @@ fn windows_main() {
     let monitors = enumerate_monitors();
     let active_mon = select_monitor(&monitors, cfg.monitor_index);
     let init_dpi = active_mon.map(|m| m.dpi).unwrap_or(BASE_DPI);
-
-    let mut args = std::env::args().skip(1);
-    if let Some(arg) = args.next() {
-        if arg == "--dump-snapshot" {
-            let out_file = args.next().map(std::path::PathBuf::from);
-            let wake_noop: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-            let eng = engine::start_engine(wake_noop);
-            eng.send(model::EngineCmd::SetPollingMode(
-                model::PollingMode::ExpandedActive,
-            ));
-            std::thread::sleep(std::time::Duration::from_millis(1200));
-            let snap = eng.latest();
-            let text = engine::format_snapshot_text(&snap);
-            if let Some(path) = out_file {
-                let _ = std::fs::write(path, &text);
-            } else {
-                use std::io::Write;
-                let _ = std::io::stdout().write_all(text.as_bytes());
-                let _ = std::io::stdout().flush();
-            }
-            eng.send(model::EngineCmd::Shutdown);
-            unsafe {
-                RoUninitialize();
-            }
-            return;
-        }
-        if arg == "--dump-shot" {
-            let mut out_path = std::path::PathBuf::from("plan\\shots");
-            let mut use_live = false;
-            let mut lang_override: Option<model::Language> = None;
-            while let Some(extra) = args.next() {
-                if extra == "--live" {
-                    use_live = true;
-                } else if extra == "--lang" {
-                    if let Some(val) = args.next() {
-                        lang_override = match val.to_ascii_lowercase().as_str() {
-                            "tr" => Some(model::Language::Tr),
-                            "en" => Some(model::Language::En),
-                            _ => lang_override,
-                        };
-                    }
-                } else if let Some(val) = extra.strip_prefix("--lang=") {
-                    lang_override = match val.to_ascii_lowercase().as_str() {
-                        "tr" => Some(model::Language::Tr),
-                        "en" => Some(model::Language::En),
-                        _ => lang_override,
-                    };
-                } else {
-                    out_path = std::path::PathBuf::from(extra);
-                }
-            }
-            if let Ok(device) = RenderDevice::new() {
-                let (snap, mut shot_cfg) = if use_live {
-                    let wake_noop: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-                    let eng = engine::start_engine(wake_noop);
-                    eng.send(model::EngineCmd::SetPollingMode(
-                        model::PollingMode::ExpandedActive,
-                    ));
-                    std::thread::sleep(std::time::Duration::from_millis(1000));
-                    let s = eng.latest();
-                    eng.send(model::EngineCmd::Shutdown);
-                    ((*s).clone(), cfg.clone())
-                } else {
-                    std::env::set_var("APPDATA", r"C:\Users\Dev\AppData\Roaming");
-                    (render::shot::build_demo_snapshot(), AppConfig::default())
-                };
-                if let Some(lang) = lang_override {
-                    shot_cfg.language = lang;
-                }
-                let _ = render::shot::dump_shots(&out_path, &device, &snap, &shot_cfg, &monitors);
-            }
-            unsafe {
-                RoUninitialize();
-            }
-            return;
-        }
-    }
 
     let _single_instance = match acquire_single_instance() {
         Some(g) => g,
@@ -161,7 +270,8 @@ fn windows_main() {
         cfg.always_on_top,
     ) {
         Ok(h) => h,
-        Err(_) => {
+        Err(e) => {
+            fatal_startup_error(&format!("Failed to create overlay window: {e}"));
             unsafe { RoUninitialize() };
             return;
         }
@@ -169,7 +279,8 @@ fn windows_main() {
 
     let device = match RenderDevice::new() {
         Ok(d) => d,
-        Err(_) => {
+        Err(e) => {
+            fatal_startup_error(&format!("Failed to initialize Direct2D/DXGI graphics: {e}"));
             unsafe { RoUninitialize() };
             return;
         }
@@ -177,7 +288,8 @@ fn windows_main() {
 
     let comp = match CompositionHost::new(hwnd, &device, init_rect.2, init_rect.3) {
         Ok(c) => c,
-        Err(_) => {
+        Err(e) => {
+            fatal_startup_error(&format!("Failed to initialize DirectComposition swapchain: {e}"));
             unsafe { RoUninitialize() };
             return;
         }
@@ -230,12 +342,16 @@ fn unix_main() {
             return;
         }
         Some("--help" | "-h") => {
-            println!("bbstats {} — developer project & background process telemetry", env!("CARGO_PKG_VERSION"));
+            println!(
+                "bbstats {} — developer project & background process telemetry",
+                env!("CARGO_PKG_VERSION")
+            );
             println!();
             println!("USAGE:");
             println!("  bbstats               Live interactive Dynamic Island terminal monitor (--watch)");
             println!("  bbstats --watch       Continuously stream grouped project & job telemetry");
             println!("  bbstats --status      Print a formatted single-shot telemetry overview");
+            println!("  bbstats --daemon      Run headless background monitor without terminal UI");
             println!("  bbstats --dump-snapshot [FILE]  Print or write plain-text telemetry snapshot");
             println!("  bbstats --autostart <on|off>    Enable or disable login LaunchAgent");
             println!("  bbstats --version     Print version information");
@@ -270,14 +386,15 @@ fn unix_main() {
         }
         Some("--dump-snapshot") => {
             let out_file = args.next().map(std::path::PathBuf::from);
-            let wake_noop: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-            let eng = engine::start_engine(wake_noop);
-            eng.send(EngineCmd::SetPollingMode(PollingMode::ExpandedActive));
-            std::thread::sleep(Duration::from_millis(1200));
+            let eng = start_engine_and_wait_first_snapshot(PollingMode::ExpandedActive, None);
             let snap = eng.latest();
             let text = engine::format_snapshot_text(&snap);
             if let Some(path) = out_file {
-                let _ = std::fs::write(path, &text);
+                if let Err(e) = std::fs::write(&path, &text) {
+                    eprintln!("Failed to write {}: {e}", path.display());
+                    eng.send(EngineCmd::Shutdown);
+                    std::process::exit(1);
+                }
             } else {
                 let _ = std::io::stdout().write_all(text.as_bytes());
                 let _ = std::io::stdout().flush();
@@ -287,18 +404,18 @@ fn unix_main() {
         }
         Some("--status") => {
             let cfg = AppConfig::load();
-            let wake_noop: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-            let eng = engine::start_engine(wake_noop);
-            eng.send(EngineCmd::SyncConfigState {
-                pinned_projects: cfg.pinned_projects.clone(),
-                hidden_projects: cfg.hidden_projects.clone(),
-                project_aliases: cfg.project_aliases.clone(),
-                project_order: cfg.project_order.clone(),
-                job_order: cfg.job_order.clone(),
-                sort_mode: cfg.sort_mode,
-            });
-            eng.send(EngineCmd::SetPollingMode(PollingMode::ExpandedActive));
-            std::thread::sleep(Duration::from_millis(1200));
+            let eng = start_engine_and_wait_first_snapshot(
+                PollingMode::ExpandedActive,
+                Some(EngineCmd::SyncConfigState {
+                    pinned_projects: cfg.pinned_projects.clone(),
+                    hidden_projects: cfg.hidden_projects.clone(),
+                    project_aliases: cfg.project_aliases.clone(),
+                    project_order: cfg.project_order.clone(),
+                    job_order: cfg.job_order.clone(),
+                    sort_mode: cfg.sort_mode,
+                    language: cfg.language,
+                }),
+            );
             let snap = eng.latest();
             let screen = render_unix_hud(&snap, cfg.language);
             print!("{screen}");
@@ -309,6 +426,7 @@ fn unix_main() {
         _ => {}
     }
 
+    let daemon_mode = first.as_deref() == Some("--daemon");
     let cfg = AppConfig::load();
     let wake_pair = Arc::new((Mutex::new(false), Condvar::new()));
     let wake_bg = Arc::clone(&wake_pair);
@@ -337,12 +455,48 @@ fn unix_main() {
         project_order: cfg.project_order.clone(),
         job_order: cfg.job_order.clone(),
         sort_mode: cfg.sort_mode,
+        language: cfg.language,
     });
     eng.send(EngineCmd::SetInterval {
         collapsed_ms: Some(cfg.collapsed_poll_ms),
         expanded_ms: Some(cfg.expanded_poll_ms),
     });
-    eng.send(EngineCmd::SetPollingMode(PollingMode::ExpandedActive));
+    eng.send(EngineCmd::SetPollingMode(if daemon_mode {
+        PollingMode::CollapsedIdle
+    } else {
+        PollingMode::ExpandedActive
+    }));
+
+    if daemon_mode {
+        while !STOP.load(Ordering::Relaxed) {
+            let (lock, cv) = &*wake_pair;
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut g, _) = cv
+                .wait_timeout(guard, Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner());
+            *g = false;
+        }
+        eng.send(EngineCmd::Shutdown);
+        return;
+    }
+
+    // Wait briefly for first snapshot so piped/TTY output is immediately populated.
+    {
+        let (lock, cv) = &*wake_pair;
+        let deadline = std::time::Instant::now() + Duration::from_millis(2500);
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !*guard && !STOP.load(Ordering::Relaxed) {
+            let rem = deadline.saturating_duration_since(std::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            guard = cv
+                .wait_timeout(guard, rem.min(Duration::from_millis(100)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *guard = false;
+    }
 
     let is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
     let poll_wait = Duration::from_millis(cfg.expanded_poll_ms.clamp(250, 5000));
@@ -363,12 +517,19 @@ fn unix_main() {
         }
 
         let (lock, cv) = &*wake_pair;
-        if let Ok(ready) = lock.lock() {
-            let (mut guard, _) = cv
-                .wait_timeout_while(ready, poll_wait, |r| !*r && !STOP.load(Ordering::Relaxed))
-                .unwrap_or_else(|e| e.into_inner());
-            *guard = false;
+        let wait_deadline = std::time::Instant::now() + poll_wait;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !*guard && !STOP.load(Ordering::Relaxed) {
+            let rem = wait_deadline.saturating_duration_since(std::time::Instant::now());
+            if rem.is_zero() {
+                break;
+            }
+            guard = cv
+                .wait_timeout(guard, rem.min(Duration::from_millis(100)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
+        *guard = false;
     }
 
     eng.send(EngineCmd::Shutdown);

@@ -158,6 +158,7 @@ mod imp {
                     "  <key>Label</key><string>{label}</string>\n",
                     "  <key>ProgramArguments</key>\n  <array>\n",
                     "    <string>{exe}</string>\n",
+                    "    <string>--daemon</string>\n",
                     "  </array>\n",
                     "  <key>RunAtLoad</key><true/>\n",
                     "</dict>\n</plist>\n"

@@ -1,6 +1,7 @@
 //! User-defined naming rules and PID state-file bindings loaded from the user's `bbstats/labels.toml`.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -107,7 +108,16 @@ impl LabelsStore {
         self.last_mtime = mtime;
 
         let new_rules = match fs::read_to_string(path) {
-            Ok(content) => parse_labels_toml(&content),
+            Ok(content) => match parse_labels_toml_strict(&content) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    crate::config::log_error(&format!(
+                        "corrupt labels.toml at {}: {err}",
+                        path.display()
+                    ));
+                    return false;
+                }
+            },
             Err(_) => Vec::new(),
         };
         let changed = new_rules != self.rules;
@@ -192,11 +202,24 @@ impl LabelsStore {
     }
 }
 
+fn load_existing_rules_strict(path: &Path) -> Result<Vec<LabelRule>, String> {
+    match fs::read_to_string(path) {
+        Ok(content) => parse_labels_toml_strict(&content).map_err(|err| {
+            let bak = crate::config::backup_corrupt_toml(path);
+            let msg = format!(
+                "corrupt labels.toml ({err}); backed up to {}",
+                bak.display()
+            );
+            crate::config::log_error(&msg);
+            msg
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
 pub fn remove_rule_from_path(path: &Path, match_substr: &str) -> Result<(), String> {
-    let mut rules = fs::read_to_string(path)
-        .ok()
-        .map(|c| parse_labels_toml(&c))
-        .unwrap_or_default();
+    let mut rules = load_existing_rules_strict(path)?;
     let before = rules.len();
     rules.retain(|r| !r.match_substr.eq_ignore_ascii_case(match_substr));
     if rules.len() == before {
@@ -218,11 +241,7 @@ fn write_rules_atomically(path: &Path, rules: Vec<LabelRule>) -> Result<(), Stri
 }
 
 pub fn save_rule_to_path(path: &Path, rule: LabelRule) -> Result<(), String> {
-    let mut rules = fs::read_to_string(path)
-        .ok()
-        .map(|c| parse_labels_toml(&c))
-        .unwrap_or_default();
-
+    let mut rules = load_existing_rules_strict(path)?;
     merge_or_prepend_rule(&mut rules, rule);
     write_rules_atomically(path, rules)
 }
@@ -278,24 +297,38 @@ fn merge_or_prepend_rule(rules: &mut Vec<LabelRule>, rule: LabelRule) {
 }
 
 pub fn parse_state_file_binding(path: &Path, rule: &LabelRule) -> Option<StateFileBinding> {
-    let text = fs::read_to_string(path).ok()?;
-    let mtime = fs::metadata(path).and_then(|m| m.modified()).ok();
+    const MAX_STATE_BYTES: u64 = 512 * 1024;
+    let file = fs::File::open(path).ok()?;
+    let mtime = file.metadata().and_then(|m| m.modified()).ok();
+    let mut buf = Vec::new();
+    file.take(MAX_STATE_BYTES).read_to_end(&mut buf).ok()?;
+    let root: serde_json::Value = serde_json::from_slice(&buf).ok()?;
+
     let pid_key = rule.pid_key.as_deref().unwrap_or("pid");
-    let pid = extract_json_u64(&text, pid_key).and_then(|v| u32::try_from(v).ok())?;
+    let pid = root
+        .get(pid_key)
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())?;
     if pid <= 4 {
         return None;
     }
     // Note: Do NOT skip when `running: false` — idle daemons between hourly scans
     // keep `"running": false` while their PID stays alive waiting for the next timer.
-    let running = extract_json_bool(&text, "running");
-    let next_run = extract_json_str(&text, "nextRun")
-        .or_else(|| extract_json_str(&text, "next_run"))
-        .or_else(|| {
-            extract_json_u64(&text, "nextRun")
-                .or_else(|| extract_json_u64(&text, "next_run"))
-                .map(format_unix_epoch_hhmm)
+    let running = root.get("running").and_then(|v| v.as_bool());
+    let next_run = extract_next_run(&root, "nextRun").or_else(|| extract_next_run(&root, "next_run"));
+    let last_log = root
+        .get("logs")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter().rev().find_map(|entry| {
+                entry
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.chars().take(120).collect())
+            })
         });
-    let last_log = extract_last_logs_text(&text);
     let state_dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let log_file = rule
         .log_file
@@ -312,6 +345,17 @@ pub fn parse_state_file_binding(path: &Path, rule: &LabelRule) -> Option<StateFi
         state_dir,
         log_file,
     })
+}
+
+fn extract_next_run(root: &serde_json::Value, key: &str) -> Option<String> {
+    let val = root.get(key)?;
+    if let Some(s) = val.as_str() {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    val.as_u64().map(format_unix_epoch_hhmm)
 }
 
 fn format_unix_epoch_hhmm(raw: u64) -> String {
@@ -382,114 +426,6 @@ pub fn expand_win_env_vars(raw: &str) -> String {
     s
 }
 
-fn extract_json_u64(json: &str, key: &str) -> Option<u64> {
-    let needle = format!("\"{key}\"");
-    let idx = json.find(&needle)?;
-    let rest = json[idx + needle.len()..].trim_start().strip_prefix(':')?.trim_start();
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse::<u64>().ok()
-}
-
-fn extract_json_bool(json: &str, key: &str) -> Option<bool> {
-    let needle = format!("\"{key}\"");
-    let idx = json.find(&needle)?;
-    let rest = json[idx + needle.len()..].trim_start().strip_prefix(':')?.trim_start();
-    if rest.starts_with("true") {
-        Some(true)
-    } else if rest.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn extract_json_str(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let idx = json.find(&needle)?;
-    let rest = json[idx + needle.len()..].trim_start().strip_prefix(':')?.trim_start();
-    let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    let val = rest[..end].trim();
-    if val.is_empty() {
-        None
-    } else {
-        Some(val.to_string())
-    }
-}
-
-/// Extracts the `"logs": [ ... ]` slice using quote-aware bracket scanning
-/// so `]` inside log text strings does not truncate early.
-pub fn extract_logs_array_slice(json: &str) -> Option<&str> {
-    let logs_idx = json.find("\"logs\"")?;
-    let after_key = json[logs_idx + 6..].trim_start().strip_prefix(':')?.trim_start();
-    if !after_key.starts_with('[') {
-        return None;
-    }
-
-    let bytes = after_key.as_bytes();
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut escape = false;
-    let mut arr_end = bytes.len();
-
-    for (i, &b) in bytes.iter().enumerate() {
-        if in_str {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-        } else {
-            match b {
-                b'"' => in_str = true,
-                b'[' => depth += 1,
-                b']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        arr_end = i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Some(&after_key[..arr_end])
-}
-
-fn extract_last_logs_text(json: &str) -> Option<String> {
-    let logs_slice = extract_logs_array_slice(json)?;
-    let text_idx = logs_slice.rfind("\"text\"")?;
-    let after = logs_slice[text_idx + 6..]
-        .trim_start()
-        .strip_prefix(':')?
-        .trim_start();
-    let after = after.strip_prefix('"')?;
-
-    let mut val = String::new();
-    let mut chars = after.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => break,
-            '\\' => {
-                if let Some(esc) = chars.next() {
-                    val.push(esc);
-                }
-            }
-            _ => val.push(ch),
-        }
-    }
-    let trimmed = val.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.chars().take(120).collect())
-    }
-}
-
 pub fn default_labels_path() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -514,10 +450,15 @@ pub fn default_labels_path() -> Option<PathBuf> {
     }
 }
 
-pub fn parse_labels_toml(content: &str) -> Vec<LabelRule> {
+pub fn parse_labels_toml_strict(content: &str) -> Result<Vec<LabelRule>, String> {
     toml::from_str::<LabelsFile>(content)
         .map(|f| f.rule)
-        .unwrap_or_default()
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+pub fn parse_labels_toml(content: &str) -> Vec<LabelRule> {
+    parse_labels_toml_strict(content).unwrap_or_default()
 }
 
 fn seed_or_upgrade_default_labels(path: &Path) {
@@ -662,6 +603,32 @@ color = "#F5B73B"
         remove_rule_from_path(&path, "my_worker.py").unwrap();
         let after = parse_labels_toml(&fs::read_to_string(&path).unwrap());
         assert!(after.is_empty());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn corrupt_labels_toml_is_backed_up_and_never_overwritten() {
+        let base =
+            std::env::temp_dir().join(format!("bbstats_corrupt_labels_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join("labels.toml");
+        let corrupt = "[[rule]]\nmatch = [unclosed";
+        fs::write(&path, corrupt).unwrap();
+
+        let err = save_rule_to_path(
+            &path,
+            LabelRule {
+                match_substr: "foo.py".to_string(),
+                job: "Foo".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("corrupt labels.toml"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), corrupt);
+        assert_eq!(fs::read_to_string(base.join("labels.toml.bak")).unwrap(), corrupt);
 
         let _ = fs::remove_dir_all(&base);
     }

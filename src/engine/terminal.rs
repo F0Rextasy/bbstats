@@ -11,13 +11,21 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[cfg(target_os = "windows")]
+use std::os::windows::io::FromRawHandle;
+#[cfg(target_os = "windows")]
 use windows::core::{PCWSTR, PWSTR};
 #[cfg(target_os = "windows")]
-use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    CloseHandle, SetHandleInformation, BOOL, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 #[cfg(target_os = "windows")]
-use windows::Win32::Storage::FileSystem::ReadFile;
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Console::{
     AttachConsole, FreeConsole, GetConsoleScreenBufferInfo, GetStdHandle,
@@ -73,11 +81,16 @@ impl OutputRing {
 #[derive(Default)]
 pub struct ManagedJobStore {
     rings: Mutex<HashMap<u32, Arc<Mutex<OutputRing>>>>,
+    exited_codes: Arc<Mutex<HashMap<u32, i32>>>,
 }
 
 impl ManagedJobStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn take_exit_code(&self, pid: u32) -> Option<i32> {
+        self.exited_codes.lock().ok()?.remove(&pid)
     }
 
     /// Launches a custom command detached with combined stdout/stderr
@@ -95,7 +108,26 @@ impl ManagedJobStore {
         unsafe {
             CreatePipe(&mut read_pipe, &mut write_pipe, Some(&sa), 4096)
                 .map_err(|e| format!("CreatePipe failed: {e}"))?;
+            if let Err(e) = SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) {
+                let _ = CloseHandle(read_pipe);
+                let _ = CloseHandle(write_pipe);
+                return Err(format!("SetHandleInformation failed: {e}"));
+            }
         }
+
+        let nul_wide: Vec<u16> = "\\\\.\\NUL\0".encode_utf16().collect();
+        let nul_in = unsafe {
+            CreateFileW(
+                PCWSTR(nul_wide.as_ptr()),
+                FILE_GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                Some(&sa),
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            )
+            .unwrap_or(INVALID_HANDLE_VALUE)
+        };
 
         let mut cmd_wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
         let dir_wide: Vec<u16> = working_dir
@@ -108,6 +140,7 @@ impl ManagedJobStore {
         let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: nul_in,
             hStdOutput: write_pipe,
             hStdError: write_pipe,
             ..Default::default()
@@ -129,9 +162,12 @@ impl ManagedJobStore {
             )
         };
 
-        // Close parent's write end immediately so ReadFile returns EOF when child exits.
+        // Close parent's write end and NUL stdin immediately so ReadFile returns EOF when child exits.
         unsafe {
             let _ = CloseHandle(write_pipe);
+            if nul_in != INVALID_HANDLE_VALUE && !nul_in.is_invalid() {
+                let _ = CloseHandle(nul_in);
+            }
         }
 
         if let Err(err) = created {
@@ -149,25 +185,28 @@ impl ManagedJobStore {
 
         let ring = self.register_ring(pid);
         let pipe_raw = read_pipe.0 as isize;
-        let _ = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name(format!("bbstats-pipe-{pid}"))
             .spawn(move || {
-                let handle = HANDLE(pipe_raw as *mut core::ffi::c_void);
+                let mut pipe_file = unsafe { File::from_raw_handle(pipe_raw as *mut core::ffi::c_void) };
                 let mut chunk = [0u8; 1024];
                 loop {
-                    let mut read_n = 0u32;
-                    let ok = unsafe { ReadFile(handle, Some(&mut chunk), Some(&mut read_n), None) };
-                    if ok.is_err() || read_n == 0 {
-                        break;
+                    match pipe_file.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read_n) => {
+                            if let Ok(mut g) = ring.lock() {
+                                g.push_bytes(&chunk[..read_n]);
+                            }
+                        }
                     }
-                    if let Ok(mut g) = ring.lock() {
-                        g.push_bytes(&chunk[..read_n as usize]);
-                    }
-                }
-                unsafe {
-                    let _ = CloseHandle(handle);
                 }
             });
+        if let Err(err) = spawned {
+            unsafe {
+                let _ = CloseHandle(read_pipe);
+            }
+            return Err(format!("pipe reader thread failed: {err}"));
+        }
 
         Ok(pid)
     }
@@ -181,6 +220,7 @@ impl ManagedJobStore {
             .arg("-c")
             .arg(cmdline)
             .current_dir(working_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -221,10 +261,19 @@ impl ManagedJobStore {
                     }
                 });
         }
+        let exited = Arc::clone(&self.exited_codes);
         let _ = thread::Builder::new()
             .name(format!("bbstats-wait-{pid}"))
             .spawn(move || {
-                let _ = child.wait();
+                if let Ok(status) = child.wait() {
+                    let code = status.code().unwrap_or(1);
+                    if let Ok(mut map) = exited.lock() {
+                        if map.len() > 64 {
+                            map.clear();
+                        }
+                        map.insert(pid, code);
+                    }
+                }
             });
 
         Ok(pid)
@@ -398,8 +447,8 @@ pub fn read_log_tail_lines(path: &Path, max_bytes: u64, max_lines: usize) -> Vec
     if file.seek(SeekFrom::Start(start)).is_err() {
         return Vec::new();
     }
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    if file.read_to_end(&mut buf).is_err() {
+    let mut buf = Vec::with_capacity((len - start).min(max_bytes) as usize);
+    if file.take(max_bytes).read_to_end(&mut buf).is_err() {
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&buf);
@@ -411,57 +460,33 @@ pub fn read_log_tail_lines(path: &Path, max_bytes: u64, max_lines: usize) -> Vec
     extract_clean_lines(aligned, max_lines)
 }
 
-fn parse_json_str_at(after_colon: &str) -> Option<String> {
-    let after_q = after_colon.trim_start().strip_prefix('"')?;
-    let mut val = String::new();
-    let mut chars = after_q.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => break,
-            '\\' => match chars.next() {
-                Some('n') => val.push(' '),
-                Some('r') => {}
-                Some('t') => val.push(' '),
-                Some(esc) => val.push(esc),
-                None => break,
-            },
-            _ => val.push(ch),
-        }
-    }
-    Some(val)
-}
-
 fn read_state_json_logs(path: &Path, max_lines: usize) -> Option<Vec<String>> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let slice = crate::engine::labels::extract_logs_array_slice(&text)?;
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    while let Some(rel) = slice[pos..].find("\"text\"") {
-        let key_abs = pos + rel;
-        let after = slice[key_abs + 6..].trim_start();
-        let Some(after) = after.strip_prefix(':') else {
-            pos = key_abs + 6;
+    const MAX_JSON_BYTES: u64 = 512 * 1024;
+    let file = File::open(path).ok()?;
+    let mut raw = Vec::new();
+    file.take(MAX_JSON_BYTES).read_to_end(&mut raw).ok()?;
+    let val: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let arr = val.get("logs")?.as_array()?;
+
+    let mut out = Vec::with_capacity(arr.len().min(max_lines));
+    for item in arr {
+        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
             continue;
         };
-        if let Some(val) = parse_json_str_at(after) {
-            let cleaned = strip_ansi(val.trim());
-            if !cleaned.is_empty() {
-                let obj_start = slice[..key_abs].rfind('{').unwrap_or(pos);
-                let obj_prefix = &slice[obj_start..key_abs];
-                let ts = obj_prefix
-                    .rfind("\"t\"")
-                    .and_then(|ti| obj_prefix[ti + 3..].trim_start().strip_prefix(':'))
-                    .and_then(parse_json_str_at)
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty() && !cleaned.starts_with(s.as_str()));
-                let formatted = match ts {
-                    Some(t) => format!("[{t}] {cleaned}"),
-                    None => cleaned,
-                };
-                out.push(formatted.chars().take(MAX_LINE_CHARS).collect());
-            }
+        let cleaned = strip_ansi(text.trim());
+        if cleaned.is_empty() {
+            continue;
         }
-        pos = key_abs + 6;
+        let ts = item
+            .get("t")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !cleaned.starts_with(s));
+        let formatted = match ts {
+            Some(t) => format!("[{t}] {cleaned}"),
+            None => cleaned,
+        };
+        out.push(formatted.chars().take(MAX_LINE_CHARS).collect());
     }
     if out.is_empty() {
         None
@@ -507,8 +532,8 @@ fn read_console_buffer_lines(pid: u32, max_lines: usize) -> Option<Vec<String>> 
                 return None;
             }
             let width = info.dwSize.X.clamp(1, 300) as usize;
-            let cursor_y = info.dwCursorPosition.Y.max(0);
-            let rows_to_read = (max_lines as i16 * 2).min(cursor_y + 1).max(1);
+            let cursor_y = info.dwCursorPosition.Y.max(0) as i32;
+            let rows_to_read = (max_lines as i32 * 2).min(cursor_y + 1).max(1);
             let start_y = (cursor_y + 1 - rows_to_read).max(0);
 
             let mut lines = Vec::new();
@@ -518,7 +543,7 @@ fn read_console_buffer_lines(pid: u32, max_lines: usize) -> Option<Vec<String>> 
                 let ok = ReadConsoleOutputCharacterW(
                     h_out,
                     &mut row_buf,
-                    COORD { X: 0, Y: row },
+                    COORD { X: 0, Y: row as i16 },
                     &mut chars_read,
                 );
                 if ok.is_ok() && chars_read > 0 {

@@ -49,7 +49,7 @@ pub(super) fn render_settings(
         false,
     )?;
     ctx.draw_text(
-        "v0.1.0",
+        concat!("v", env!("CARGO_PKG_VERSION")),
         &fonts.row_secondary,
         rect(w - 64.0, 8.0, w - 16.0, 34.0),
         TEXT_MUTED,
@@ -283,6 +283,15 @@ pub(super) fn render_settings(
         TEXT_PRIMARY,
         false,
     )?;
+    if state.hotkey_failed {
+        ctx.draw_text(
+            lang.pick("Conflict!", "Çakışma!"),
+            &fonts.mono_badge,
+            rect(w - 254.0, y + 2.0, w - 184.0, y + 28.0),
+            ACCENT_DANGER,
+            false,
+        )?;
+    }
     let hk_btn = rect(w - 180.0, y + 2.0, w - 16.0, y + 28.0);
     ctx.fill_rounded(hk_btn, 7.0, BG_ELEVATED)?;
     ctx.draw_text(cfg.hotkey.label(), &fonts.mono_badge, hk_btn, ACCENT_INFO, false)?;

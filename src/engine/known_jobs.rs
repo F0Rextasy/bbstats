@@ -1,10 +1,12 @@
 //! Discovery of known-but-stopped automation jobs (configured via `labels.toml`
-//! `scan_dir` / `pid_file` / `scheduled_task` or `%USERPROFILE%\.omp\local\*`) — runs ONLY while expanded (60s TTL).
+//! `scan_dir` / `pid_file` / `scheduled_task`) — runs ONLY while expanded (60s TTL).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -13,7 +15,7 @@ use std::os::windows::process::CommandExt;
 
 use crate::engine::labels::{expand_win_env_vars, LabelsStore};
 use crate::engine::project_resolver::tail_last_4kb_line;
-use crate::model::{JobId, ProjectId};
+use crate::model::{JobId, Language, ProjectId};
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -39,6 +41,7 @@ pub struct KnownJobsSnapshot {
 
 pub struct KnownJobsScanner {
     last_scan: Option<Instant>,
+    last_lang: Option<Language>,
     cached: KnownJobsSnapshot,
 }
 
@@ -46,29 +49,34 @@ impl KnownJobsScanner {
     pub fn new() -> Self {
         Self {
             last_scan: None,
+            last_lang: None,
             cached: KnownJobsSnapshot::default(),
         }
     }
 
-    pub fn get_or_refresh(&mut self, allow_io: bool, labels: &LabelsStore) -> &KnownJobsSnapshot {
+    pub fn get_or_refresh(
+        &mut self,
+        allow_io: bool,
+        labels: &LabelsStore,
+        lang: Language,
+    ) -> &KnownJobsSnapshot {
+        let lang_changed = self.last_lang != Some(lang);
         if allow_io
-            && self
-                .last_scan
-                .is_none_or(|t| t.elapsed() >= SCAN_INTERVAL)
+            && (lang_changed
+                || self
+                    .last_scan
+                    .is_none_or(|t| t.elapsed() >= SCAN_INTERVAL))
         {
-            self.cached = scan_known_jobs_from_env(labels);
+            self.cached = scan_known_jobs_from_env(labels, lang);
             self.last_scan = Some(Instant::now());
+            self.last_lang = Some(lang);
         }
         &self.cached
     }
 }
 
-fn scan_known_jobs_from_env(labels: &LabelsStore) -> KnownJobsSnapshot {
-    let omp_local = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .map(|home| home.join(".omp").join("local"));
-    scan_known_jobs_with_root(labels, omp_local.as_deref())
+fn scan_known_jobs_from_env(labels: &LabelsStore, lang: Language) -> KnownJobsSnapshot {
+    scan_known_jobs_with_root(labels, None, lang)
 }
 
 fn push_unique_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<String>, dir: PathBuf) {
@@ -89,6 +97,7 @@ fn push_unique_dir(dirs: &mut Vec<PathBuf>, seen: &mut HashSet<String>, dir: Pat
 pub fn scan_known_jobs_with_root(
     labels: &LabelsStore,
     default_root: Option<&Path>,
+    lang: Language,
 ) -> KnownJobsSnapshot {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -114,12 +123,12 @@ pub fn scan_known_jobs_with_root(
 
     let mut snap = KnownJobsSnapshot::default();
     for dir in dirs {
-        scan_known_dir(&dir, labels, &mut snap);
+        scan_known_dir(&dir, labels, lang, &mut snap);
     }
     snap
 }
 
-fn scan_known_dir(dir: &Path, labels: &LabelsStore, snap: &mut KnownJobsSnapshot) {
+fn scan_known_dir(dir: &Path, labels: &LabelsStore, lang: Language, snap: &mut KnownJobsSnapshot) {
     let dir_name = dir
         .file_name()
         .and_then(|s| s.to_str())
@@ -230,10 +239,10 @@ fn scan_known_dir(dir: &Path, labels: &LabelsStore, snap: &mut KnownJobsSnapshot
         }
     }
 
-    if let Some(note) = read_watchdog_state_note(dir) {
+    if let Some(note) = read_watchdog_state_note(dir, lang) {
         snap.watchdog_notes.insert(proj_id, note);
     } else if let Some(task_name) = matched_task_name {
-        if let Some(note) = query_scheduled_task_note(dir, &task_name) {
+        if let Some(note) = query_scheduled_task_note(dir, &task_name, lang) {
             snap.watchdog_notes.insert(proj_id, note);
         }
     }
@@ -270,20 +279,24 @@ fn find_scheduled_task_for_dir(norm_dir: &str, labels: &LabelsStore) -> Option<S
     None
 }
 
-fn read_watchdog_state_note(dir: &Path) -> Option<String> {
+fn format_watchdog_note(lang: Language, hhmm: Option<String>) -> String {
+    match hhmm {
+        Some(t) => format!("Watchdog · {} {t}", lang.pick("last run", "son çalışma")),
+        None => lang.pick("Watchdog active", "Watchdog aktif").to_string(),
+    }
+}
+
+fn read_watchdog_state_note(dir: &Path, lang: Language) -> Option<String> {
     let state_path = dir.join("watchdog-state.json");
     if !state_path.is_file() {
         return None;
     }
     let content = fs::read_to_string(&state_path).ok()?;
     let hhmm = extract_hhmm_from_json(&content);
-    Some(match hhmm {
-        Some(t) => format!("Watchdog · her 15 dk · son çalışma {t}"),
-        None => "Watchdog · her 15 dk".to_string(),
-    })
+    Some(format_watchdog_note(lang, hhmm))
 }
 
-fn query_scheduled_task_note(dir: &Path, task_name: &str) -> Option<String> {
+fn query_scheduled_task_note(dir: &Path, task_name: &str, lang: Language) -> Option<String> {
     if task_name.trim().is_empty() || !dir.is_dir() {
         return None;
     }
@@ -309,10 +322,7 @@ fn query_scheduled_task_note(dir: &Path, task_name: &str) -> Option<String> {
                     None
                 }
             });
-            return Some(match hhmm {
-                Some(t) => format!("Watchdog · her 15 dk · son çalışma {t}"),
-                None => "Watchdog · her 15 dk".to_string(),
-            });
+            return Some(format_watchdog_note(lang, hhmm));
         }
     }
 
@@ -330,7 +340,7 @@ fn query_scheduled_task_note(dir: &Path, task_name: &str) -> Option<String> {
     }
 
     if dir.join("watchdog.py").is_file() {
-        Some("Watchdog · her 15 dk".to_string())
+        Some(format_watchdog_note(lang, None))
     } else {
         None
     }
@@ -338,7 +348,18 @@ fn query_scheduled_task_note(dir: &Path, task_name: &str) -> Option<String> {
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn run_command_bounded(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
+    const MAX_STDOUT_BYTES: u64 = 256 * 1024;
     let mut child = cmd.spawn().ok()?;
+    // Drain stdout concurrently on a helper thread so verbose output cannot fill
+    // the OS pipe buffer and deadlock `try_wait()`.
+    let stdout_handle = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.take(MAX_STDOUT_BYTES).read_to_end(&mut buf);
+            buf
+        })
+    });
+
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
@@ -352,15 +373,15 @@ fn run_command_bounded(mut cmd: Command, timeout: Duration) -> Option<Vec<u8>> {
                 break None;
             }
         }
-    }?;
-    if !status.success() {
-        return None;
+    };
+    let stdout_bytes = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    if status.is_some_and(|st| st.success()) {
+        Some(stdout_bytes)
+    } else {
+        None
     }
-    let mut stdout_bytes = Vec::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_end(&mut stdout_bytes);
-    }
-    Some(stdout_bytes)
 }
 
 fn extract_hhmm_from_json(text: &str) -> Option<String> {
@@ -457,7 +478,7 @@ mod tests {
                 ..Default::default()
             },
         ]);
-        let snap = scan_known_jobs_with_root(&labels, Some(&base));
+        let snap = scan_known_jobs_with_root(&labels, Some(&base), Language::En);
 
         assert_eq!(snap.jobs.len(), 3, "watchdog.py and start-*.cmd must not be job rows");
         let titles: Vec<&str> = snap.jobs.iter().map(|j| j.title.as_str()).collect();
@@ -472,7 +493,12 @@ mod tests {
         }
 
         let note = snap.watchdog_notes.values().next().unwrap();
-        assert_eq!(note, "Watchdog · her 15 dk · son çalışma 19:14");
+        assert_eq!(note, "Watchdog · last run 19:14");
+        let snap_tr = scan_known_jobs_with_root(&labels, Some(&base), Language::Tr);
+        assert_eq!(
+            snap_tr.watchdog_notes.values().next().unwrap(),
+            "Watchdog · son çalışma 19:14"
+        );
 
         let _ = fs::remove_dir_all(&base);
         let _ = fs::remove_dir_all(&custom_dir);

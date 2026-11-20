@@ -1,6 +1,6 @@
 # bbstats Custom Rules Example
 # Windows: copy desired rules into %APPDATA%\bbstats\labels.toml
-# macOS (planned): ~/.config/bbstats/labels.toml
+# macOS: ~/Library/Application Support/bbstats/labels.toml
 
 [[rule]]
 # Case-insensitive substring matched against process cmdline, script path, or working directory.

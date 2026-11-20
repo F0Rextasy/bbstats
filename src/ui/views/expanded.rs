@@ -528,6 +528,21 @@ pub(super) fn render_expanded(
         render_project_job_cards(ctx, fonts, w, list_top, list_bot, viewport_h, lang, state, snap, hit_map, &mut next_id)?;
     }
 
+    if let Some((ref toast_msg, ts)) = state.toast {
+        if ts.elapsed().as_secs() < 5 {
+            let t_rect = rect(16.0, list_bot - 30.0, w - 16.0, list_bot - 5.0);
+            ctx.fill_rounded(t_rect, 6.0, BG_OVERLAY)?;
+            ctx.stroke_rounded(t_rect, 6.0, ACCENT_WARN, 1.0)?;
+            ctx.draw_text(
+                toast_msg,
+                &fonts.row_secondary,
+                rect(24.0, list_bot - 30.0, w - 24.0, list_bot - 5.0),
+                ACCENT_WARN,
+                false,
+            )?;
+        }
+    }
+
     // 5. Bottom Status Bar (24 DIP)
     ctx.draw_hairline(16.0, list_bot, w - 16.0)?;
     let status_left = format!(
@@ -612,198 +627,245 @@ fn render_project_job_cards<F: FnMut() -> u32>(
         return Ok(());
     }
 
-    unsafe {
-        ctx.dc.PushAxisAlignedClip(
-            &rect(0.0, list_top, w, list_bot),
-            windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        );
-    }
-
+    let enter_t = state.content_enter_t;
+    let group_count = groups.len();
     let mut y = list_top - state.scroll_offset;
     let mut flat_idx = 0usize;
     let mut stagger_idx = 0usize;
-    let enter_t = state.content_enter_t;
-    let group_count = groups.len();
 
-    for (g_idx, (proj, jobs)) in groups.into_iter().enumerate() {
-        let wd_h = if proj.watchdog_note.is_some() { 20.0 } else { 0.0 };
-        let block_h = 30.0 + wd_h + (jobs.len().max(1) as f32) * 40.0 + 4.0;
-        let swatch_col = project_swatch_color(proj, g_idx);
+    ctx.with_axis_clip(rect(0.0, list_top, w, list_bot), || {
+        for (g_idx, (proj, jobs)) in groups.into_iter().enumerate() {
+            let wd_h = if proj.watchdog_note.is_some() { 20.0 } else { 0.0 };
+            let block_h = 30.0 + wd_h + (jobs.len().max(1) as f32) * 40.0 + 4.0;
+            let swatch_col = project_swatch_color(proj, g_idx);
 
-        if y + block_h >= list_top && y <= list_bot {
-            let (grp_alpha, grp_dy) =
-                crate::ui::layout::stagger_row_progress(enter_t, stagger_idx);
-            stagger_idx += 1;
+            if y + block_h >= list_top && y <= list_bot {
+                let (grp_alpha, grp_dy) =
+                    crate::ui::layout::stagger_row_progress(enter_t, stagger_idx);
+                stagger_idx += 1;
 
-            if grp_alpha > 0.01 {
-                ctx.with_transformed_layer(0.0, grp_dy, 1.0, 1.0, grp_alpha, || {
-                    // Flat exelban/stats Project Row Header (30 DIP, NO outer card border!)
-                    let pin_r = rect(14.0, y + 4.0, 32.0, y + 26.0);
-                    if proj.pinned {
-                        ctx.draw_text("★", &fonts.mono_badge, pin_r, swatch_col, false)?;
-                    } else {
-                        // Signature exelban/stats 8x8 rounded color square
-                        ctx.fill_rounded(rect(17.0, y + 10.5, 25.0, y + 18.5), 2.5, swatch_col)?;
-                    }
-                    hit_map.push(next_id(), pin_r, HitAction::TogglePinProject(proj.id.clone()));
-
-                    let hdr_name_rect = rect(32.0, y + 2.0, 212.0, y + 27.0);
-                    let hdr_id = next_id();
-                    ctx.draw_text(
-                        &proj.name,
-                        &fonts.title,
-                        hdr_name_rect,
-                        TEXT_PRIMARY,
-                        false,
-                    )?;
-                    hit_map.push_with_rclick(
-                        hdr_id,
-                        hdr_name_rect,
-                        HitAction::OpenProjectDetail(proj.id.clone()),
-                        HitAction::BeginRenameProject {
-                            project_id: proj.id.clone(),
-                            current_name: proj.name.clone(),
-                        },
-                    );
-
-                    ctx.draw_text(
-                        &format!("{} {}", jobs.len(), lang.pick("jobs", "iş")),
-                        &fonts.row_secondary,
-                        rect(214.0, y + 3.0, 262.0, y + 26.0),
-                        TEXT_MUTED,
-                        true,
-                    )?;
-
-                    // Hover reorder / rename controls on project header
-                    let up_r = rect(w - 116.0, y + 4.0, w - 98.0, y + 25.0);
-                    let up_id = next_id();
-                    let dn_r = rect(w - 96.0, y + 4.0, w - 78.0, y + 25.0);
-                    let dn_id = next_id();
-                    let rn_r = rect(w - 76.0, y + 4.0, w - 58.0, y + 25.0);
-                    let rn_id = next_id();
-                    let hdr_hovered = state.hovered_hit_id == Some(hdr_id)
-                        || state.hovered_hit_id == Some(up_id)
-                        || state.hovered_hit_id == Some(dn_id)
-                        || state.hovered_hit_id == Some(rn_id);
-
-                    if hdr_hovered {
-                        if state.hovered_hit_id == Some(up_id) {
-                            ctx.fill_rounded(up_r, 4.0, BG_ELEVATED_HOVER)?;
+                if grp_alpha > 0.01 {
+                    ctx.with_transformed_layer(0.0, grp_dy, 1.0, 1.0, grp_alpha, || {
+                        // Flat exelban/stats Project Row Header (30 DIP, NO outer card border!)
+                        let pin_r = rect(14.0, y + 4.0, 32.0, y + 26.0);
+                        if proj.pinned {
+                            ctx.draw_text("★", &fonts.mono_badge, pin_r, swatch_col, false)?;
+                        } else {
+                            // Signature exelban/stats 8x8 rounded color square
+                            ctx.fill_rounded(rect(17.0, y + 10.5, 25.0, y + 18.5), 2.5, swatch_col)?;
                         }
-                        ctx.draw_text("↑", &fonts.mono_badge, up_r, TEXT_MUTED, false)?;
-                        if state.hovered_hit_id == Some(dn_id) {
-                            ctx.fill_rounded(dn_r, 4.0, BG_ELEVATED_HOVER)?;
-                        }
-                        ctx.draw_text("↓", &fonts.mono_badge, dn_r, TEXT_MUTED, false)?;
-                        if state.hovered_hit_id == Some(rn_id) {
-                            ctx.fill_rounded(rn_r, 4.0, BG_ELEVATED_HOVER)?;
-                        }
-                        ctx.draw_text("✎", &fonts.mono_badge, rn_r, TEXT_MUTED, false)?;
-                    } else {
-                        // Total project RAM & CPU% (crisp tabular sans-serif)
+                        hit_map.push_clipped(
+                            next_id(),
+                            pin_r,
+                            list_top,
+                            list_bot,
+                            HitAction::TogglePinProject(proj.id.clone()),
+                        );
+
+                        let hdr_name_right = if proj.git_branch.is_some() { 180.0 } else { 212.0 };
+                        let hdr_name_rect = rect(32.0, y + 2.0, hdr_name_right, y + 27.0);
+                        let hdr_id = next_id();
                         ctx.draw_text(
-                            &format_ram(proj.ram),
-                            &fonts.mono_metric,
-                            rect(316.0, y + 2.0, 394.0, y + 27.0),
+                            &proj.name,
+                            &fonts.title,
+                            hdr_name_rect,
                             TEXT_PRIMARY,
-                            true,
+                            false,
                         )?;
-                        ctx.draw_text(
-                            &format!("{:.1}%", proj.cpu),
-                            &fonts.mono_metric,
-                            rect(396.0, y + 2.0, w - 58.0, y + 27.0),
-                            TEXT_SECONDARY,
-                            true,
-                        )?;
-                    }
-                    hit_map.push(up_id, up_r, HitAction::MoveProjectOrder(proj.id.clone(), -1));
-                    hit_map.push(dn_id, dn_r, HitAction::MoveProjectOrder(proj.id.clone(), 1));
-                    hit_map.push(
-                        rn_id,
-                        rn_r,
-                        HitAction::BeginRenameProject {
-                            project_id: proj.id.clone(),
-                            current_name: proj.name.clone(),
-                        },
-                    );
+                        hit_map.push_with_rclick_clipped(
+                            hdr_id,
+                            hdr_name_rect,
+                            list_top,
+                            list_bot,
+                            HitAction::OpenProjectDetail(proj.id.clone()),
+                            HitAction::BeginRenameProject {
+                                project_id: proj.id.clone(),
+                                current_name: proj.name.clone(),
+                            },
+                        );
 
-                    // Borderless Folder + Detail icons (hover pill only)
-                    if proj.root.is_some() {
-                        let f_r = rect(w - 52.0, y + 4.0, w - 34.0, y + 25.0);
-                        let fid = next_id();
-                        if state.hovered_hit_id == Some(fid) {
-                            ctx.fill_rounded(f_r, 5.0, BG_ELEVATED_HOVER)?;
-                        }
-                        ctx.draw_text("↗", &fonts.mono_badge, f_r, TEXT_MUTED, false)?;
-                        hit_map.push(fid, f_r, HitAction::OpenProjectFolder(proj.id.clone()));
-                    }
-                    let d_r = rect(w - 32.0, y + 4.0, w - 14.0, y + 25.0);
-                    let did = next_id();
-                    if state.hovered_hit_id == Some(did) {
-                        ctx.fill_rounded(d_r, 5.0, BG_ELEVATED_HOVER)?;
-                    }
-                    ctx.draw_text("›", &fonts.mono_badge, d_r, TEXT_SECONDARY, false)?;
-                    hit_map.push(did, d_r, HitAction::OpenProjectDetail(proj.id.clone()));
-
-                    // Optional Watchdog inline info line (no heavy box!)
-                    if let Some(ref wd_note) = proj.watchdog_note {
-                        let wy = y + 28.0;
-                        ctx.draw_status_dot(30.0, wy + 10.0, 2.5, ACCENT_INFO, false)?;
+                        let jobs_x0 = hdr_name_right + 2.0;
+                        let jobs_x1 = jobs_x0 + 44.0;
                         ctx.draw_text(
-                            wd_note,
+                            &format!("{} {}", jobs.len(), lang.pick("jobs", "iş")),
                             &fonts.row_secondary,
-                            rect(38.0, wy, w - 18.0, wy + 19.0),
+                            rect(jobs_x0, y + 3.0, jobs_x1, y + 26.0),
                             TEXT_MUTED,
                             true,
                         )?;
-                    }
-                    Ok(())
-                })?;
-            }
+                        if let Some(ref branch) = proj.git_branch {
+                            let bw = ((branch.chars().count().min(11) as f32) * 5.8 + 12.0)
+                                .clamp(36.0, 82.0);
+                            let b_left = jobs_x1 + 4.0;
+                            let b_rect =
+                                rect(b_left, y + 5.5, (b_left + bw).min(312.0), y + 23.5);
+                            ctx.fill_rounded(b_rect, 4.0, BG_ELEVATED)?;
+                            ctx.draw_text(
+                                branch,
+                                &fonts.mono_badge,
+                                b_rect,
+                                TEXT_SECONDARY,
+                                true,
+                            )?;
+                        }
 
-            // Job Rows inside Project (40 DIP per row, zero nested boxes)
-            for (j_idx, job) in jobs.iter().enumerate() {
-                let jy = y + 28.0 + wd_h + j_idx as f32 * 40.0;
-                if jy + 40.0 < list_top || jy > list_bot {
-                    flat_idx += 1;
-                    continue;
-                }
-                let (row_alpha, row_dy) =
-                    crate::ui::layout::stagger_row_progress(enter_t, stagger_idx);
-                stagger_idx += 1;
-                if row_alpha > 0.01 {
-                    ctx.with_transformed_layer(0.0, row_dy, 1.0, 1.0, row_alpha, || {
-                        render_job_row(
-                            ctx,
-                            fonts,
-                            w,
-                            jy,
-                            job,
-                            flat_idx == state.selected_index,
-                            lang,
-                            state,
-                            hit_map,
-                            next_id,
-                        )
+                        // Hover reorder / rename controls on project header
+                        let up_r = rect(w - 116.0, y + 4.0, w - 98.0, y + 25.0);
+                        let up_id = next_id();
+                        let dn_r = rect(w - 96.0, y + 4.0, w - 78.0, y + 25.0);
+                        let dn_id = next_id();
+                        let rn_r = rect(w - 76.0, y + 4.0, w - 58.0, y + 25.0);
+                        let rn_id = next_id();
+                        let hdr_hovered = state.hovered_hit_id == Some(hdr_id)
+                            || state.hovered_hit_id == Some(up_id)
+                            || state.hovered_hit_id == Some(dn_id)
+                            || state.hovered_hit_id == Some(rn_id);
+
+                        if hdr_hovered {
+                            if state.hovered_hit_id == Some(up_id) {
+                                ctx.fill_rounded(up_r, 4.0, BG_ELEVATED_HOVER)?;
+                            }
+                            ctx.draw_text("↑", &fonts.mono_badge, up_r, TEXT_MUTED, false)?;
+                            if state.hovered_hit_id == Some(dn_id) {
+                                ctx.fill_rounded(dn_r, 4.0, BG_ELEVATED_HOVER)?;
+                            }
+                            ctx.draw_text("↓", &fonts.mono_badge, dn_r, TEXT_MUTED, false)?;
+                            if state.hovered_hit_id == Some(rn_id) {
+                                ctx.fill_rounded(rn_r, 4.0, BG_ELEVATED_HOVER)?;
+                            }
+                            ctx.draw_text("✎", &fonts.mono_badge, rn_r, TEXT_MUTED, false)?;
+                        } else {
+                            // Total project RAM & CPU% (crisp tabular sans-serif)
+                            ctx.draw_text(
+                                &format_ram(proj.ram),
+                                &fonts.mono_metric,
+                                rect(316.0, y + 2.0, 394.0, y + 27.0),
+                                TEXT_PRIMARY,
+                                true,
+                            )?;
+                            ctx.draw_text(
+                                &format!("{:.1}%", proj.cpu),
+                                &fonts.mono_metric,
+                                rect(396.0, y + 2.0, w - 58.0, y + 27.0),
+                                TEXT_SECONDARY,
+                                true,
+                            )?;
+                        }
+                        hit_map.push_clipped(
+                            up_id,
+                            up_r,
+                            list_top,
+                            list_bot,
+                            HitAction::MoveProjectOrder(proj.id.clone(), -1),
+                        );
+                        hit_map.push_clipped(
+                            dn_id,
+                            dn_r,
+                            list_top,
+                            list_bot,
+                            HitAction::MoveProjectOrder(proj.id.clone(), 1),
+                        );
+                        hit_map.push_clipped(
+                            rn_id,
+                            rn_r,
+                            list_top,
+                            list_bot,
+                            HitAction::BeginRenameProject {
+                                project_id: proj.id.clone(),
+                                current_name: proj.name.clone(),
+                            },
+                        );
+
+                        // Borderless Folder + Detail icons (hover pill only)
+                        if proj.root.is_some() {
+                            let f_r = rect(w - 52.0, y + 4.0, w - 34.0, y + 25.0);
+                            let fid = next_id();
+                            if state.hovered_hit_id == Some(fid) {
+                                ctx.fill_rounded(f_r, 5.0, BG_ELEVATED_HOVER)?;
+                            }
+                            ctx.draw_text("↗", &fonts.mono_badge, f_r, TEXT_MUTED, false)?;
+                            hit_map.push_clipped(
+                                fid,
+                                f_r,
+                                list_top,
+                                list_bot,
+                                HitAction::OpenProjectFolder(proj.id.clone()),
+                            );
+                        }
+                        let d_r = rect(w - 32.0, y + 4.0, w - 14.0, y + 25.0);
+                        let did = next_id();
+                        if state.hovered_hit_id == Some(did) {
+                            ctx.fill_rounded(d_r, 5.0, BG_ELEVATED_HOVER)?;
+                        }
+                        ctx.draw_text("›", &fonts.mono_badge, d_r, TEXT_SECONDARY, false)?;
+                        hit_map.push_clipped(
+                            did,
+                            d_r,
+                            list_top,
+                            list_bot,
+                            HitAction::OpenProjectDetail(proj.id.clone()),
+                        );
+
+                        // Optional Watchdog inline info line (no heavy box!)
+                        if let Some(ref wd_note) = proj.watchdog_note {
+                            let wy = y + 28.0;
+                            ctx.draw_status_dot(30.0, wy + 10.0, 2.5, ACCENT_INFO, false)?;
+                            ctx.draw_text(
+                                wd_note,
+                                &fonts.row_secondary,
+                                rect(38.0, wy, w - 18.0, wy + 19.0),
+                                TEXT_MUTED,
+                                true,
+                            )?;
+                        }
+                        Ok(())
                     })?;
                 }
-                flat_idx += 1;
-            }
 
-            if g_idx + 1 < group_count && grp_alpha > 0.01 {
-                ctx.with_transformed_layer(0.0, grp_dy, 1.0, 1.0, grp_alpha, || {
-                    ctx.draw_hairline(16.0, y + block_h + 2.0, w - 16.0)
-                })?;
+                // Job Rows inside Project (40 DIP per row, zero nested boxes)
+                for (j_idx, job) in jobs.iter().enumerate() {
+                    let jy = y + 28.0 + wd_h + j_idx as f32 * 40.0;
+                    if jy + 40.0 < list_top || jy > list_bot {
+                        flat_idx += 1;
+                        continue;
+                    }
+                    let (row_alpha, row_dy) =
+                        crate::ui::layout::stagger_row_progress(enter_t, stagger_idx);
+                    stagger_idx += 1;
+                    if row_alpha > 0.01 {
+                        ctx.with_transformed_layer(0.0, row_dy, 1.0, 1.0, row_alpha, || {
+                            render_job_row(
+                                ctx,
+                                fonts,
+                                w,
+                                jy,
+                                list_top,
+                                list_bot,
+                                job,
+                                flat_idx == state.selected_index,
+                                lang,
+                                state,
+                                hit_map,
+                                next_id,
+                            )
+                        })?;
+                    }
+                    flat_idx += 1;
+                }
+
+                if g_idx + 1 < group_count && grp_alpha > 0.01 {
+                    ctx.with_transformed_layer(0.0, grp_dy, 1.0, 1.0, grp_alpha, || {
+                        ctx.draw_hairline(16.0, y + block_h + 2.0, w - 16.0)
+                    })?;
+                }
+            } else {
+                flat_idx += jobs.len();
             }
-        } else {
-            flat_idx += jobs.len();
+            y += block_h + 6.0;
         }
-        y += block_h + 6.0;
-    }
+        Ok(())
+    })?;
 
-    unsafe {
-        ctx.dc.PopAxisAlignedClip();
-    }
     Ok(())
 }
 
@@ -813,6 +875,8 @@ fn render_job_row<F: FnMut() -> u32>(
     fonts: &FontSet,
     w: f32,
     jy: f32,
+    list_top: f32,
+    list_bot: f32,
     job: &Job,
     is_selected: bool,
     lang: Language,
@@ -924,9 +988,11 @@ fn render_job_row<F: FnMut() -> u32>(
         )?;
     }
 
-    hit_map.push_with_rclick(
+    hit_map.push_with_rclick_clipped(
         row_id,
         row_rect,
+        list_top,
+        list_bot,
         HitAction::OpenJobDetail(job.project.clone(), job.id.clone()),
         HitAction::BeginRenameJob {
             match_hint: job.match_hint.clone(),
@@ -960,9 +1026,11 @@ fn render_job_row<F: FnMut() -> u32>(
             },
         )?;
         ctx.draw_text(&label, &fonts.mono_badge, p_rect, ACCENT_INFO, true)?;
-        hit_map.push_with_rclick(
+        hit_map.push_with_rclick_clipped(
             pid_hit,
             p_rect,
+            list_top,
+            list_bot,
             HitAction::OpenPort {
                 port: port.port,
                 url: port.suggested_url.clone(),
@@ -1073,7 +1141,7 @@ fn render_job_row<F: FnMut() -> u32>(
             BG_OVERLAY,
             false,
         )?;
-        hit_map.push(next_id(), ok_r, HitAction::ConfirmKillJob(job.id.clone()));
+        hit_map.push_clipped(next_id(), ok_r, list_top, list_bot, HitAction::ConfirmKillJob(job.id.clone()));
 
         ctx.fill_rounded(cn_r, 6.0, BG_ELEVATED_HOVER)?;
         ctx.draw_text(
@@ -1083,7 +1151,7 @@ fn render_job_row<F: FnMut() -> u32>(
             TEXT_PRIMARY,
             false,
         )?;
-        hit_map.push(next_id(), cn_r, HitAction::CancelKillConfirm);
+        hit_map.push_clipped(next_id(), cn_r, list_top, list_bot, HitAction::CancelKillConfirm);
     } else {
         if show_actions {
             for (b_rect, b_id, lbl) in [(up_rect, up_id, "↑"), (dn_rect, dn_id, "↓"), (ed_rect, ed_id, "✎")] {
@@ -1155,11 +1223,13 @@ fn render_job_row<F: FnMut() -> u32>(
         } else {
             job.id.0.clone()
         };
-        hit_map.push(up_id, up_rect, HitAction::MoveJobOrder(order_key.clone(), -1));
-        hit_map.push(dn_id, dn_rect, HitAction::MoveJobOrder(order_key, 1));
-        hit_map.push(
+        hit_map.push_clipped(up_id, up_rect, list_top, list_bot, HitAction::MoveJobOrder(order_key.clone(), -1));
+        hit_map.push_clipped(dn_id, dn_rect, list_top, list_bot, HitAction::MoveJobOrder(order_key, 1));
+        hit_map.push_clipped(
             ed_id,
             ed_rect,
+            list_top,
+            list_bot,
             HitAction::BeginRenameJob {
                 match_hint: job.match_hint.clone(),
                 current_title: job.title.clone(),
@@ -1167,15 +1237,15 @@ fn render_job_row<F: FnMut() -> u32>(
         );
         if job.can_restart {
             if job.status == ProjectStatus::Stopped && job.custom_command.is_some() {
-                hit_map.push(rid, r_rect, HitAction::StartCustomJob(job.id.clone()));
+                hit_map.push_clipped(rid, r_rect, list_top, list_bot, HitAction::StartCustomJob(job.id.clone()));
             } else {
-                hit_map.push(rid, r_rect, HitAction::RestartJob(job.id.clone()));
+                hit_map.push_clipped(rid, r_rect, list_top, list_bot, HitAction::RestartJob(job.id.clone()));
             }
         }
         if job.can_kill {
-            hit_map.push(kid, k_rect, HitAction::RequestKillJob(job.id.clone()));
+            hit_map.push_clipped(kid, k_rect, list_top, list_bot, HitAction::RequestKillJob(job.id.clone()));
         } else if job.status == ProjectStatus::Stopped && job.is_watched {
-            hit_map.push(kid, k_rect, HitAction::RemoveWatchedJob(job.match_hint.clone()));
+            hit_map.push_clipped(kid, k_rect, list_top, list_bot, HitAction::RemoveWatchedJob(job.match_hint.clone()));
         }
     }
 
@@ -1213,139 +1283,145 @@ fn render_all_procs_list<F: FnMut() -> u32>(
     state.max_scroll = (total_h - viewport_h).max(0.0);
     state.scroll_offset = state.scroll_offset.clamp(0.0, state.max_scroll);
 
-    unsafe {
-        ctx.dc.PushAxisAlignedClip(
-            &rect(0.0, list_top, w, list_bot),
-            windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-        );
-    }
-
-    let hdr_y = list_top - state.scroll_offset;
-    ctx.draw_text(
-        &format!(
-            "{} ({})",
-            lang.pick(
-                "ALL OS PROCESSES — raw fallback view",
-                "TÜM İŞLETİM SİSTEMİ SÜREÇLERİ — ham görünüm",
+    ctx.with_axis_clip(rect(0.0, list_top, w, list_bot), || {
+        let hdr_y = list_top - state.scroll_offset;
+        ctx.draw_text(
+            &format!(
+                "{} ({})",
+                lang.pick(
+                    "ALL OS PROCESSES — raw fallback view",
+                    "TÜM İŞLETİM SİSTEMİ SÜREÇLERİ — ham görünüm",
+                ),
+                procs.len()
             ),
-            procs.len()
-        ),
-        &fonts.section_hdr,
-        rect(14.0, hdr_y, w - 14.0, hdr_y + 20.0),
-        TEXT_MUTED,
-        true,
-    )?;
-
-    for (idx, pr) in procs.iter().enumerate() {
-        let y = hdr_y + 22.0 + idx as f32 * row_h;
-        if y + row_h < list_top || y > list_bot {
-            continue;
-        }
-        let rr = rect(12.0, y, w - 12.0, y + row_h - 4.0);
-        ctx.fill_rounded(rr, 7.0, BG_CARD)?;
-        ctx.draw_text(
-            &format!("{} · {}", pr.name, pr.role_label),
-            &fonts.row_primary,
-            rect(22.0, y + 2.0, 290.0, y + 20.0),
-            TEXT_PRIMARY,
-            false,
-        )?;
-        ctx.draw_text(
-            &format!("PID {} · {}", pr.key.pid, format_uptime(pr.uptime_secs)),
-            &fonts.row_secondary,
-            rect(22.0, y + 19.0, 290.0, y + 36.0),
+            &fonts.section_hdr,
+            rect(14.0, hdr_y, w - 14.0, hdr_y + 20.0),
             TEXT_MUTED,
             true,
         )?;
-        let confirming = matches!(
-            &state.pending_kill,
-            Some(PendingKill::Process(pk)) if pk == &pr.key
-        );
-        let metric_right = if confirming { w - 126.0 } else { w - 118.0 };
-        ctx.draw_text(
-            &format!("{:.1}% · {}", pr.cpu, format_ram(pr.ram)),
-            &fonts.mono_metric,
-            rect(280.0, y + 4.0, metric_right, y + 34.0),
-            TEXT_SECONDARY,
-            true,
-        )?;
-        if confirming {
-            let ok_r = rect(w - 120.0, y + 7.0, w - 66.0, y + 31.0);
-            ctx.fill_rounded(ok_r, 5.0, ACCENT_DANGER)?;
-            ctx.draw_text(
-                lang.pick("Confirm", "Onayla"),
-                &fonts.mono_badge,
-                ok_r,
-                BG_OVERLAY,
-                false,
-            )?;
-            hit_map.push(next_id(), ok_r, HitAction::ConfirmKillProcess(pr.key));
 
-            let cn_r = rect(w - 62.0, y + 7.0, w - 18.0, y + 31.0);
-            ctx.fill_rounded(cn_r, 5.0, BG_ELEVATED_HOVER)?;
+        for (idx, pr) in procs.iter().enumerate() {
+            let y = hdr_y + 22.0 + idx as f32 * row_h;
+            if y + row_h < list_top || y > list_bot {
+                continue;
+            }
+            let rr = rect(12.0, y, w - 12.0, y + row_h - 4.0);
+            ctx.fill_rounded(rr, 7.0, BG_CARD)?;
             ctx.draw_text(
-                lang.pick("Cancel", "İptal"),
-                &fonts.mono_badge,
-                cn_r,
+                &format!("{} · {}", pr.name, pr.role_label),
+                &fonts.row_primary,
+                rect(22.0, y + 2.0, 290.0, y + 20.0),
                 TEXT_PRIMARY,
                 false,
             )?;
-            hit_map.push(next_id(), cn_r, HitAction::CancelKillConfirm);
-        } else {
-            let short_exe = pr
-                .name
-                .strip_suffix(".exe")
-                .or_else(|| pr.name.strip_suffix(".EXE"))
-                .unwrap_or(&pr.name)
-                .to_string();
-            if !pr.is_critical_system {
-                let add_r = rect(w - 112.0, y + 7.0, w - 52.0, y + 31.0);
-                let add_id = next_id();
-                ctx.fill_rounded(
-                    add_r,
-                    5.0,
-                    if state.hovered_hit_id == Some(add_id) {
-                        rgba(10, 132, 255, 0.30)
-                    } else {
-                        ACCENT_INFO_BG
-                    },
-                )?;
+            ctx.draw_text(
+                &format!("PID {} · {}", pr.key.pid, format_uptime(pr.uptime_secs)),
+                &fonts.row_secondary,
+                rect(22.0, y + 19.0, 290.0, y + 36.0),
+                TEXT_MUTED,
+                true,
+            )?;
+            let confirming = matches!(
+                &state.pending_kill,
+                Some(PendingKill::Process(pk)) if pk == &pr.key
+            );
+            let metric_right = if confirming { w - 126.0 } else { w - 118.0 };
+            ctx.draw_text(
+                &format!("{:.1}% · {}", pr.cpu, format_ram(pr.ram)),
+                &fonts.mono_metric,
+                rect(280.0, y + 4.0, metric_right, y + 34.0),
+                TEXT_SECONDARY,
+                true,
+            )?;
+            if confirming {
+                let ok_r = rect(w - 120.0, y + 7.0, w - 66.0, y + 31.0);
+                ctx.fill_rounded(ok_r, 5.0, ACCENT_DANGER)?;
                 ctx.draw_text(
-                    lang.pick("+ Watch", "+ İzle"),
+                    lang.pick("Confirm", "Onayla"),
                     &fonts.mono_badge,
-                    add_r,
-                    ACCENT_INFO,
+                    ok_r,
+                    BG_OVERLAY,
                     false,
                 )?;
-                hit_map.push(
-                    add_id,
-                    add_r,
-                    HitAction::WatchProcessFromAll {
-                        match_substr: pr.name.clone(),
-                        title: short_exe,
-                        working_dir: pr
-                            .working_dir
-                            .as_ref()
-                            .map(|p| p.to_string_lossy().into_owned()),
-                    },
+                hit_map.push_clipped(
+                    next_id(),
+                    ok_r,
+                    list_top,
+                    list_bot,
+                    HitAction::ConfirmKillProcess(pr.key),
                 );
-            }
-            if pr.is_critical_system || !pr.can_kill {
-                let lk = rect(w - 48.0, y + 7.0, w - 16.0, y + 31.0);
-                ctx.fill_rounded(lk, 5.0, BG_OVERLAY)?;
-                ctx.draw_text("LOCK", &fonts.mono_badge, lk, TEXT_MUTED, false)?;
+
+                let cn_r = rect(w - 62.0, y + 7.0, w - 18.0, y + 31.0);
+                ctx.fill_rounded(cn_r, 5.0, BG_ELEVATED_HOVER)?;
+                ctx.draw_text(
+                    lang.pick("Cancel", "İptal"),
+                    &fonts.mono_badge,
+                    cn_r,
+                    TEXT_PRIMARY,
+                    false,
+                )?;
+                hit_map.push_clipped(next_id(), cn_r, list_top, list_bot, HitAction::CancelKillConfirm);
             } else {
-                let k_r = rect(w - 46.0, y + 7.0, w - 18.0, y + 31.0);
-                ctx.fill_rounded(k_r, 5.0, ACCENT_DANGER_BG)?;
-                ctx.draw_text("■", &fonts.mono_badge, k_r, ACCENT_DANGER, false)?;
-                hit_map.push(next_id(), k_r, HitAction::RequestKillProcess(pr.key));
+                let short_exe = pr
+                    .name
+                    .strip_suffix(".exe")
+                    .or_else(|| pr.name.strip_suffix(".EXE"))
+                    .unwrap_or(&pr.name)
+                    .to_string();
+                if !pr.is_critical_system {
+                    let add_r = rect(w - 112.0, y + 7.0, w - 52.0, y + 31.0);
+                    let add_id = next_id();
+                    ctx.fill_rounded(
+                        add_r,
+                        5.0,
+                        if state.hovered_hit_id == Some(add_id) {
+                            rgba(10, 132, 255, 0.30)
+                        } else {
+                            ACCENT_INFO_BG
+                        },
+                    )?;
+                    ctx.draw_text(
+                        lang.pick("+ Watch", "+ İzle"),
+                        &fonts.mono_badge,
+                        add_r,
+                        ACCENT_INFO,
+                        false,
+                    )?;
+                    hit_map.push_clipped(
+                        add_id,
+                        add_r,
+                        list_top,
+                        list_bot,
+                        HitAction::WatchProcessFromAll {
+                            match_substr: pr.name.clone(),
+                            title: short_exe,
+                            working_dir: pr
+                                .working_dir
+                                .as_ref()
+                                .map(|p| p.to_string_lossy().into_owned()),
+                        },
+                    );
+                }
+                if pr.is_critical_system || !pr.can_kill {
+                    let lk = rect(w - 48.0, y + 7.0, w - 16.0, y + 31.0);
+                    ctx.fill_rounded(lk, 5.0, BG_OVERLAY)?;
+                    ctx.draw_text("LOCK", &fonts.mono_badge, lk, TEXT_MUTED, false)?;
+                } else {
+                    let k_r = rect(w - 46.0, y + 7.0, w - 18.0, y + 31.0);
+                    ctx.fill_rounded(k_r, 5.0, ACCENT_DANGER_BG)?;
+                    ctx.draw_text("■", &fonts.mono_badge, k_r, ACCENT_DANGER, false)?;
+                    hit_map.push_clipped(
+                        next_id(),
+                        k_r,
+                        list_top,
+                        list_bot,
+                        HitAction::RequestKillProcess(pr.key),
+                    );
+                }
             }
         }
-    }
-
-    unsafe {
-        ctx.dc.PopAxisAlignedClip();
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 

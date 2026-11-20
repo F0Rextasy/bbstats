@@ -3,7 +3,7 @@
 //! Keep this module pure `std` with no UI or Win32 types so both `engine` and
 //! `ui`/`render` layers can compile against a stable contract.
 
-#![allow(dead_code)]
+#![cfg_attr(not(target_os = "windows"), allow(dead_code))]
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -113,10 +113,6 @@ impl SortMode {
         }
     }
 
-    pub fn label(self) -> &'static str {
-        self.label_for(Language::Tr)
-    }
-
     pub fn next(self) -> Self {
         match self {
             Self::Custom => Self::Cpu,
@@ -149,13 +145,10 @@ impl TerminalSourceKind {
             Self::None => lang.pick("No Output", "Çıktı Yok"),
         }
     }
-
-    pub fn label(self) -> &'static str {
-        self.label_for(Language::Tr)
-    }
 }
 
 /// Bounded terminal tail snapshot populated ONLY while a Detail view is open.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct TerminalOutput {
     pub project_id: ProjectId,
@@ -165,9 +158,8 @@ pub struct TerminalOutput {
     pub lines: Vec<String>,
 }
 
-pub type JobStatus = ProjectStatus;
-
 /// Semantic role inferred for a process within a project.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessRole {
     DevServer,
@@ -206,6 +198,7 @@ pub struct PortBinding {
 }
 
 /// Per-process telemetry and inferred metadata (underlying raw process).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ProcInfo {
     pub key: ProcessKey,
@@ -217,10 +210,7 @@ pub struct ProcInfo {
     pub working_dir: Option<PathBuf>,
     pub cpu: f32,
     pub ram: u64,
-    pub disk_read_bps: u64,
-    pub disk_write_bps: u64,
     pub ports: Vec<PortBinding>,
-    pub active_tcp_connections: u16,
     pub uptime_secs: u64,
     pub is_helper_collapsed: bool,
     pub is_critical_system: bool,
@@ -230,6 +220,7 @@ pub struct ProcInfo {
 }
 
 /// A human-readable background Job (collapsed process tree for a single script/entrypoint).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: JobId,
@@ -258,6 +249,7 @@ pub struct Job {
 }
 
 /// A logical project grouping one or more related Jobs.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ProjectGroup {
     pub id: ProjectId,
@@ -270,12 +262,10 @@ pub struct ProjectGroup {
     pub status: ProjectStatus,
     pub cpu: f32,
     pub ram: u64,
-    pub disk_bps: u64,
     pub ports: Vec<PortBinding>,
     pub jobs: Vec<Job>,
     pub watchdog_note: Option<String>,
     pub procs: Vec<ProcInfo>,
-    pub helper_count: u16,
     pub cpu_history: [u8; 30],
     pub ram_history_mb: [u16; 30],
 }
@@ -299,6 +289,7 @@ pub enum AlertKind {
 }
 
 /// User-facing alert banner / pill notification.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Alert {
     pub id: u64,
@@ -311,6 +302,7 @@ pub struct Alert {
 }
 
 /// Immutable telemetry snapshot published by the background engine.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     pub timestamp_ms: u64,
@@ -331,6 +323,8 @@ pub struct Snapshot {
     pub all_procs: Vec<ProcInfo>,
     /// Populated only when a Detail view is actively inspecting a job/project.
     pub active_terminal: Option<TerminalOutput>,
+    /// Monotonically-numbered latest action/spawn error surfaced to the UI.
+    pub last_action_error: Option<(u64, String)>,
 }
 
 /// Commands sent from the UI thread to the background engine thread.
@@ -353,12 +347,13 @@ pub enum EngineCmd {
     /// Kill all killable processes belonging to a project group.
     KillProject(ProjectId),
     /// Restart a previously tracked process (or container) if a restart recipe is available.
+    #[allow(dead_code)]
     Restart(ProcessKey),
     /// Restart the primary restartable process of a Job.
     RestartJob(JobId),
     /// Restart the primary restartable process(es) of a project.
     RestartProject(ProjectId),
-    /// Sync persisted UI ordering, pins, hidden projects, aliases, and sort mode to the engine.
+    /// Sync persisted UI ordering, pins, hidden projects, aliases, sort mode, and language to the engine.
     SyncConfigState {
         pinned_projects: Vec<String>,
         hidden_projects: Vec<String>,
@@ -366,6 +361,7 @@ pub enum EngineCmd {
         project_order: Vec<String>,
         job_order: Vec<String>,
         sort_mode: SortMode,
+        language: Language,
     },
     /// Pin or unpin a project to keep it at the top of the list.
     SetPinned {
@@ -401,8 +397,6 @@ pub enum EngineCmd {
     RemoveLabelRule(String),
     /// Start a custom or stopped job configured with a launch command.
     StartCustomJob(JobId),
-    /// Force reload of `%APPDATA%\bbstats\labels.toml` and re-resolve metadata.
-    ReloadLabels,
     /// Wake the engine immediately and force a fresh scan.
     ForceRescan,
     /// Gracefully stop the background engine thread.

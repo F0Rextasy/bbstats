@@ -10,9 +10,9 @@ use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
 #[cfg(target_os = "windows")]
 use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
-    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_ESTAB, MIB_TCP_STATE_LISTEN,
-    MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
-    TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
+    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_LISTEN, MIB_UDP6ROW_OWNER_PID,
+    MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
+    UDP_TABLE_OWNER_PID,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
@@ -26,15 +26,12 @@ use crate::model::{BindScope, PortBinding, ProcessKey, TransportProto};
 #[derive(Debug, Clone, Copy)]
 struct PrevSample {
     cpu_time_100ns: i64,
-    read_bytes: u64,
-    write_bytes: u64,
     seen_tick: u64,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct PidNetworkInfo {
     pub ports: Vec<PortBinding>,
-    pub active_tcp_connections: u16,
 }
 
 /// Snapshot of a single process's raw fields + computed dynamic metrics for one tick.
@@ -46,8 +43,6 @@ pub struct CollectedProcess {
     pub image_name: String,
     pub cpu_percent: f32,
     pub private_ram_bytes: u64,
-    pub disk_read_bps: u64,
-    pub disk_write_bps: u64,
     pub uptime_secs: u64,
 }
 
@@ -60,10 +55,10 @@ pub struct CollectedTick {
 }
 
 pub struct ProcessCollector {
-    scratch_buf: Vec<u8>,
+    scratch_buf: Vec<u64>,
     raw_entries: Vec<RawProcessEntry>,
     #[cfg(target_os = "windows")]
-    net_buf: Vec<u8>,
+    net_buf: Vec<u64>,
     prev_samples: HashMap<ProcessKey, PrevSample>,
     tick_id: u64,
     last_tick: Option<Instant>,
@@ -74,10 +69,10 @@ pub struct ProcessCollector {
 impl ProcessCollector {
     pub fn new() -> Self {
         Self {
-            scratch_buf: Vec::with_capacity(768 * 1024),
+            scratch_buf: Vec::with_capacity((768 * 1024) / 8),
             raw_entries: Vec::with_capacity(512),
             #[cfg(target_os = "windows")]
-            net_buf: vec![0u8; 64 * 1024],
+            net_buf: vec![0u64; 8192],
             prev_samples: HashMap::with_capacity(512),
             tick_id: 0,
             last_tick: None,
@@ -86,16 +81,12 @@ impl ProcessCollector {
         }
     }
 
-    /// Collects all running processes and computes CPU%, private RAM, and disk I/O rates.
+    /// Collects all running processes and computes CPU% and private RAM.
     pub fn collect_processes(&mut self) -> CollectedTick {
         let now = Instant::now();
         let wall_100ns = self
             .last_tick
             .map(|prev| (now.duration_since(prev).as_secs_f64() * 10_000_000.0).max(1.0))
-            .unwrap_or(1.0);
-        let wall_secs = self
-            .last_tick
-            .map(|prev| now.duration_since(prev).as_secs_f64().max(0.001))
             .unwrap_or(1.0);
         let has_prev_tick = self.last_tick.is_some();
         self.last_tick = Some(now);
@@ -113,12 +104,9 @@ impl ProcessCollector {
             let key = ProcessKey::new(raw.pid, raw.create_time_100ns);
             let sample = PrevSample {
                 cpu_time_100ns: raw.cpu_time_100ns,
-                read_bytes: raw.read_bytes,
-                write_bytes: raw.write_bytes,
                 seen_tick: tick_id,
             };
-            let (cpu_percent, disk_read_bps, disk_write_bps) = match self.prev_samples.entry(key)
-            {
+            let cpu_percent = match self.prev_samples.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut e) => {
                     let prev = *e.get();
                     e.insert(sample);
@@ -127,21 +115,14 @@ impl ProcessCollector {
                             .cpu_time_100ns
                             .saturating_sub(prev.cpu_time_100ns)
                             .max(0) as f64;
-                        let cpu = ((d_cpu / norm_denom) * 100.0).clamp(0.0, 100.0) as f32;
-                        let d_read = raw.read_bytes.saturating_sub(prev.read_bytes) as f64;
-                        let d_write = raw.write_bytes.saturating_sub(prev.write_bytes) as f64;
-                        (
-                            cpu,
-                            (d_read / wall_secs).round() as u64,
-                            (d_write / wall_secs).round() as u64,
-                        )
+                        ((d_cpu / norm_denom) * 100.0).clamp(0.0, 100.0) as f32
                     } else {
-                        (0.0, 0, 0)
+                        0.0
                     }
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert(sample);
-                    (0.0, 0, 0)
+                    0.0
                 }
             };
 
@@ -158,8 +139,6 @@ impl ProcessCollector {
                 image_name: raw.image_name.clone(),
                 cpu_percent,
                 private_ram_bytes: raw.private_ram_bytes,
-                disk_read_bps,
-                disk_write_bps,
                 uptime_secs,
             });
         }
@@ -261,9 +240,6 @@ impl ProcessCollector {
                         suggested_url: suggest_url_for_port(port),
                     },
                 );
-            } else if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32 {
-                let entry = by_pid.entry(pid).or_default();
-                entry.active_tcp_connections = entry.active_tcp_connections.saturating_add(1);
             }
         }
     }
@@ -294,9 +270,6 @@ impl ProcessCollector {
                         suggested_url: suggest_url_for_port(port),
                     },
                 );
-            } else if row.dwState == MIB_TCP_STATE_ESTAB.0 as u32 {
-                let entry = by_pid.entry(pid).or_default();
-                entry.active_tcp_connections = entry.active_tcp_connections.saturating_add(1);
             }
         }
     }
@@ -316,13 +289,17 @@ impl ProcessCollector {
             return;
         }
 
-        if self.net_buf.len() < std::mem::size_of::<MIB_UDPTABLE_OWNER_PID>() {
+        let byte_len = self.net_buf.len() * std::mem::size_of::<u64>();
+        if byte_len < std::mem::size_of::<MIB_UDPTABLE_OWNER_PID>() {
             return;
         }
         let table = unsafe { &*(self.net_buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID) };
         let count = table.dwNumEntries as usize;
         let rows_offset = std::mem::offset_of!(MIB_UDPTABLE_OWNER_PID, table);
-        if rows_offset + count * std::mem::size_of::<MIB_UDPROW_OWNER_PID>() > self.net_buf.len() {
+        let Some(rows_bytes) = count.checked_mul(std::mem::size_of::<MIB_UDPROW_OWNER_PID>()) else {
+            return;
+        };
+        if rows_offset.saturating_add(rows_bytes) > byte_len {
             return;
         }
         let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) };
@@ -361,13 +338,17 @@ impl ProcessCollector {
             return;
         }
 
-        if self.net_buf.len() < std::mem::size_of::<MIB_UDP6TABLE_OWNER_PID>() {
+        let byte_len = self.net_buf.len() * std::mem::size_of::<u64>();
+        if byte_len < std::mem::size_of::<MIB_UDP6TABLE_OWNER_PID>() {
             return;
         }
         let table = unsafe { &*(self.net_buf.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID) };
         let count = table.dwNumEntries as usize;
         let rows_offset = std::mem::offset_of!(MIB_UDP6TABLE_OWNER_PID, table);
-        if rows_offset + count * std::mem::size_of::<MIB_UDP6ROW_OWNER_PID>() > self.net_buf.len() {
+        let Some(rows_bytes) = count.checked_mul(std::mem::size_of::<MIB_UDP6ROW_OWNER_PID>()) else {
+            return;
+        };
+        if rows_offset.saturating_add(rows_bytes) > byte_len {
             return;
         }
         let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) };
@@ -393,38 +374,42 @@ impl ProcessCollector {
 }
 
 #[cfg(target_os = "windows")]
-fn query_tcp_v4_rows(buf: &mut Vec<u8>) -> Option<&[MIB_TCPROW_OWNER_PID]> {
+fn query_tcp_v4_rows(buf: &mut Vec<u64>) -> Option<&[MIB_TCPROW_OWNER_PID]> {
     if !query_ip_table(buf, |ptr, sz| unsafe {
         GetExtendedTcpTable(Some(ptr), sz, false, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0)
     }) {
         return None;
     }
-    if buf.len() < std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>() {
+    let byte_len = buf.len() * std::mem::size_of::<u64>();
+    if byte_len < std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>() {
         return None;
     }
     let table = unsafe { &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID) };
     let count = table.dwNumEntries as usize;
     let rows_offset = std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table);
-    if rows_offset + count * std::mem::size_of::<MIB_TCPROW_OWNER_PID>() > buf.len() {
+    let rows_bytes = count.checked_mul(std::mem::size_of::<MIB_TCPROW_OWNER_PID>())?;
+    if rows_offset.saturating_add(rows_bytes) > byte_len {
         return None;
     }
     Some(unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) })
 }
 
 #[cfg(target_os = "windows")]
-fn query_tcp_v6_rows(buf: &mut Vec<u8>) -> Option<&[MIB_TCP6ROW_OWNER_PID]> {
+fn query_tcp_v6_rows(buf: &mut Vec<u64>) -> Option<&[MIB_TCP6ROW_OWNER_PID]> {
     if !query_ip_table(buf, |ptr, sz| unsafe {
         GetExtendedTcpTable(Some(ptr), sz, false, AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0)
     }) {
         return None;
     }
-    if buf.len() < std::mem::size_of::<MIB_TCP6TABLE_OWNER_PID>() {
+    let byte_len = buf.len() * std::mem::size_of::<u64>();
+    if byte_len < std::mem::size_of::<MIB_TCP6TABLE_OWNER_PID>() {
         return None;
     }
     let table = unsafe { &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID) };
     let count = table.dwNumEntries as usize;
     let rows_offset = std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
-    if rows_offset + count * std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>() > buf.len() {
+    let rows_bytes = count.checked_mul(std::mem::size_of::<MIB_TCP6ROW_OWNER_PID>())?;
+    if rows_offset.saturating_add(rows_bytes) > byte_len {
         return None;
     }
     Some(unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) })
@@ -437,7 +422,7 @@ pub fn are_tcp_ports_listening(ports: &[u16]) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u64; 8192];
         if let Some(rows) = query_tcp_v4_rows(&mut buf) {
             if rows.iter().any(|r| {
                 r.dwState == MIB_TCP_STATE_LISTEN.0 as u32
@@ -458,39 +443,44 @@ pub fn are_tcp_ports_listening(ports: &[u16]) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        use std::net::{SocketAddr, TcpStream};
-        use std::time::Duration;
-        let timeout = Duration::from_millis(25);
-        for &port in ports {
-            let v4 = SocketAddr::from(([127, 0, 0, 1], port));
-            if TcpStream::connect_timeout(&v4, timeout).is_ok() {
-                return true;
-            }
-            let v6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
-            if TcpStream::connect_timeout(&v6, timeout).is_ok() {
-                return true;
-            }
+        let Ok(output) = std::process::Command::new("lsof")
+            .args(["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pPnT"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
         }
-        false
+        let map = parse_lsof_ports(&String::from_utf8_lossy(&output.stdout));
+        map.values()
+            .any(|info| info.ports.iter().any(|b| ports.contains(&b.port)))
     }
 }
 
 #[cfg(target_os = "windows")]
-fn query_ip_table<F>(buf: &mut Vec<u8>, mut call: F) -> bool
+fn query_ip_table<F>(buf: &mut Vec<u64>, mut call: F) -> bool
 where
     F: FnMut(*mut c_void, *mut u32) -> u32,
 {
     if buf.is_empty() {
-        buf.resize(64 * 1024, 0);
+        buf.resize(8192, 0);
     }
-    let mut size = buf.len() as u32;
-    let mut rc = call(buf.as_mut_ptr() as *mut c_void, &mut size);
-    if rc == ERROR_INSUFFICIENT_BUFFER.0 {
-        buf.resize((size as usize).max(buf.len()) + 8192, 0);
-        size = buf.len() as u32;
-        rc = call(buf.as_mut_ptr() as *mut c_void, &mut size);
+    for _ in 0..3 {
+        let mut size = (buf.len() * std::mem::size_of::<u64>()) as u32;
+        let rc = call(buf.as_mut_ptr() as *mut c_void, &mut size);
+        if rc == NO_ERROR.0 {
+            return true;
+        }
+        if rc != ERROR_INSUFFICIENT_BUFFER.0 {
+            return false;
+        }
+        let needed_bytes = (size as usize).max(buf.len() * 8) + 8192;
+        buf.resize(needed_bytes.div_ceil(std::mem::size_of::<u64>()), 0);
     }
-    rc == NO_ERROR.0
+    false
 }
 
 #[cfg(target_os = "windows")]
@@ -536,8 +526,6 @@ pub(crate) fn parse_lsof_ports(text: &str) -> HashMap<u32, PidNetworkInfo> {
         }
         let Some(p) = proto else { return };
         if matches!(p, TransportProto::Tcp) && estab {
-            by_pid.entry(pid).or_default().active_tcp_connections =
-                by_pid.entry(pid).or_default().active_tcp_connections.saturating_add(1);
             return;
         }
         let Some((scope, port)) = endpoint else { return };
@@ -678,7 +666,6 @@ TST=LISTEN
 ";
         let map = parse_lsof_ports(sample);
         let p1 = map.get(&4210).unwrap();
-        assert_eq!(p1.active_tcp_connections, 1);
         assert_eq!(p1.ports.len(), 1);
         assert_eq!(p1.ports[0].port, 3000);
         assert_eq!(p1.ports[0].scope, BindScope::Localhost);

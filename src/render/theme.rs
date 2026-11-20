@@ -25,13 +25,24 @@ pub const BG_TRACK: D2D1_COLOR_F = rgba(255, 255, 255, 0.11);
 /// Parses `#RRGGBB` hex color strings from `labels.toml`.
 pub fn parse_hex_color(hex: &str) -> Option<D2D1_COLOR_F> {
     let s = hex.trim().strip_prefix('#')?;
-    if s.len() != 6 {
+    if s.len() != 6 || !s.is_ascii() {
         return None;
     }
     let r = u8::from_str_radix(&s[0..2], 16).ok()?;
     let g = u8::from_str_radix(&s[2..4], 16).ok()?;
     let b = u8::from_str_radix(&s[4..6], 16).ok()?;
     Some(rgba(r, g, b, 1.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_color_rejects_multibyte_utf8_six_byte_input() {
+        assert!(parse_hex_color("#ğüş").is_none());
+        assert!(parse_hex_color("#12ABEF").is_some());
+    }
 }
 
 pub const BORDER_OUTER_DARK: D2D1_COLOR_F = rgba(0, 0, 0, 0.68);

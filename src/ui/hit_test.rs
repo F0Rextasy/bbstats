@@ -122,6 +122,37 @@ impl HitMap {
         });
     }
 
+    pub fn push_clipped(
+        &mut self,
+        id: u32,
+        mut rect: D2D_RECT_F,
+        min_y: f32,
+        max_y: f32,
+        action: HitAction,
+    ) {
+        rect.top = rect.top.max(min_y);
+        rect.bottom = rect.bottom.min(max_y);
+        if rect.bottom > rect.top {
+            self.push(id, rect, action);
+        }
+    }
+
+    pub fn push_with_rclick_clipped(
+        &mut self,
+        id: u32,
+        mut rect: D2D_RECT_F,
+        min_y: f32,
+        max_y: f32,
+        action: HitAction,
+        right_click_action: HitAction,
+    ) {
+        rect.top = rect.top.max(min_y);
+        rect.bottom = rect.bottom.min(max_y);
+        if rect.bottom > rect.top {
+            self.push_with_rclick(id, rect, action, right_click_action);
+        }
+    }
+
     /// Topmost matching region (last pushed wins for overlapping buttons inside rows).
     pub fn hit_test(&self, x: f32, y: f32) -> Option<&HitRegion> {
         self.regions.iter().rev().find(|r| {
