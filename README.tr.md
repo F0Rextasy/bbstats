@@ -32,11 +32,11 @@
   <table>
     <tr>
       <td align="center" width="50%">
-        <strong>Genişletilmiş Panel &amp; Canlı Eğriler</strong><br />
+        <strong>Genişletilmiş Panel, Git Branch Rozetleri &amp; Canlı Eğriler</strong><br />
         <img src="assets/screenshots/tr/03-expanded-panel.png" alt="Genişletilmiş panel" width="100%" />
       </td>
       <td align="center" width="50%">
-        <strong>İş Detayı, Log Akışı &amp; Alt Süreçler</strong><br />
+        <strong>İş Detayı, Log Akışı &amp; İşe Özgü Alt Süreçler</strong><br />
         <img src="assets/screenshots/tr/04-detail-terminal.png" alt="Detay terminal görünümü" width="100%" />
       </td>
     </tr>
@@ -46,7 +46,7 @@
         <img src="assets/screenshots/tr/05-crash-alert.png" alt="Çökme uyarısı ve kırmızı üst parıltı" width="100%" />
       </td>
       <td align="center" width="50%">
-        <strong>Ayarlar (TR / EN Dil Seçimi)</strong><br />
+        <strong>Ayarlar (v0.2.1, TR / EN Dil Seçimi)</strong><br />
         <img src="assets/screenshots/tr/06-settings.png" alt="Ayarlar ekranı" width="100%" />
       </td>
     </tr>
@@ -83,8 +83,8 @@
 
 | Platform | Durum | Arayüz ve Grafik Katmanı | Telemetri ve Başlangıç |
 |---|---|---|---|
-| **Windows 10 / 11 (`x86_64`)** | Destekleniyor (`v0.2.0`) | Direct3D11 + Direct2D + DirectWrite + WinRT Composition (`WS_EX_TOOLWINDOW`, Acrylic cam) | NT PEB okuma, IP Helper TCP/UDP portları, `Shell_NotifyIconW`, Registry Run |
-| **macOS (`arm64` / `x86_64`)** | Destekleniyor (`v0.2.0`) | Doğal ANSI Dynamic Island canlı terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`, `--dump-snapshot`) | `ps` / `sysctl` / `vm_stat` / `lsof` port ve CWD tarama, `kqueue` çökme izleyici, `SIGTERM`→`SIGKILL`, Docker Unix soketi, `~/Library/LaunchAgents` |
+| **Windows 10 / 11 (`x86_64`)** | Destekleniyor (`v0.2.1`) | Direct3D11 + Direct2D + DirectWrite + WinRT Composition (`WS_EX_TOOLWINDOW`, Acrylic cam) | NT PEB okuma, IP Helper TCP/UDP portları, `Shell_NotifyIconW`, Registry Run |
+| **macOS (`arm64` / `x86_64`)** | Destekleniyor (`v0.2.1`) | Doğal ANSI Dynamic Island canlı terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`, `--dump-snapshot`) | `ps` / `sysctl` / `vm_stat` / `lsof` port ve CWD tarama, `kqueue` çökme izleyici, `SIGTERM`→`SIGKILL`, Docker Unix soketi, `~/Library/LaunchAgents` |
 
 ---
 

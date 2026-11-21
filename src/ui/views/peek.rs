@@ -31,9 +31,9 @@ pub(super) fn render_hover_peek(
     let hdr = format!(
         "{} {} · {} {}",
         snap.total_jobs,
-        lang.pick("Jobs", "İş"),
+        lang.plural(snap.total_jobs as usize, "Job", "Jobs", "İş"),
         snap.total_projects,
-        lang.pick("Projects", "Proje")
+        lang.plural(snap.total_projects as usize, "Project", "Projects", "Proje")
     );
     ctx.draw_text(&hdr, &fonts.title, rect(30.0, 4.0, 220.0, 34.0), TEXT_PRIMARY, true)?;
 
@@ -107,7 +107,11 @@ pub(super) fn render_hover_peek(
             )?;
 
             ctx.draw_text(
-                &format!("{} {}", proj.jobs.len(), lang.pick("jobs", "iş")),
+                &format!(
+                    "{} {}",
+                    proj.jobs.len(),
+                    lang.plural(proj.jobs.len(), "job", "jobs", "iş")
+                ),
                 &fonts.row_secondary,
                 rect(190.0, y, 228.0, y + 32.0),
                 TEXT_MUTED,

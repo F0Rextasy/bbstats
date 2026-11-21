@@ -213,7 +213,12 @@ pub(super) fn render_detail(
         if matches!(&state.pending_kill, Some(PendingKill::Project(id)) if id == &proj.id) {
             Some((
                 match lang {
-                    Language::En => format!("Stop {} processes in {}?", proj.procs.len(), proj.name),
+                    Language::En => format!(
+                        "Stop {} {} in {}?",
+                        proj.procs.len(),
+                        lang.plural(proj.procs.len(), "process", "processes", "süreç"),
+                        proj.name
+                    ),
                     Language::Tr => {
                         format!("{} içindeki {} süreç durdurulsun mu?", proj.name, proj.procs.len())
                     }
@@ -229,7 +234,12 @@ pub(super) fn render_detail(
                     (
                         match lang {
                             Language::En => {
-                                format!("Stop {} processes in {}?", j.procs.len(), j.title)
+                                format!(
+                                    "Stop {} {} in {}?",
+                                    j.procs.len(),
+                                    lang.plural(j.procs.len(), "process", "processes", "süreç"),
+                                    j.title
+                                )
                             }
                             Language::Tr => {
                                 format!("{} içindeki {} süreç durdurulsun mu?", j.title, j.procs.len())

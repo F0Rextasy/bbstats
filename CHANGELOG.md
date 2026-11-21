@@ -5,6 +5,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ---
 
+## [0.2.1] - 2026-11-21
+
+UI polish, bilingual singular/plural grammar, alert banner clarity, and PNG screenshot compression patch release (**v0.2.1**).
+
+### Fixed & Changed
+
+#### English
+- **Singular / Plural Grammar (`Language::plural`):** Added `Language::plural` and applied it across Expanded gauges/footer/project headers, Hover Peek headers/rows, and Detail stop-confirmation dialogs so English counts like `1 job`, `1 project`, `1 proc`, and `1 process` format cleanly.
+- **Context-Aware Alert Banners:** Added `alert_banner_meta` in `expanded.rs` so `HighCpu`, `MemorySpike`, and non-restartable `Crash` alerts display tailored instructions instead of referencing a hidden `Restart` button, and widened collapsed/expanded alert text rects when no `Restart` button is drawn.
+- **Monochrome Direct2D Pencil Icon:** Replaced the yellow Unicode color emoji `✎` rename glyph on project-header and job-row hover controls with a crisp monochrome Direct2D vector icon (`DrawCtx::draw_pencil_icon`).
+- **Project Header & Git Branch Layout:** Fixed `hdr_name_right` (`176.0`) in `expanded.rs` so project job counts stay vertically aligned whether or not a Git branch badge is present, and widened the branch badge bounds (`clamp(38.0, 108.0)`) so `feat/embeddings` fits unclipped.
+- **Localized Demo Crash & Compressed Screenshots:** Localized the Turkish demo `crash_summary` in `--dump-shot`, pinned demo `APPDATA` to `C:\Users\Dev\AppData\Roaming`, and added optional `miniz_oxide` DEFLATE compression with PNG Sub filtering under the `screenshots` feature (`12` repo PNGs reduced from `~12.4 MiB` to `~0.56 MiB`), refreshing EN/TR README screenshots.
+
+#### Türkçe
+- **İngilizce Tekil / Çoğul Dilbilgisi (`Language::plural`):** Genişletilmiş panel sayaçları, Hover Önizleme ve Detay durdurma onay metinlerinde `1 job`, `1 project`, `1 proc`, `1 process` gibi tekil sayıların doğru yazılması sağlandı.
+- **Uyarı Türüne Özgü Banner Metni:** `HighCpu`, `MemorySpike` ve yeniden başlatılamayan çökme uyarılarında olmayan `Restart` düğmesine yönlendiren alt metin düzeltildi; buton olmadığında daraltılmış/genişletilmiş uyarı metin alanları genişletildi.
+- **Monokrom Direct2D Kalem İkonu:** Proje başlığı ve iş satırı hover butonlarındaki sarı renkli `✎` emojisi yerine diğer simgelerle uyumlu tek renkli Direct2D vektör kalem ikonu (`DrawCtx::draw_pencil_icon`) eklendi.
+- **Proje Başlığı Hizası ve Git Branch Rozeti:** Git branch rozeti olsun veya olmasın iş sayısı sütununun dikey hizası sabitlendi ve `feat/embeddings` gibi uzun branch adlarının kesilmemesi için rozet genişliği artırıldı.
+- **Türkçe Demo Çökme Özeti ve Sıkıştırılmış Ekran Görüntüleri:** Demo çekimlerinde `crash_summary` Türkçe yerelleştirildi, `APPDATA` demo yolu maskelendi ve opsiyonel `screenshots` özelliği altında PNG Sub filtresi + `miniz_oxide` DEFLATE sıkıştırması ile 12 ekran görüntüsü toplam `~12.4 MiB` yerine `~0.56 MiB` boyutuna indirildi.
+
+---
+
 ## [0.2.0] - 2026-11-21
 
 Safety, reliability, macOS parity, and UI polish release (**v0.2.0**).

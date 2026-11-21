@@ -201,6 +201,7 @@ fn windows_main() {
                             eng.send(model::EngineCmd::Shutdown);
                             ((*s).clone(), cfg)
                         } else {
+                            std::env::set_var("APPDATA", r"C:\Users\Dev\AppData\Roaming");
                             (render::shot::build_demo_snapshot(), AppConfig::default())
                         };
                         if let Some(lang) = lang_override {

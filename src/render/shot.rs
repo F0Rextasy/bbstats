@@ -559,7 +559,12 @@ pub fn dump_shots(
                     status: ProjectStatus::Crashed,
                     last_log: None,
                     crash_summary: Some(
-                        "Exit code 101 · panicked at src/main.rs:42".to_string(),
+                        cfg.language
+                            .pick(
+                                "Exit code 101 · panicked at src/main.rs:42",
+                                "Çıkış kodu 101 · panicked at src/main.rs:42",
+                            )
+                            .to_string(),
                     ),
                     root: None,
                     primary_key: crate::model::ProcessKey::new(4242, 1),
@@ -1059,28 +1064,19 @@ pub fn dump_shots(
 }
 
 fn write_png_rgba(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
-    let mut raw = Vec::with_capacity((height as usize) * (1 + width as usize * 4));
+    let row_bytes = width as usize * 4;
+    let mut raw = Vec::with_capacity((height as usize) * (1 + row_bytes));
     for y in 0..height as usize {
-        raw.push(0); // filter type 0 (None)
-        let row_start = y * width as usize * 4;
-        raw.extend_from_slice(&rgba[row_start..row_start + width as usize * 4]);
+        raw.push(1); // PNG Sub filter (bpp = 4) improves DEFLATE compression on UI gradients
+        let row_start = y * row_bytes;
+        let row = &rgba[row_start..row_start + row_bytes];
+        raw.extend_from_slice(&row[..4.min(row_bytes)]);
+        for i in 4..row_bytes {
+            raw.push(row[i].wrapping_sub(row[i - 4]));
+        }
     }
 
-    let mut zlib = Vec::with_capacity(raw.len() + 64);
-    zlib.extend_from_slice(&[0x78, 0x01]);
-    let mut pos = 0usize;
-    while pos < raw.len() {
-        let chunk = (raw.len() - pos).min(65535);
-        let is_last = pos + chunk >= raw.len();
-        zlib.push(if is_last { 1 } else { 0 });
-        let len = chunk as u16;
-        let nlen = !len;
-        zlib.extend_from_slice(&len.to_le_bytes());
-        zlib.extend_from_slice(&nlen.to_le_bytes());
-        zlib.extend_from_slice(&raw[pos..pos + chunk]);
-        pos += chunk;
-    }
-    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+    let zlib = miniz_oxide::deflate::compress_to_vec_zlib(&raw, 9);
 
     let mut png = Vec::with_capacity(zlib.len() + 128);
     png.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
@@ -1115,12 +1111,25 @@ fn push_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&(!crc).to_be_bytes());
 }
 
-fn adler32(data: &[u8]) -> u32 {
-    let mut a = 1u32;
-    let mut b = 0u32;
-    for &byte in data {
-        a = (a + byte as u32) % 65521;
-        b = (b + a) % 65521;
+#[cfg(test)]
+mod tests {
+    use super::write_png_rgba;
+
+    #[test]
+    fn write_png_rgba_produces_valid_compressed_png() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("bbstats_png_test_{}.png", std::process::id()));
+        let w = 64u32;
+        let h = 64u32;
+        let rgba = vec![42u8; (w * h * 4) as usize];
+        write_png_rgba(&path, w, h, &rgba).expect("write compressed png");
+        let bytes = std::fs::read(&path).expect("read png");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]));
+        assert!(bytes.windows(4).any(|w| w == b"IHDR"));
+        assert!(bytes.windows(4).any(|w| w == b"IDAT"));
+        assert!(bytes.windows(4).any(|w| w == b"IEND"));
+        assert!(bytes.len() < (w * h * 4) as usize);
     }
-    (b << 16) | a
 }

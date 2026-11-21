@@ -32,11 +32,11 @@
   <table>
     <tr>
       <td align="center" width="50%">
-        <strong>Expanded Panel &amp; Live Sparklines</strong><br />
+        <strong>Expanded Panel, Git Branches &amp; Live Sparklines</strong><br />
         <img src="assets/screenshots/en/03-expanded-panel.png" alt="Expanded panel" width="100%" />
       </td>
       <td align="center" width="50%">
-        <strong>Job Detail, Logs &amp; Subprocesses</strong><br />
+        <strong>Job Detail, Logs &amp; Job-Scoped Subprocesses</strong><br />
         <img src="assets/screenshots/en/04-detail-terminal.png" alt="Detail terminal view" width="100%" />
       </td>
     </tr>
@@ -46,7 +46,7 @@
         <img src="assets/screenshots/en/05-crash-alert.png" alt="Crash alert and red glow" width="100%" />
       </td>
       <td align="center" width="50%">
-        <strong>Settings (EN / TR Switcher)</strong><br />
+        <strong>Settings (v0.2.1, EN / TR Switcher)</strong><br />
         <img src="assets/screenshots/en/06-settings.png" alt="Settings view" width="100%" />
       </td>
     </tr>
@@ -83,8 +83,8 @@
 
 | Platform | Status | Interface & Rendering | Telemetry & Autostart |
 |---|---|---|---|
-| **Windows 10 / 11 (`x86_64`)** | Supported (`v0.2.0`) | Direct3D11 + Direct2D + DirectWrite + WinRT Composition (`WS_EX_TOOLWINDOW`, Acrylic backdrop) | NT PEB inspection, IP Helper TCP/UDP ports, Tray `Shell_NotifyIconW`, Registry Run |
-| **macOS (`arm64` / `x86_64`)** | Supported (`v0.2.0`) | Native ANSI Dynamic Island live terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`, `--dump-snapshot`) | `ps` / `sysctl` / `vm_stat` / `lsof` port & CWD telemetry, `kqueue` exit watcher, `SIGTERM`→`SIGKILL`, Docker Unix socket, `~/Library/LaunchAgents` |
+| **Windows 10 / 11 (`x86_64`)** | Supported (`v0.2.1`) | Direct3D11 + Direct2D + DirectWrite + WinRT Composition (`WS_EX_TOOLWINDOW`, Acrylic backdrop) | NT PEB inspection, IP Helper TCP/UDP ports, Tray `Shell_NotifyIconW`, Registry Run |
+| **macOS (`arm64` / `x86_64`)** | Supported (`v0.2.1`) | Native ANSI Dynamic Island live terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`, `--dump-snapshot`) | `ps` / `sysctl` / `vm_stat` / `lsof` port & CWD telemetry, `kqueue` exit watcher, `SIGTERM`→`SIGKILL`, Docker Unix socket, `~/Library/LaunchAgents` |
 
 ---
 

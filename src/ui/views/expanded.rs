@@ -211,7 +211,11 @@ pub(super) fn render_expanded(
         false,
     )?;
     ctx.draw_text(
-        &format!("{} {}", snap.total_procs, lang.pick("procs", "süreç")),
+        &format!(
+            "{} {}",
+            snap.total_procs,
+            lang.plural(snap.total_procs as usize, "proc", "procs", "süreç")
+        ),
         &fonts.caption_center,
         rect(cx2 - 56.0, 102.0, cx2 + 56.0, 120.0),
         TEXT_SECONDARY,
@@ -236,7 +240,11 @@ pub(super) fn render_expanded(
         false,
     )?;
     ctx.draw_text(
-        &format!("{} {}", snap.total_projects, lang.pick("projects", "proje")),
+        &format!(
+            "{} {}",
+            snap.total_projects,
+            lang.plural(snap.total_projects as usize, "project", "projects", "proje")
+        ),
         &fonts.caption_center,
         rect(cx3 - 56.0, 102.0, cx3 + 56.0, 120.0),
         TEXT_SECONDARY,
@@ -479,26 +487,25 @@ pub(super) fn render_expanded(
         ctx.fill_rounded(banner, 8.0, bg_a)?;
         ctx.stroke_rounded(banner, 8.0, fg_a, 1.0)?;
 
+        let (subtitle, can_restart) = alert_banner_meta(&alert.kind, lang);
+        let text_right = if can_restart { w - 126.0 } else { w - 52.0 };
         let title = format!("! {} — {}", alert.project_name, alert.message);
         ctx.draw_text(
             &title,
             &fonts.row_primary,
-            rect(22.0, list_top + 4.0, w - 126.0, list_top + 24.0),
+            rect(22.0, list_top + 4.0, text_right, list_top + 24.0),
             TEXT_PRIMARY,
             true,
         )?;
         ctx.draw_text(
-            lang.pick(
-                "Click Restart to relaunch or dismiss",
-                "Yeniden başlatmak için Restart'a tıklayın veya kapatın",
-            ),
+            subtitle,
             &fonts.row_secondary,
-            rect(22.0, list_top + 22.0, w - 126.0, list_top + 40.0),
+            rect(22.0, list_top + 22.0, text_right, list_top + 40.0),
             TEXT_SECONDARY,
             false,
         )?;
 
-        if matches!(alert.kind, AlertKind::Crash { can_restart: true, .. }) {
+        if can_restart {
             let r_btn = rect(w - 118.0, list_top + 8.0, w - 50.0, list_top + 36.0);
             ctx.fill_rounded(r_btn, 6.0, BG_OVERLAY)?;
             ctx.draw_text("↻ Restart", &fonts.mono_badge, r_btn, TEXT_PRIMARY, false)?;
@@ -548,9 +555,9 @@ pub(super) fn render_expanded(
     let status_left = format!(
         "{} {} · {} {} · {:.1}% CPU · {}",
         snap.total_jobs,
-        lang.pick("jobs", "iş"),
+        lang.plural(snap.total_jobs as usize, "job", "jobs", "iş"),
         snap.total_projects,
-        lang.pick("projects", "proje"),
+        lang.plural(snap.total_projects as usize, "project", "projects", "proje"),
         snap.total_dev_cpu,
         format_ram(snap.total_dev_ram_bytes)
     );
@@ -662,7 +669,7 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                             HitAction::TogglePinProject(proj.id.clone()),
                         );
 
-                        let hdr_name_right = if proj.git_branch.is_some() { 180.0 } else { 212.0 };
+                        let hdr_name_right = 176.0;
                         let hdr_name_rect = rect(32.0, y + 2.0, hdr_name_right, y + 27.0);
                         let hdr_id = next_id();
                         ctx.draw_text(
@@ -687,18 +694,18 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                         let jobs_x0 = hdr_name_right + 2.0;
                         let jobs_x1 = jobs_x0 + 44.0;
                         ctx.draw_text(
-                            &format!("{} {}", jobs.len(), lang.pick("jobs", "iş")),
+                            &format!("{} {}", jobs.len(), lang.plural(jobs.len(), "job", "jobs", "iş")),
                             &fonts.row_secondary,
                             rect(jobs_x0, y + 3.0, jobs_x1, y + 26.0),
                             TEXT_MUTED,
                             true,
                         )?;
                         if let Some(ref branch) = proj.git_branch {
-                            let bw = ((branch.chars().count().min(11) as f32) * 5.8 + 12.0)
-                                .clamp(36.0, 82.0);
-                            let b_left = jobs_x1 + 4.0;
+                            let bw = ((branch.chars().count().min(16) as f32) * 5.8 + 14.0)
+                                .clamp(38.0, 108.0);
+                            let b_left = 224.0;
                             let b_rect =
-                                rect(b_left, y + 5.5, (b_left + bw).min(312.0), y + 23.5);
+                                rect(b_left, y + 5.5, (b_left + bw).min(332.0), y + 23.5);
                             ctx.fill_rounded(b_rect, 4.0, BG_ELEVATED)?;
                             ctx.draw_text(
                                 branch,
@@ -733,7 +740,7 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                             if state.hovered_hit_id == Some(rn_id) {
                                 ctx.fill_rounded(rn_r, 4.0, BG_ELEVATED_HOVER)?;
                             }
-                            ctx.draw_text("✎", &fonts.mono_badge, rn_r, TEXT_MUTED, false)?;
+                            ctx.draw_pencil_icon(rn_r, TEXT_MUTED)?;
                         } else {
                             // Total project RAM & CPU% (crisp tabular sans-serif)
                             ctx.draw_text(
@@ -1154,7 +1161,7 @@ fn render_job_row<F: FnMut() -> u32>(
         hit_map.push_clipped(next_id(), cn_r, list_top, list_bot, HitAction::CancelKillConfirm);
     } else {
         if show_actions {
-            for (b_rect, b_id, lbl) in [(up_rect, up_id, "↑"), (dn_rect, dn_id, "↓"), (ed_rect, ed_id, "✎")] {
+            for (b_rect, b_id, lbl) in [(up_rect, up_id, "↑"), (dn_rect, dn_id, "↓")] {
                 ctx.fill_rounded(
                     b_rect,
                     5.0,
@@ -1166,6 +1173,16 @@ fn render_job_row<F: FnMut() -> u32>(
                 )?;
                 ctx.draw_text(lbl, &fonts.mono_badge, b_rect, TEXT_SECONDARY, false)?;
             }
+            ctx.fill_rounded(
+                ed_rect,
+                5.0,
+                if state.hovered_hit_id == Some(ed_id) {
+                    BG_ELEVATED_HOVER
+                } else {
+                    BG_WELL
+                },
+            )?;
+            ctx.draw_pencil_icon(ed_rect, TEXT_SECONDARY)?;
 
             ctx.fill_rounded(
                 r_rect,
@@ -1423,5 +1440,79 @@ fn render_all_procs_list<F: FnMut() -> u32>(
         Ok(())
     })?;
     Ok(())
+}
+
+fn alert_banner_meta(kind: &AlertKind, lang: Language) -> (&'static str, bool) {
+    match kind {
+        AlertKind::Crash { can_restart: true, .. } => (
+            lang.pick(
+                "Click Restart to relaunch or dismiss",
+                "Yeniden başlatmak için Restart'a tıklayın veya kapatın",
+            ),
+            true,
+        ),
+        AlertKind::Crash { can_restart: false, .. } => (
+            lang.pick(
+                "Inspect logs or dismiss alert",
+                "Logları inceleyin veya uyarıyı kapatın",
+            ),
+            false,
+        ),
+        AlertKind::HighCpu { .. } => (
+            lang.pick(
+                "Sustained high CPU — inspect job or dismiss",
+                "Yüksek CPU kullanımı — işi inceleyin veya kapatın",
+            ),
+            false,
+        ),
+        AlertKind::MemorySpike { .. } => (
+            lang.pick(
+                "Elevated memory usage — inspect job or dismiss",
+                "Yüksek bellek kullanımı — işi inceleyin veya kapatın",
+            ),
+            false,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::alert_banner_meta;
+    use crate::model::{AlertKind, Language};
+
+    #[test]
+    fn alert_banner_meta_matches_restart_capability_across_variants() {
+        let restartable = AlertKind::Crash {
+            pid: 1,
+            process_name: "api".into(),
+            exit_code: 1,
+            can_restart: true,
+        };
+        let non_restartable = AlertKind::Crash {
+            pid: 2,
+            process_name: "api".into(),
+            exit_code: 1,
+            can_restart: false,
+        };
+        let high_cpu = AlertKind::HighCpu {
+            cpu_percent: 95.0,
+            duration_secs: 60,
+        };
+        let mem_spike = AlertKind::MemorySpike {
+            ram_bytes: 2 * 1024 * 1024 * 1024,
+        };
+
+        let (sub_r, flag_r) = alert_banner_meta(&restartable, Language::En);
+        assert!(flag_r);
+        assert!(sub_r.contains("Restart"));
+
+        for kind in [&non_restartable, &high_cpu, &mem_spike] {
+            for lang in [Language::En, Language::Tr] {
+                let (sub, flag) = alert_banner_meta(kind, lang);
+                assert!(!flag);
+                assert!(!sub.contains("Restart"));
+            }
+        }
+    }
 }
 

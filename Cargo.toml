@@ -1,6 +1,6 @@
 [package]
 name = "bbstats"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 build = "build.rs"
 description = "Dynamic Island background process & developer project telemetry monitor"
@@ -12,12 +12,13 @@ categories = ["command-line-utilities", "development-tools", "os"]
 
 [features]
 default = []
-screenshots = []
+screenshots = ["dep:miniz_oxide"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+miniz_oxide = { version = "0.8", optional = true, default-features = false, features = ["with-alloc"] }
 
 [target.'cfg(not(windows))'.dependencies]
 libc = "0.2"

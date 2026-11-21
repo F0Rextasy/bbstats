@@ -1109,6 +1109,63 @@ impl<'a> DrawCtx<'a> {
         )?;
         Ok(())
     }
+
+    /// Draws a crisp monochrome tilted pencil icon centered within `r`.
+    pub fn draw_pencil_icon(
+        &self,
+        r: D2D_RECT_F,
+        color: D2D1_COLOR_F,
+    ) -> windows::core::Result<()> {
+        let cx = (r.left + r.right) * 0.5;
+        let cy = (r.top + r.bottom) * 0.5;
+        let brush = self.solid(color);
+        unsafe {
+            let geo = self.d2d_factory.CreatePathGeometry()?;
+            let sink = geo.Open()?;
+            sink.BeginFigure(
+                D2D_POINT_2F {
+                    x: cx - 4.0,
+                    y: cy + 4.0,
+                },
+                windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_HOLLOW,
+            );
+            sink.AddLine(D2D_POINT_2F {
+                x: cx - 3.4,
+                y: cy + 1.3,
+            });
+            sink.AddLine(D2D_POINT_2F {
+                x: cx + 1.5,
+                y: cy - 3.6,
+            });
+            sink.AddLine(D2D_POINT_2F {
+                x: cx + 3.6,
+                y: cy - 1.5,
+            });
+            sink.AddLine(D2D_POINT_2F {
+                x: cx - 1.3,
+                y: cy + 3.4,
+            });
+            sink.EndFigure(
+                windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_CLOSED,
+            );
+            sink.Close()?;
+            self.dc.DrawGeometry(&geo, brush, 1.25, None);
+            self.dc.DrawLine(
+                D2D_POINT_2F {
+                    x: cx + 0.4,
+                    y: cy - 2.5,
+                },
+                D2D_POINT_2F {
+                    x: cx + 2.5,
+                    y: cy - 0.4,
+                },
+                brush,
+                1.0,
+                None,
+            );
+        }
+        Ok(())
+    }
 }
 
 #[inline]

@@ -88,6 +88,26 @@ impl Language {
             Self::Tr => tr,
         }
     }
+
+    #[inline]
+    pub const fn plural<'a>(
+        self,
+        count: usize,
+        en_one: &'a str,
+        en_many: &'a str,
+        tr: &'a str,
+    ) -> &'a str {
+        match self {
+            Self::En => {
+                if count == 1 {
+                    en_one
+                } else {
+                    en_many
+                }
+            }
+            Self::Tr => tr,
+        }
+    }
 }
 
 /// Sort order for projects and jobs in the main panel.
@@ -419,4 +439,19 @@ pub fn fold_search_lower(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Language;
+
+    #[test]
+    fn language_plural_handles_zero_one_and_many() {
+        assert_eq!(Language::En.plural(0, "job", "jobs", "iş"), "jobs");
+        assert_eq!(Language::En.plural(1, "job", "jobs", "iş"), "job");
+        assert_eq!(Language::En.plural(2, "job", "jobs", "iş"), "jobs");
+        assert_eq!(Language::Tr.plural(0, "job", "jobs", "iş"), "iş");
+        assert_eq!(Language::Tr.plural(1, "job", "jobs", "iş"), "iş");
+        assert_eq!(Language::Tr.plural(2, "job", "jobs", "iş"), "iş");
+    }
 }

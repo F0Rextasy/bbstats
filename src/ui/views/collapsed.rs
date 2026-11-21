@@ -64,16 +64,16 @@ pub(super) fn render_collapsed(
             BG_OVERLAY,
             false,
         )?;
+        let can_restart = matches!(alert.kind, AlertKind::Crash { can_restart: true, .. });
         let msg = format!("{} · {}", alert.project_name, alert.message);
         ctx.draw_text(
             &msg,
             &fonts.pill_label,
-            rect(28.0, 0.0, w - 72.0, h),
+            rect(28.0, 0.0, if can_restart { w - 72.0 } else { w - 34.0 }, h),
             TEXT_PRIMARY,
             true,
         )?;
 
-        let can_restart = matches!(alert.kind, AlertKind::Crash { can_restart: true, .. });
         if can_restart {
             let r_btn = rect(w - 66.0, 5.0, w - 34.0, h - 5.0);
             ctx.fill_rounded(r_btn, 6.0, ACCENT_DANGER_BG)?;
