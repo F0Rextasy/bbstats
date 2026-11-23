@@ -5,7 +5,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ---
 
-## [Unreleased]
+## [0.3.0] - 2026-11-23
 
 ### Security, Correctness & Architecture
 - **100% Local Privacy & Secret Redaction:** Context-aware `-p` redaction preserves port flags (`next dev -p 3001`, `docker run -p 8080:80`, `psql -p 5432`) while redacting secret flags (`--token`, `--api-key`, `--header`, `-u`/`-a`, URL query tokens, and `mysql -p`); non-shell Unix job spawning avoids `/bin/sh -c` injection.
