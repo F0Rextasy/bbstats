@@ -2,13 +2,14 @@
 name = "bbstats"
 version = "0.2.1"
 edition = "2021"
+rust-version = "1.88"
 build = "build.rs"
 description = "Dynamic Island background process & developer project telemetry monitor"
 license = "MIT"
 repository = "https://github.com/F0Rextasy/bbstats"
 readme = "README.md"
-keywords = ["process-monitor", "telemetry", "dynamic-island", "developer-tools"]
-categories = ["command-line-utilities", "development-tools", "os"]
+keywords = ["process-monitor", "dynamic-island", "developer-tools", "dev-dashboard"]
+categories = ["gui", "command-line-utilities", "development-tools"]
 
 [features]
 default = []

@@ -70,10 +70,23 @@ pub enum InferenceSource {
     FallbackExeName,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RestartRecipe {
     pub raw_cmdline: String,
     pub working_dir: PathBuf,
+    pub env_vars: Vec<(String, String)>,
+    pub use_shell: bool,
+}
+
+impl std::fmt::Debug for RestartRecipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestartRecipe")
+            .field("raw_cmdline", &"<redacted>")
+            .field("working_dir", &self.working_dir)
+            .field("env_vars_count", &self.env_vars.len())
+            .field("use_shell", &self.use_shell)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -301,9 +314,20 @@ impl ProjectResolver {
                 .map(|b| (b.pid, b))
                 .collect();
             if next_bindings != self.state_bindings {
-                for pid in next_bindings.keys() {
-                    self.meta_cache.retain(|k, _| k.pid != *pid);
-                    self.ignored_keys.retain(|k| k.pid != *pid);
+                let mut changed_pids: HashSet<u32> = HashSet::new();
+                for (pid, next_b) in &next_bindings {
+                    if self.state_bindings.get(pid) != Some(next_b) {
+                        changed_pids.insert(*pid);
+                    }
+                }
+                for pid in self.state_bindings.keys() {
+                    if !next_bindings.contains_key(pid) {
+                        changed_pids.insert(*pid);
+                    }
+                }
+                if !changed_pids.is_empty() {
+                    self.meta_cache.retain(|k, _| !changed_pids.contains(&k.pid));
+                    self.ignored_keys.retain(|k| !changed_pids.contains(&k.pid));
                 }
                 self.state_bindings = next_bindings;
             }
@@ -341,7 +365,12 @@ impl ProjectResolver {
                 .last_wsl_poll
                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(15));
             if should_poll {
-                self.wsl_distros_cache = list_wsl_distros_from_registry();
+                let next_distros = list_wsl_distros_from_registry();
+                if next_distros != self.wsl_distros_cache {
+                    self.wsl_distros_cache = next_distros;
+                    self.meta_cache
+                        .retain(|_, m| m.inference_source != InferenceSource::WslVm);
+                }
                 self.last_wsl_poll = Some(Instant::now());
             }
         }
@@ -361,7 +390,7 @@ impl ProjectResolver {
             }
             if active_by_pid
                 .get(&k.pid)
-                .is_some_and(|p| p.image_name.eq_ignore_ascii_case("cmd.exe"))
+                .is_some_and(|p| is_shell_wrapper_exe(&p.image_name))
                 && children_by_pid.get(&k.pid).is_some_and(|kids| {
                     kids.iter().any(|c| {
                         !c.image_name.eq_ignore_ascii_case("conhost.exe")
@@ -425,7 +454,7 @@ impl ProjectResolver {
             let Some(cur_meta) = self.meta_cache.get(key).cloned() else {
                 continue;
             };
-            if cur_meta.image_name.eq_ignore_ascii_case("cmd.exe") {
+            if is_shell_wrapper_exe(&cur_meta.image_name) {
                 let Some(children) = children_by_pid.get(&key.pid) else {
                     continue;
                 };
@@ -451,7 +480,7 @@ impl ProjectResolver {
                             updated_wrapper.is_wrapper_or_helper = true;
                             self.meta_cache.insert(*key, Arc::new(updated_wrapper));
 
-                            // Propagate `>> logfile` from `cmd /c ... >> logfile` to child if child had none.
+                            // Propagate `>> logfile` from `cmd /c ... >> logfile` or `sh -c ... >> logfile` to child.
                             if child_meta.log_path.is_none() && cur_meta.log_path.is_some() {
                                 let mut updated_child = (*child_meta).clone();
                                 updated_child.log_path = cur_meta.log_path.clone();
@@ -464,7 +493,7 @@ impl ProjectResolver {
             } else if cur_meta.log_path.is_none() && !cur_meta.is_ignored_noise {
                 if let Some(parent_proc) = active_by_pid.get(&cur_proc.parent_pid) {
                     if parent_proc.key.create_time_100ns <= cur_proc.key.create_time_100ns
-                        && parent_proc.image_name.eq_ignore_ascii_case("cmd.exe")
+                        && is_shell_wrapper_exe(&parent_proc.image_name)
                     {
                         if let Some(parent_meta) = self.meta_cache.get(&parent_proc.key).cloned() {
                             if parent_meta.log_path.is_some() {
@@ -564,17 +593,20 @@ impl ProjectResolver {
             || (proc.session_id == 0 && is_hard_blacklisted_name(&lower_name))
             || is_hard_blacklisted_name(&lower_name);
 
-        // State-file PID binding takes precedence even when PEB/WMI cmdline is completely unreadable.
-        if let Some(binding) = self.state_bindings.get(&proc.key.pid).cloned() {
-            let owned_peb;
-            let peb = match prefetched_peb {
-                Some(p) => p,
-                None => {
-                    owned_peb = inspect_process_peb(proc.key.pid);
-                    &owned_peb
-                }
-            };
-            return self.resolve_from_state_binding(proc, &binding, peb, is_critical);
+        // State-file PID binding takes precedence even when PEB/WMI cmdline is completely unreadable,
+        // but never overrides critical OS processes or bbstats itself.
+        if !is_critical {
+            if let Some(binding) = self.state_bindings.get(&proc.key.pid).cloned() {
+                let owned_peb;
+                let peb = match prefetched_peb {
+                    Some(p) => p,
+                    None => {
+                        owned_peb = inspect_process_peb(proc.key.pid);
+                        &owned_peb
+                    }
+                };
+                return self.resolve_from_state_binding(proc, &binding, peb, is_critical);
+            }
         }
 
         // Self & immediate OS/driver/browser/IDE noise fast-skip (zero PEB read!),
@@ -594,7 +626,12 @@ impl ProjectResolver {
                 sanitized_cmdline: None,
                 access_limited: false,
                 project_id: ProjectId("system:ignored".to_string()),
-                project_display_name: "Windows System".to_string(),
+                project_display_name: if cfg!(target_os = "windows") {
+                    "Windows System"
+                } else {
+                    "System"
+                }
+                .to_string(),
                 project_root: None,
                 git_branch: None,
                 job_id: JobId(format!("sys:{}", proc.key.pid)),
@@ -636,7 +673,7 @@ impl ProjectResolver {
                 git_branch: None,
                 job_id: JobId("wsl:vmmem".to_string()),
                 job_title: distros.clone(),
-                job_subtitle: "Virtual Machine".to_string(),
+                job_subtitle: self.language.pick("Virtual Machine", "Sanal Makine").to_string(),
                 job_icon: None,
                 job_color: None,
                 match_hint: "vmmemWSL".to_string(),
@@ -674,13 +711,16 @@ impl ProjectResolver {
         peb: &crate::engine::win_nt::PebInspection,
         is_critical: bool,
     ) -> ProcessMetadata {
-        let project_name = binding
+        let explicit_project = binding
             .rule
             .project
-            .clone()
-            .filter(|s| !s.trim().is_empty())
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let project_name = explicit_project
+            .map(str::to_string)
             .unwrap_or_else(|| dir_name_or(&binding.state_dir, "Automation"));
-        let project_id = if binding.state_dir.as_os_str().is_empty() {
+        let project_id = if explicit_project.is_some() || binding.state_dir.as_os_str().is_empty() {
             ProjectId(format!("rule:{}", project_name.to_ascii_lowercase()))
         } else {
             ProjectId(normalize_project_id(&binding.state_dir))
@@ -692,7 +732,8 @@ impl ProjectResolver {
             .as_deref()
             .map(|nr| format!(" · {} {nr}", self.language.pick("next", "sonraki")))
             .unwrap_or_default();
-        let job_subtitle = format!("{project_name} › ...\\{folder_short}{next_hint}");
+        let sep = std::path::MAIN_SEPARATOR;
+        let job_subtitle = format!("{project_name} › ...{sep}{folder_short}{next_hint}");
         let job_id = JobId(format!(
             "{}::state:{}",
             project_id.0,
@@ -706,7 +747,9 @@ impl ProjectResolver {
                 .find(|p| p.is_file())
         });
 
-        let restart_recipe = if let Some(ref cmd) = binding.rule.command {
+        let restart_recipe = if is_critical {
+            None
+        } else if let Some(ref cmd) = binding.rule.command {
             let cwd = binding
                 .rule
                 .working_dir
@@ -714,15 +757,24 @@ impl ProjectResolver {
                 .map(|w| PathBuf::from(crate::engine::labels::expand_win_env_vars(w)))
                 .or_else(|| peb.working_dir.clone())
                 .unwrap_or_else(|| binding.state_dir.clone());
+            let mut env_vars = peb.dev_env.clone();
+            if let Some(ref ef) = binding.rule.env_file {
+                let ef_path = PathBuf::from(expand_win_env_vars(ef));
+                env_vars.extend(crate::engine::labels::load_env_file_vars(&ef_path));
+            }
             Some(RestartRecipe {
                 raw_cmdline: cmd.clone(),
                 working_dir: cwd,
+                env_vars,
+                use_shell: true,
             })
         } else {
             match (peb.cmdline.as_ref(), peb.working_dir.as_ref()) {
                 (Some(cmd), Some(cwd)) if !is_critical => Some(RestartRecipe {
                     raw_cmdline: cmd.clone(),
                     working_dir: cwd.clone(),
+                    env_vars: peb.dev_env.clone(),
+                    use_shell: false,
                 }),
                 _ => None,
             }
@@ -784,8 +836,10 @@ impl ProjectResolver {
             || (proc.session_id == 0 && is_hard_blacklisted_name(&lower_name))
             || is_hard_blacklisted_name(&lower_name);
 
-        if let Some(binding) = self.state_bindings.get(&proc.key.pid).cloned() {
-            return self.resolve_from_state_binding(proc, &binding, peb, is_critical);
+        if !is_critical {
+            if let Some(binding) = self.state_bindings.get(&proc.key.pid).cloned() {
+                return self.resolve_from_state_binding(proc, &binding, peb, is_critical);
+            }
         }
 
         let access_limited = !peb.peb_readable && proc.key.pid > 4;
@@ -805,11 +859,7 @@ impl ProjectResolver {
             peb.working_dir.as_deref(),
         );
         let is_interactive_shell = is_interactive_shell_process(&lower_name, peb.cmdline.as_deref());
-        let is_cmd_wrapper = lower_name == "cmd.exe"
-            && peb
-                .cmdline
-                .as_deref()
-                .is_some_and(|c| c.to_ascii_lowercase().contains("/c"));
+        let is_cmd_wrapper = is_shell_wrapper_cmdline(&lower_name, peb.cmdline.as_deref());
 
         let parsed = analyze_command_and_paths(
             &lower_name,
@@ -971,9 +1021,7 @@ impl ProjectResolver {
         if let Some(rule) = rule_match.as_ref() {
             if let Some(p_override) = rule.project.as_ref().filter(|s| !s.trim().is_empty()) {
                 project_name = p_override.trim().to_string();
-                if project_root.is_none() {
-                    project_id = ProjectId(format!("rule:{}", project_name.to_ascii_lowercase()));
-                }
+                project_id = ProjectId(format!("rule:{}", project_name.to_ascii_lowercase()));
             }
             if !rule.job.trim().is_empty() {
                 job_title = rule.job.trim().to_string();
@@ -1116,15 +1164,24 @@ impl ProjectResolver {
                 .or_else(|| peb.working_dir.clone())
                 .or_else(|| project_root.clone())
                 .unwrap_or_else(|| PathBuf::from("."));
+            let mut env_vars = peb.dev_env.clone();
+            if let Some(ef) = rule_match.as_ref().and_then(|r| r.env_file.as_deref()) {
+                let ef_path = PathBuf::from(expand_win_env_vars(ef));
+                env_vars.extend(crate::engine::labels::load_env_file_vars(&ef_path));
+            }
             Some(RestartRecipe {
                 raw_cmdline: cmd.clone(),
                 working_dir: cwd,
+                env_vars,
+                use_shell: true,
             })
         } else {
             match (peb.cmdline.as_ref(), peb.working_dir.as_ref()) {
                 (Some(cmd), Some(cwd)) if !is_critical && !is_wrapper_or_helper => Some(RestartRecipe {
                     raw_cmdline: cmd.clone(),
                     working_dir: cwd.clone(),
+                    env_vars: peb.dev_env.clone(),
+                    use_shell: false,
                 }),
                 _ => None,
             }
@@ -1258,6 +1315,34 @@ impl ProjectResolver {
     }
 }
 
+
+fn is_shell_wrapper_exe(name: &str) -> bool {
+    let low = name.to_ascii_lowercase();
+    let base = low.strip_suffix(".exe").unwrap_or(&low);
+    matches!(base, "cmd" | "sh" | "bash" | "zsh" | "dash")
+}
+
+fn is_shell_wrapper_cmdline(lower_name: &str, cmdline: Option<&str>) -> bool {
+    let base = lower_name.strip_suffix(".exe").unwrap_or(lower_name);
+    let args = split_cmdline_args(cmdline.unwrap_or(""));
+    let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
+    if base == "cmd" {
+        rest.iter().any(|a| {
+            let low = a.to_ascii_lowercase();
+            low == "/c" || low.starts_with("/c")
+        })
+    } else if matches!(base, "sh" | "bash" | "zsh" | "dash") {
+        rest.iter().any(|a| {
+            a == "-c"
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a.len() >= 2
+                    && a.ends_with('c'))
+        })
+    } else {
+        false
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1558,7 +1643,7 @@ mod tests {
 
     #[test]
     fn sanitize_cmdline_masks_secrets_and_urls() {
-        let raw = r#"node server.js --token=abc12345 --api-key "sk-secret-99" -p mypass https://admin:s3cr3t@db.local:5432/app --port 3000"#;
+        let raw = r#"node server.js --token=abc12345 --api-key "sk-secret-99" --password mypass https://admin:s3cr3t@db.local:5432/app -p 3000"#;
         let clean = sanitize_cmdline(raw);
         assert!(!clean.contains("abc12345"));
         assert!(!clean.contains("sk-secret-99"));
@@ -1566,8 +1651,17 @@ mod tests {
         assert!(!clean.contains("s3cr3t"));
         assert!(clean.contains("--token=***"));
         assert!(clean.contains("--api-key ***"));
+        assert!(clean.contains("--password ***"));
         assert!(clean.contains("https://admin:***@db.local:5432/app"));
-        assert!(clean.contains("--port 3000"));
+        assert!(clean.contains("-p 3000"));
+    }
+
+    #[test]
+    fn shell_wrapper_cmdline_rejects_path_substring_and_matches_unix_shells() {
+        assert!(!is_shell_wrapper_cmdline("cmd.exe", Some("cmd.exe /k cd C:/code")));
+        assert!(is_shell_wrapper_cmdline("cmd.exe", Some("cmd.exe /c node app.js")));
+        assert!(is_shell_wrapper_cmdline("bash", Some("bash -lc 'node app.js'")));
+        assert!(!is_shell_wrapper_cmdline("bash", Some("bash -l")));
     }
 
     #[test]

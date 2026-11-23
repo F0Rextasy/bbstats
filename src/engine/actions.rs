@@ -58,13 +58,21 @@ const CRITICAL_PROCESS_BLACKLIST: &[&str] = &[
     "vmmemwsl",
     "vmmem",
     "vmmem.exe",
-    // macOS / Unix
+    // macOS / Unix / Linux
     "launchd",
     "kernel_task",
     "windowserver",
     "loginwindow",
     "sysmond",
     "usereventagent",
+    "systemd",
+    "init",
+    "sshd",
+    "dbus-daemon",
+    "systemd-journald",
+    "systemd-udevd",
+    "xorg",
+    "wayland",
     "bbstats",
     "bbstats.exe",
 ];
@@ -117,7 +125,7 @@ pub fn compute_self_ancestors(procs: &[CollectedProcess], self_pid: u32) -> Hash
     let by_pid: HashMap<u32, &CollectedProcess> = procs.iter().map(|p| (p.key.pid, p)).collect();
     let mut ancestors = HashSet::new();
     let mut cur_pid = self_pid;
-    for _ in 0..8 {
+    for _ in 0..64 {
         let Some(p) = by_pid.get(&cur_pid) else {
             break;
         };
@@ -231,20 +239,30 @@ pub fn execute_safe_kill_many(
 
     let by_key: HashMap<ProcessKey, &CollectedProcess> = procs.iter().map(|p| (p.key, p)).collect();
     let now = Instant::now();
-    for key in &targets {
-        user_kills.insert(*key, now);
-    }
+    let mut actually_killed: Vec<ProcessKey> = Vec::new();
 
     #[cfg(target_os = "windows")]
     {
         // First ask any GUI top-level windows to close cleanly (only after verifying ProcessKey).
-        let mut sent_wm_close = false;
+        let mut closed_requested: Vec<ProcessKey> = Vec::new();
         for key in &targets {
+            let Some(proc_info) = by_key.get(key) else {
+                continue;
+            };
+            if !is_kill_allowed(
+                key.pid,
+                proc_info.session_id,
+                &proc_info.image_name,
+                self_pid,
+                &ancestors,
+            ) {
+                continue;
+            }
             if open_process_for_wait(*key).is_some() && send_wm_close_to_pid(key.pid) {
-                sent_wm_close = true;
+                closed_requested.push(*key);
             }
         }
-        if sent_wm_close {
+        if !closed_requested.is_empty() {
             std::thread::sleep(Duration::from_millis(250));
         }
 
@@ -265,10 +283,16 @@ pub fn execute_safe_kill_many(
             if let Some(h) = open_process_for_terminate(*key) {
                 // If process already exited cleanly from WM_CLOSE, skip TerminateProcess.
                 if is_process_alive_handle(h.raw()) {
-                    unsafe {
-                        let _ = TerminateProcess(h.raw(), 1);
+                    // SAFETY: `h` is a valid PROCESS_TERMINATE handle verified against `key.create_time_100ns`.
+                    let ok = unsafe { TerminateProcess(h.raw(), 1) }.is_ok();
+                    if ok {
+                        actually_killed.push(*key);
                     }
+                } else if closed_requested.contains(key) {
+                    actually_killed.push(*key);
                 }
+            } else if closed_requested.contains(key) && open_process_for_wait(*key).is_none() {
+                actually_killed.push(*key);
             }
         }
     }
@@ -276,7 +300,7 @@ pub fn execute_safe_kill_many(
     #[cfg(not(target_os = "windows"))]
     {
         // Send graceful SIGTERM first across verified targets.
-        let mut sent_term = false;
+        let mut sent_term: Vec<ProcessKey> = Vec::new();
         for key in &targets {
             if let Some(proc_info) = by_key.get(key) {
                 if is_kill_allowed(
@@ -286,36 +310,47 @@ pub fn execute_safe_kill_many(
                     self_pid,
                     &ancestors,
                 ) && verify_unix_process_key(*key)
+                    // SAFETY: Sends a process signal after checking PID/identity and blacklist guards.
                     && unsafe { libc::kill(key.pid as libc::pid_t, libc::SIGTERM) } == 0
                 {
-                    sent_term = true;
+                    sent_term.push(*key);
                 }
             }
         }
-        if sent_term {
+        if !sent_term.is_empty() {
             std::thread::sleep(Duration::from_millis(250));
         }
         // Follow up with SIGKILL only after re-verifying process identity against PID reuse.
         for key in &targets {
             if let Some(proc_info) = by_key.get(key) {
-                if is_kill_allowed(
+                if !is_kill_allowed(
                     key.pid,
                     proc_info.session_id,
                     &proc_info.image_name,
                     self_pid,
                     &ancestors,
-                ) && verify_unix_process_key(*key)
+                ) {
+                    continue;
+                }
+                if verify_unix_process_key(*key)
+                    // SAFETY: Sends a process signal after checking PID/identity and blacklist guards.
                     && unsafe { libc::kill(key.pid as libc::pid_t, 0) } == 0
                 {
-                    unsafe {
-                        let _ = libc::kill(key.pid as libc::pid_t, libc::SIGKILL);
+                    // SAFETY: Sends a process signal after checking PID/identity and blacklist guards.
+                    if unsafe { libc::kill(key.pid as libc::pid_t, libc::SIGKILL) } == 0 {
+                        actually_killed.push(*key);
                     }
+                } else if sent_term.contains(key) {
+                    actually_killed.push(*key);
                 }
             }
         }
     }
 
-    targets
+    for key in &actually_killed {
+        user_kills.insert(*key, now);
+    }
+    actually_killed
 }
 
 #[cfg(target_os = "windows")]
@@ -325,6 +360,7 @@ fn send_wm_close_to_pid(target_pid: u32) -> bool {
         sent: bool,
     }
 
+    // SAFETY: Process/window Win32 handles and callbacks remain valid within scope.
     unsafe extern "system" fn enum_proc(
         hwnd: windows::Win32::Foundation::HWND,
         lparam: LPARAM,
@@ -345,6 +381,7 @@ fn send_wm_close_to_pid(target_pid: u32) -> bool {
         pid: target_pid,
         sent: false,
     };
+    // SAFETY: Process/window Win32 handles and callbacks remain valid within scope.
     unsafe {
         let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut EnumCtx as isize));
     }
@@ -418,6 +455,7 @@ mod watcher_imp {
             let ctx_ptr = Box::into_raw(ctx_box);
 
             let mut wait_handle = HANDLE::default();
+            // SAFETY: Process/window Win32 handles and callbacks remain valid within scope.
             let res = unsafe {
                 RegisterWaitForSingleObject(
                     &mut wait_handle,
@@ -430,6 +468,7 @@ mod watcher_imp {
             };
 
             if res.is_err() || wait_handle.is_invalid() {
+                // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
                 unsafe {
                     drop(Box::from_raw(ctx_ptr));
                 }
@@ -453,13 +492,14 @@ mod watcher_imp {
             if is_process_alive_handle(entry._proc_handle.raw()) {
                 None
             } else {
-                Some(get_exit_code(entry._proc_handle.raw()).unwrap_or(1))
+                Some(get_exit_code(entry._proc_handle.raw()).unwrap_or(0))
             }
         }
 
         /// Unregisters and frees a watched entry once its exit event has been processed or the process is ignored.
         pub fn unwatch(&mut self, key: &ProcessKey) {
             if let Some(entry) = self.entries.remove(key) {
+                // SAFETY: Box-allocated WaitContext remains valid until UnregisterWaitEx completes or leaks intentionally on timeout.
                 unsafe {
                     let _ = UnregisterWaitEx(entry.wait_handle, INVALID_HANDLE_VALUE);
                     drop(Box::from_raw(entry.ctx_ptr));
@@ -477,6 +517,7 @@ mod watcher_imp {
         }
     }
 
+    // SAFETY: Called by Win32 with matching system ABI; pointer arguments are checked before dereference.
     unsafe extern "system" fn wait_callback(parameter: *mut c_void, timer_or_wait_fired: BOOLEAN) {
         if parameter.is_null() || timer_or_wait_fired.as_bool() {
             return;
@@ -517,6 +558,7 @@ mod watcher_imp {
 
     impl ExitWatcher {
         pub fn new(on_exit: ExitCallback) -> Self {
+            // SAFETY: Valid kqueue file descriptor and stack-allocated kevent buffers.
             let kq = unsafe { libc::kqueue() };
             let watched = Arc::new(Mutex::new(HashMap::with_capacity(64)));
             let stop = Arc::new(AtomicBool::new(false));
@@ -527,12 +569,14 @@ mod watcher_imp {
                 std::thread::Builder::new()
                     .name("bbstats-kqueue".to_string())
                     .spawn(move || {
+                        // SAFETY: Valid kqueue file descriptor and stack-allocated kevent buffers.
                         let mut events: [libc::kevent; 16] = unsafe { std::mem::zeroed() };
                         let timeout = libc::timespec {
                             tv_sec: 0,
                             tv_nsec: 200_000_000,
                         };
                         while !s_bg.load(Ordering::Acquire) {
+                            // SAFETY: Valid kqueue file descriptor and stack-allocated kevent buffers.
                             let n = unsafe {
                                 libc::kevent(
                                     kq,
@@ -570,7 +614,7 @@ mod watcher_imp {
         }
 
         pub fn ensure_watched(&mut self, key: ProcessKey) {
-            if self.kq < 0 || key.pid <= 1 {
+            if self.kq < 0 || key.pid <= 1 || !crate::engine::win_nt::verify_unix_process_key(key) {
                 return;
             }
             if let Ok(mut map) = self.watched.lock() {
@@ -589,6 +633,7 @@ mod watcher_imp {
                 data: 0,
                 udata: std::ptr::null_mut(),
             };
+            // SAFETY: Valid kqueue file descriptor and stack-allocated kevent buffers.
             let rc = unsafe { libc::kevent(self.kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
             if rc < 0 {
                 if let Ok(mut map) = self.watched.lock() {
@@ -618,6 +663,7 @@ mod watcher_imp {
                     data: 0,
                     udata: std::ptr::null_mut(),
                 };
+                // SAFETY: Valid kqueue file descriptor and stack-allocated kevent buffers.
                 unsafe {
                     let _ = libc::kevent(self.kq, &kev, 1, std::ptr::null_mut(), 0, std::ptr::null());
                 }
@@ -632,6 +678,7 @@ mod watcher_imp {
                 let _ = j.join();
             }
             if self.kq >= 0 {
+                // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
                 unsafe {
                     libc::close(self.kq);
                 }

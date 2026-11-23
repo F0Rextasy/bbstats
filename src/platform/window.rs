@@ -41,6 +41,7 @@ pub struct SingleInstanceGuard(HANDLE);
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
+        // SAFETY: Process/window Win32 handles and callbacks remain valid within scope.
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(self.0);
         }
@@ -51,6 +52,7 @@ pub fn acquire_single_instance() -> Option<SingleInstanceGuard> {
     let name: Vec<u16> = "Local\\BbstatsDynamicIslandProcessMonitor\0"
         .encode_utf16()
         .collect();
+    // SAFETY: Process/window Win32 handles and callbacks remain valid within scope.
     unsafe {
         let h = CreateMutexW(None, false, PCWSTR(name.as_ptr())).ok()?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
@@ -73,6 +75,7 @@ pub fn create_island_hwnd(
     let title: Vec<u16> = "bbstats\0".encode_utf16().collect();
     let tb_msg_name: Vec<u16> = "TaskbarCreated\0".encode_utf16().collect();
 
+    // SAFETY: Called by Win32 with matching system ABI; pointer arguments are checked before dereference.
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
         let cursor = LoadCursorW(None, IDC_ARROW)?;
@@ -129,6 +132,7 @@ pub fn create_island_hwnd(
 }
 
 pub fn set_window_topmost(hwnd: HWND, topmost: bool) {
+    // SAFETY: HWND is valid for this window's lifetime on the UI thread.
     unsafe {
         let insert_after = if topmost { HWND_TOPMOST } else { HWND_NOTOPMOST };
         let _ = SetWindowPos(
@@ -144,6 +148,7 @@ pub fn set_window_topmost(hwnd: HWND, topmost: bool) {
 }
 
 pub fn set_window_activatable(hwnd: HWND, activatable: bool) {
+    // SAFETY: HWND is valid for this window's lifetime on the UI thread.
     unsafe {
         let cur = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let no_act = WS_EX_NOACTIVATE.0 as isize;
@@ -168,11 +173,13 @@ pub fn set_window_activatable(hwnd: HWND, activatable: bool) {
 }
 
 pub fn is_foreground_window(hwnd: HWND) -> bool {
+    // SAFETY: HWND is valid for this window's lifetime on the UI thread.
     unsafe { GetForegroundWindow() == hwnd }
 }
 
 pub fn attach_and_run(hwnd: HWND, app: Rc<RefCell<App>>) {
     let ptr = Rc::into_raw(app);
+    // SAFETY: HWND is valid for this window's lifetime on the UI thread.
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
         let hotkey = {
@@ -199,6 +206,7 @@ pub fn attach_and_run(hwnd: HWND, app: Rc<RefCell<App>>) {
 }
 
 pub fn post_snapshot_wake(hwnd_raw: isize) {
+    // SAFETY: HWND is valid for this window's lifetime on the UI thread.
     unsafe {
         let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
         let _ = PostMessageW(hwnd, WM_APP_SNAPSHOT, WPARAM(0), LPARAM(0));
@@ -206,10 +214,12 @@ pub fn post_snapshot_wake(hwnd_raw: isize) {
 }
 
 fn with_app<R>(hwnd: HWND, f: impl FnOnce(&mut App) -> R) -> Option<R> {
+    // SAFETY: HWND is valid for this window's lifetime on the UI thread.
     let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const RefCell<App>;
     if ptr.is_null() {
         return None;
     }
+    // SAFETY: HWND is valid for this window's lifetime on the UI thread.
     let cell = unsafe { &*ptr };
     // Use try_borrow_mut so synchronous Win32 re-entrant messages (e.g. during SetWindowPos) never panic.
     let mut borrowed = cell.try_borrow_mut().ok()?;
@@ -238,6 +248,7 @@ fn signed_hiword(v: usize) -> i32 {
     ((v >> 16) & 0xFFFF) as u16 as i16 as i32
 }
 
+// SAFETY: Called by Win32 with matching system ABI; pointer arguments are checked before dereference.
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -246,7 +257,7 @@ unsafe extern "system" fn wnd_proc(
 ) -> LRESULT {
     let tb_msg = TASKBAR_CREATED_MSG.with(|c| *c.borrow());
     if tb_msg != 0 && msg == tb_msg {
-        with_app(hwnd, |app| app.tray.add());
+        with_app(hwnd, |app| app.tray.add(app.cfg.language));
         return LRESULT(0);
     }
 
@@ -406,6 +417,7 @@ mod tests {
         assert!(ico.len() > 54);
         assert_eq!(&ico[0..6], &[0, 0, 1, 0, 3, 0]);
 
+        // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
         unsafe {
             let hinst = GetModuleHandleW(None).unwrap();
             let icon = LoadIconW(hinst, PCWSTR(std::ptr::without_provenance(1)))

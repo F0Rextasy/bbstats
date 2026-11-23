@@ -1,0 +1,42 @@
+name: Bug Report
+description: Report a crash, process-grouping bug, UI glitch, or CLI issue in bbstats
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue! Please fill out the details below. (Remember to double-check any command lines you paste for secrets.)
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: bbstats Version
+      description: Output of `bbstats --version`
+      placeholder: "bbstats 0.2.1"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and how to reproduce it.
+    validations:
+      required: true
+  - type: textarea
+    id: snapshot
+    attributes:
+      label: Optional `--dump-snapshot` output or logs
+      description: Paste relevant lines from `bbstats --dump-snapshot` (verify no private paths/tokens remain).
+      render: text

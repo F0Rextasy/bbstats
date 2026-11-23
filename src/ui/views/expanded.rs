@@ -299,6 +299,13 @@ pub(super) fn render_expanded(
     ctx.fill_rounded(search_rect, 7.0, BG_ELEVATED)?;
     if state.search_focused && state.rename_draft.is_none() && state.add_job_draft.is_none() {
         ctx.stroke_rounded(search_rect, 7.0, BORDER_FOCUS, 1.3)?;
+        if state.text_all_selected && !state.search_query.is_empty() {
+            ctx.fill_rounded(
+                rect(24.0, 209.0, w - 42.0, 231.0),
+                4.0,
+                ACCENT_INFO_BG,
+            )?;
+        }
     }
     let search_txt = if state.search_query.is_empty() {
         lang.pick("Search job, project or :port...", "İş, proje veya :port ara...")
@@ -354,6 +361,13 @@ pub(super) fn render_expanded(
 
         let input_box = rect(70.0, list_top + 5.0, w - 134.0, list_top + 31.0);
         ctx.fill_rounded(input_box, 5.0, BG_ELEVATED)?;
+        if state.text_all_selected && !draft.input.is_empty() {
+            ctx.fill_rounded(
+                rect(75.0, list_top + 7.0, w - 138.0, list_top + 29.0),
+                4.0,
+                ACCENT_INFO_BG,
+            )?;
+        }
         ctx.draw_text(
             &format!("{}|", draft.input),
             &fonts.row_primary,
@@ -430,6 +444,13 @@ pub(super) fn render_expanded(
             ctx.fill_rounded(f_rect, 5.0, BG_ELEVATED)?;
             if add.active_field == idx {
                 ctx.stroke_rounded(f_rect, 5.0, BORDER_FOCUS, 1.0)?;
+                if state.text_all_selected && !val.is_empty() {
+                    ctx.fill_rounded(
+                        rect(85.0, fy + 2.0, right_edge - 4.0, fy + 22.0),
+                        3.0,
+                        ACCENT_INFO_BG,
+                    )?;
+                }
             }
             let shown = if add.active_field == idx {
                 format!("{val}|")
@@ -508,7 +529,13 @@ pub(super) fn render_expanded(
         if can_restart {
             let r_btn = rect(w - 118.0, list_top + 8.0, w - 50.0, list_top + 36.0);
             ctx.fill_rounded(r_btn, 6.0, BG_OVERLAY)?;
-            ctx.draw_text("↻ Restart", &fonts.mono_badge, r_btn, TEXT_PRIMARY, false)?;
+            ctx.draw_text(
+                lang.pick("↻ Restart", "↻ Başlat"),
+                &fonts.mono_badge,
+                r_btn,
+                TEXT_PRIMARY,
+                false,
+            )?;
             hit_map.push(
                 next_id(),
                 r_btn,
@@ -671,6 +698,7 @@ fn render_project_job_cards<F: FnMut() -> u32>(
 
                         let hdr_name_right = 176.0;
                         let hdr_name_rect = rect(32.0, y + 2.0, hdr_name_right, y + 27.0);
+                        let hdr_hover_rect = rect(32.0, y + 2.0, w - 56.0, y + 27.0);
                         let hdr_id = next_id();
                         ctx.draw_text(
                             &proj.name,
@@ -681,7 +709,7 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                         )?;
                         hit_map.push_with_rclick_clipped(
                             hdr_id,
-                            hdr_name_rect,
+                            hdr_hover_rect,
                             list_top,
                             list_bot,
                             HitAction::OpenProjectDetail(proj.id.clone()),
@@ -741,6 +769,30 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                                 ctx.fill_rounded(rn_r, 4.0, BG_ELEVATED_HOVER)?;
                             }
                             ctx.draw_pencil_icon(rn_r, TEXT_MUTED)?;
+                            hit_map.push_clipped(
+                                up_id,
+                                up_r,
+                                list_top,
+                                list_bot,
+                                HitAction::MoveProjectOrder(proj.id.clone(), -1),
+                            );
+                            hit_map.push_clipped(
+                                dn_id,
+                                dn_r,
+                                list_top,
+                                list_bot,
+                                HitAction::MoveProjectOrder(proj.id.clone(), 1),
+                            );
+                            hit_map.push_clipped(
+                                rn_id,
+                                rn_r,
+                                list_top,
+                                list_bot,
+                                HitAction::BeginRenameProject {
+                                    project_id: proj.id.clone(),
+                                    current_name: proj.name.clone(),
+                                },
+                            );
                         } else {
                             // Total project RAM & CPU% (crisp tabular sans-serif)
                             ctx.draw_text(
@@ -758,30 +810,6 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                                 true,
                             )?;
                         }
-                        hit_map.push_clipped(
-                            up_id,
-                            up_r,
-                            list_top,
-                            list_bot,
-                            HitAction::MoveProjectOrder(proj.id.clone(), -1),
-                        );
-                        hit_map.push_clipped(
-                            dn_id,
-                            dn_r,
-                            list_top,
-                            list_bot,
-                            HitAction::MoveProjectOrder(proj.id.clone(), 1),
-                        );
-                        hit_map.push_clipped(
-                            rn_id,
-                            rn_r,
-                            list_top,
-                            list_bot,
-                            HitAction::BeginRenameProject {
-                                project_id: proj.id.clone(),
-                                current_name: proj.name.clone(),
-                            },
-                        );
 
                         // Borderless Folder + Detail icons (hover pill only)
                         if proj.root.is_some() {
@@ -1234,35 +1262,36 @@ fn render_job_row<F: FnMut() -> u32>(
                 },
                 false,
             )?;
-        }
-        let order_key = if !job.match_hint.is_empty() {
-            job.match_hint.clone()
-        } else {
-            job.id.0.clone()
-        };
-        hit_map.push_clipped(up_id, up_rect, list_top, list_bot, HitAction::MoveJobOrder(order_key.clone(), -1));
-        hit_map.push_clipped(dn_id, dn_rect, list_top, list_bot, HitAction::MoveJobOrder(order_key, 1));
-        hit_map.push_clipped(
-            ed_id,
-            ed_rect,
-            list_top,
-            list_bot,
-            HitAction::BeginRenameJob {
-                match_hint: job.match_hint.clone(),
-                current_title: job.title.clone(),
-            },
-        );
-        if job.can_restart {
-            if job.status == ProjectStatus::Stopped && job.custom_command.is_some() {
-                hit_map.push_clipped(rid, r_rect, list_top, list_bot, HitAction::StartCustomJob(job.id.clone()));
+
+            let order_key = if !job.match_hint.is_empty() {
+                job.match_hint.clone()
             } else {
-                hit_map.push_clipped(rid, r_rect, list_top, list_bot, HitAction::RestartJob(job.id.clone()));
+                job.id.0.clone()
+            };
+            hit_map.push_clipped(up_id, up_rect, list_top, list_bot, HitAction::MoveJobOrder(order_key.clone(), -1));
+            hit_map.push_clipped(dn_id, dn_rect, list_top, list_bot, HitAction::MoveJobOrder(order_key, 1));
+            hit_map.push_clipped(
+                ed_id,
+                ed_rect,
+                list_top,
+                list_bot,
+                HitAction::BeginRenameJob {
+                    match_hint: job.match_hint.clone(),
+                    current_title: job.title.clone(),
+                },
+            );
+            if job.can_restart {
+                if job.status == ProjectStatus::Stopped && job.custom_command.is_some() {
+                    hit_map.push_clipped(rid, r_rect, list_top, list_bot, HitAction::StartCustomJob(job.id.clone()));
+                } else {
+                    hit_map.push_clipped(rid, r_rect, list_top, list_bot, HitAction::RestartJob(job.id.clone()));
+                }
             }
-        }
-        if job.can_kill {
-            hit_map.push_clipped(kid, k_rect, list_top, list_bot, HitAction::RequestKillJob(job.id.clone()));
-        } else if job.status == ProjectStatus::Stopped && job.is_watched {
-            hit_map.push_clipped(kid, k_rect, list_top, list_bot, HitAction::RemoveWatchedJob(job.match_hint.clone()));
+            if job.can_kill {
+                hit_map.push_clipped(kid, k_rect, list_top, list_bot, HitAction::RequestKillJob(job.id.clone()));
+            } else if job.status == ProjectStatus::Stopped && job.is_watched {
+                hit_map.push_clipped(kid, k_rect, list_top, list_bot, HitAction::RemoveWatchedJob(job.match_hint.clone()));
+            }
         }
     }
 
@@ -1316,6 +1345,23 @@ fn render_all_procs_list<F: FnMut() -> u32>(
             TEXT_MUTED,
             true,
         )?;
+
+        if procs.is_empty() {
+            ctx.draw_text(
+                if state.search_query.is_empty() {
+                    lang.pick("No OS processes available.", "Görüntülenecek işletim sistemi süreci yok.")
+                } else {
+                    lang.pick(
+                        "No processes matched your search.",
+                        "Aramanızla eşleşen süreç bulunamadı.",
+                    )
+                },
+                &fonts.row_secondary,
+                rect(20.0, hdr_y + 26.0, w - 20.0, hdr_y + 56.0),
+                TEXT_MUTED,
+                false,
+            )?;
+        }
 
         for (idx, pr) in procs.iter().enumerate() {
             let y = hdr_y + 22.0 + idx as f32 * row_h;
@@ -1422,7 +1468,13 @@ fn render_all_procs_list<F: FnMut() -> u32>(
                 if pr.is_critical_system || !pr.can_kill {
                     let lk = rect(w - 48.0, y + 7.0, w - 16.0, y + 31.0);
                     ctx.fill_rounded(lk, 5.0, BG_OVERLAY)?;
-                    ctx.draw_text("LOCK", &fonts.mono_badge, lk, TEXT_MUTED, false)?;
+                    ctx.draw_text(
+                        lang.pick("LOCK", "KİLİT"),
+                        &fonts.mono_badge,
+                        lk,
+                        TEXT_MUTED,
+                        false,
+                    )?;
                 } else {
                     let k_r = rect(w - 46.0, y + 7.0, w - 18.0, y + 31.0);
                     ctx.fill_rounded(k_r, 5.0, ACCENT_DANGER_BG)?;
@@ -1447,7 +1499,7 @@ fn alert_banner_meta(kind: &AlertKind, lang: Language) -> (&'static str, bool) {
         AlertKind::Crash { can_restart: true, .. } => (
             lang.pick(
                 "Click Restart to relaunch or dismiss",
-                "Yeniden başlatmak için Restart'a tıklayın veya kapatın",
+                "Yeniden başlatmak için Başlat'a tıklayın veya kapatın",
             ),
             true,
         ),

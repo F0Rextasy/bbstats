@@ -42,6 +42,8 @@ pub struct LabelRule {
     pub hide_transient: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_restart: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -105,12 +107,12 @@ impl LabelsStore {
         if !force && mtime == self.last_mtime {
             return false;
         }
-        self.last_mtime = mtime;
 
         let new_rules = match fs::read_to_string(path) {
             Ok(content) => match parse_labels_toml_strict(&content) {
                 Ok(parsed) => parsed,
                 Err(err) => {
+                    self.last_mtime = mtime;
                     crate::config::log_error(&format!(
                         "corrupt labels.toml at {}: {err}",
                         path.display()
@@ -118,8 +120,13 @@ impl LabelsStore {
                     return false;
                 }
             },
-            Err(_) => Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => {
+                // Transient I/O / sharing violation: keep existing rules and retry next tick.
+                return false;
+            }
         };
+        self.last_mtime = mtime;
         let changed = new_rules != self.rules;
         self.rules = new_rules;
         changed || force
@@ -129,10 +136,10 @@ impl LabelsStore {
     pub fn match_rule(&self, haystacks: &[&str]) -> Option<&LabelRule> {
         let folded_haystacks: Vec<String> = haystacks
             .iter()
-            .map(|h| fold_search_lower(h).replace('\\', "/"))
+            .map(|h| normalize_match_key(h))
             .collect();
         for rule in &self.rules {
-            let needle = fold_search_lower(rule.match_substr.trim()).replace('\\', "/");
+            let needle = normalize_match_key(&rule.match_substr);
             if needle.is_empty() {
                 continue;
             }
@@ -145,7 +152,7 @@ impl LabelsStore {
 
     /// Matches only rules whose `match_substr` targets the script name itself (not just parent folder).
     pub fn match_specific_script_rule(&self, full_path: &str, file_name: &str) -> Option<&LabelRule> {
-        let low_full = fold_search_lower(full_path).replace('\\', "/");
+        let low_full = normalize_match_key(full_path);
         let low_file = fold_search_lower(file_name);
         let stem = Path::new(file_name)
             .file_stem()
@@ -153,12 +160,13 @@ impl LabelsStore {
             .map(fold_search_lower)
             .unwrap_or_default();
         for rule in &self.rules {
-            let needle = fold_search_lower(rule.match_substr.trim()).replace('\\', "/");
+            let needle = normalize_match_key(&rule.match_substr);
             if needle.is_empty() {
                 continue;
             }
-            let needle_targets_script = (!stem.is_empty() && needle.contains(&stem))
-                || needle.contains(&low_file);
+            let needle_leaf = needle.rsplit('/').next().unwrap_or(&needle);
+            let needle_targets_script =
+                needle_leaf == low_file || (!stem.is_empty() && needle_leaf == stem);
             if needle_targets_script && (low_full.contains(&needle) || low_file.contains(&needle)) {
                 return Some(rule);
             }
@@ -185,7 +193,7 @@ impl LabelsStore {
     /// preserving existing optional metadata when incoming fields are `None`.
     pub fn save_rule(&mut self, rule: LabelRule) -> Result<(), String> {
         let Some(path) = &self.path else {
-            return Err("APPDATA path unavailable".to_string());
+            return Err("config path unavailable".to_string());
         };
         save_rule_to_path(path, rule)?;
         self.reload_if_changed(true);
@@ -194,7 +202,7 @@ impl LabelsStore {
 
     pub fn remove_rule(&mut self, match_substr: &str) -> Result<(), String> {
         let Some(path) = &self.path else {
-            return Err("APPDATA path unavailable".to_string());
+            return Err("config path unavailable".to_string());
         };
         remove_rule_from_path(path, match_substr)?;
         self.reload_if_changed(true);
@@ -218,10 +226,15 @@ fn load_existing_rules_strict(path: &Path) -> Result<Vec<LabelRule>, String> {
     }
 }
 
+fn normalize_match_key(s: &str) -> String {
+    fold_search_lower(s.trim()).replace('\\', "/")
+}
+
 pub fn remove_rule_from_path(path: &Path, match_substr: &str) -> Result<(), String> {
     let mut rules = load_existing_rules_strict(path)?;
     let before = rules.len();
-    rules.retain(|r| !r.match_substr.eq_ignore_ascii_case(match_substr));
+    let target = normalize_match_key(match_substr);
+    rules.retain(|r| normalize_match_key(&r.match_substr) != target);
     if rules.len() == before {
         return Ok(());
     }
@@ -247,9 +260,10 @@ pub fn save_rule_to_path(path: &Path, rule: LabelRule) -> Result<(), String> {
 }
 
 fn merge_or_prepend_rule(rules: &mut Vec<LabelRule>, rule: LabelRule) {
+    let target = normalize_match_key(&rule.match_substr);
     if let Some(existing) = rules
         .iter_mut()
-        .find(|r| r.match_substr.eq_ignore_ascii_case(&rule.match_substr))
+        .find(|r| normalize_match_key(&r.match_substr) == target)
     {
         existing.job = rule.job;
         if rule.project.is_some() {
@@ -290,6 +304,9 @@ fn merge_or_prepend_rule(rules: &mut Vec<LabelRule>, rule: LabelRule) {
         }
         if rule.auto_restart.is_some() {
             existing.auto_restart = rule.auto_restart;
+        }
+        if rule.env_file.is_some() {
+            existing.env_file = rule.env_file;
         }
     } else {
         rules.insert(0, rule);
@@ -373,23 +390,28 @@ fn format_unix_epoch_hhmm(raw: u64) -> String {
 
 #[cfg(target_os = "windows")]
 fn local_utc_offset_secs() -> i64 {
-    unsafe {
-        let utc = GetSystemTime();
-        let local = GetLocalTime();
-        let utc_min = (utc.wHour as i64) * 60 + (utc.wMinute as i64);
-        let local_min = (local.wHour as i64) * 60 + (local.wMinute as i64);
-        let mut diff = local_min - utc_min;
-        if diff > 14 * 60 {
-            diff -= 24 * 60;
-        } else if diff < -12 * 60 {
-            diff += 24 * 60;
+    // Retry if a minute boundary ticked between GetSystemTime and GetLocalTime.
+    for _ in 0..3 {
+        // SAFETY: Win32 GetSystemTime/GetLocalTime have no preconditions and return value structs.
+        let (utc1, local, utc2) = unsafe { (GetSystemTime(), GetLocalTime(), GetSystemTime()) };
+        if utc1.wMinute == utc2.wMinute {
+            let utc_min = (utc1.wHour as i64) * 60 + (utc1.wMinute as i64);
+            let local_min = (local.wHour as i64) * 60 + (local.wMinute as i64);
+            let mut diff = local_min - utc_min;
+            if diff > 14 * 60 {
+                diff -= 24 * 60;
+            } else if diff < -12 * 60 {
+                diff += 24 * 60;
+            }
+            return diff * 60;
         }
-        diff * 60
     }
+    0
 }
 
 #[cfg(not(target_os = "windows"))]
 fn local_utc_offset_secs() -> i64 {
+    // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
     unsafe {
         let now: libc::time_t = libc::time(std::ptr::null_mut());
         let mut tm_local: libc::tm = std::mem::zeroed();
@@ -401,9 +423,23 @@ fn local_utc_offset_secs() -> i64 {
     }
 }
 
+fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    let low_h = haystack.to_ascii_lowercase();
+    let low_n = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut last = 0usize;
+    for (idx, _) in low_h.match_indices(&low_n) {
+        out.push_str(&haystack[last..idx]);
+        out.push_str(replacement);
+        last = idx + needle.len();
+    }
+    out.push_str(&haystack[last..]);
+    out
+}
+
 pub fn expand_win_env_vars(raw: &str) -> String {
     let mut s = raw.to_string();
-    if let Some(rest) = s.strip_prefix("~/") {
+    if let Some(rest) = s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\")) {
         if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
             let sep = if cfg!(windows) { '\\' } else { '/' };
             s = format!("{}{}{}", home.to_string_lossy(), sep, rest);
@@ -411,9 +447,9 @@ pub fn expand_win_env_vars(raw: &str) -> String {
     }
     for var in ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME"] {
         let token = format!("%{var}%");
-        if s.contains(&token) {
+        if s.to_ascii_lowercase().contains(&token.to_ascii_lowercase()) {
             if let Ok(val) = std::env::var(var) {
-                s = s.replace(&token, &val);
+                s = replace_ascii_case_insensitive(&s, &token, &val);
             }
         }
         let dollar_token = format!("${var}");
@@ -424,6 +460,43 @@ pub fn expand_win_env_vars(raw: &str) -> String {
         }
     }
     s
+}
+
+/// Parses a simple `.env` file (`KEY=VALUE`, ignoring comments and blank lines, bounded to 128 KB).
+pub fn load_env_file_vars(path: &Path) -> Vec<(String, String)> {
+    const MAX_ENV_BYTES: u64 = 128 * 1024;
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut raw = String::new();
+    if file.take(MAX_ENV_BYTES).read_to_string(&mut raw).is_err() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let body = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let Some((k, v)) = body.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            continue;
+        }
+        let val_trim = v.trim();
+        let val = if (val_trim.starts_with('"') && val_trim.ends_with('"') && val_trim.len() >= 2)
+            || (val_trim.starts_with('\'') && val_trim.ends_with('\'') && val_trim.len() >= 2)
+        {
+            val_trim[1..val_trim.len() - 1].to_string()
+        } else {
+            val_trim.split(" #").next().unwrap_or(val_trim).trim().to_string()
+        };
+        out.push((key.to_string(), val));
+    }
+    out
 }
 
 pub fn default_labels_path() -> Option<PathBuf> {

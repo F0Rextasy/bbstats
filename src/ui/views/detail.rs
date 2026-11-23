@@ -155,24 +155,49 @@ pub(super) fn render_detail(
     let is_stopped_custom = active_job.is_some_and(|j| {
         j.status == ProjectStatus::Stopped && j.custom_command.is_some()
     });
-    ctx.fill_rounded(rst_rect, 8.0, BG_ELEVATED)?;
+    let rst_enabled = if is_stopped_custom {
+        true
+    } else if proj.jobs.len() > 1 {
+        active_job.is_some_and(|j| j.can_restart)
+    } else {
+        active_job.is_some_and(|j| j.can_restart)
+            || proj.jobs.iter().any(|j| j.can_restart)
+    };
+    let rst_id = next_id();
+    ctx.fill_rounded(
+        rst_rect,
+        8.0,
+        if rst_enabled && state.hovered_hit_id == Some(rst_id) {
+            BG_ELEVATED_HOVER
+        } else {
+            BG_ELEVATED
+        },
+    )?;
     ctx.draw_text(
         if is_stopped_custom { "▶" } else { "↻" },
         &fonts.mono_badge,
         rst_rect,
-        if is_stopped_custom { ACCENT_LIVE } else { TEXT_PRIMARY },
+        if !rst_enabled {
+            TEXT_MUTED
+        } else if is_stopped_custom {
+            ACCENT_LIVE
+        } else {
+            TEXT_PRIMARY
+        },
         false,
     )?;
-    if let Some(j) = active_job {
-        if is_stopped_custom {
-            hit_map.push(next_id(), rst_rect, HitAction::StartCustomJob(j.id.clone()));
-        } else if j.can_restart {
-            hit_map.push(next_id(), rst_rect, HitAction::RestartJob(j.id.clone()));
-        } else {
-            hit_map.push(next_id(), rst_rect, HitAction::RestartProject(proj.id.clone()));
+    if rst_enabled {
+        if let Some(j) = active_job {
+            if is_stopped_custom {
+                hit_map.push(rst_id, rst_rect, HitAction::StartCustomJob(j.id.clone()));
+            } else if j.can_restart {
+                hit_map.push(rst_id, rst_rect, HitAction::RestartJob(j.id.clone()));
+            } else if proj.jobs.len() <= 1 {
+                hit_map.push(rst_id, rst_rect, HitAction::RestartProject(proj.id.clone()));
+            }
+        } else if proj.jobs.len() <= 1 {
+            hit_map.push(rst_id, rst_rect, HitAction::RestartProject(proj.id.clone()));
         }
-    } else {
-        hit_map.push(next_id(), rst_rect, HitAction::RestartProject(proj.id.clone()));
     }
 
     let stop_rect = rect(w - 40.0, 9.0, w - 12.0, 35.0);
@@ -181,7 +206,15 @@ pub(super) fn render_detail(
     } else {
         None
     };
-    let stop_enabled = scope_job.is_none_or(|j| j.can_kill);
+    let has_killable_procs = proj
+        .procs
+        .iter()
+        .any(|p| p.can_kill && !p.is_critical_system);
+    let stop_enabled = match scope_job {
+        Some(j) => j.can_kill && j.procs.iter().any(|p| p.can_kill && !p.is_critical_system),
+        None => has_killable_procs,
+    };
+    let stop_id = next_id();
     ctx.fill_rounded(
         stop_rect,
         8.0,
@@ -198,12 +231,12 @@ pub(super) fn render_detail(
         if stop_enabled { ACCENT_DANGER } else { TEXT_MUTED },
         false,
     )?;
-    if let Some(j) = scope_job {
-        if j.can_kill {
-            hit_map.push(next_id(), stop_rect, HitAction::RequestKillJob(j.id.clone()));
+    if stop_enabled {
+        if let Some(j) = scope_job {
+            hit_map.push(stop_id, stop_rect, HitAction::RequestKillJob(j.id.clone()));
+        } else {
+            hit_map.push(stop_id, stop_rect, HitAction::RequestKillProject(proj.id.clone()));
         }
-    } else {
-        hit_map.push(next_id(), stop_rect, HitAction::RequestKillProject(proj.id.clone()));
     }
 
     ctx.draw_hairline(12.0, 44.0, w - 12.0)?;
@@ -340,6 +373,7 @@ pub(super) fn render_detail(
         (0.0, 1.0)
     };
 
+    let pre_body_hits = hit_map.regions.len();
     ctx.with_transformed_layer(slide_x, 0.0, 1.0, 1.0, body_alpha, || {
         render_detail_body(
             ctx,
@@ -356,6 +390,20 @@ pub(super) fn render_detail(
             &mut next_id,
         )
     })?;
+    if slide_x.abs() > 0.01 {
+        for r in &mut hit_map.regions[pre_body_hits..] {
+            r.rect.left += slide_x;
+            r.rect.right += slide_x;
+        }
+        if let Some(vp) = &mut hit_map.scroll_viewport {
+            vp.left += slide_x;
+            vp.right += slide_x;
+        }
+        if let Some(tvp) = &mut hit_map.term_viewport {
+            tvp.left += slide_x;
+            tvp.right += slide_x;
+        }
+    }
 
     let list_bot = h - 28.0;
     ctx.draw_hairline(12.0, list_bot, w - 12.0)?;
@@ -446,7 +494,7 @@ fn render_detail_body<F: FnMut() -> u32>(
 
     ctx.fill_rounded(cpu_card, 8.0, BG_CARD)?;
     ctx.stroke_rounded(cpu_card, 8.0, BORDER_SUBTLE, 1.0)?;
-    let cpu_samples: Vec<f32> = proj.cpu_history.iter().map(|&v| v as f32).collect();
+    let cpu_samples: [f32; 30] = std::array::from_fn(|i| proj.cpu_history[i] as f32);
     let cpu_peak = cpu_samples.iter().copied().fold(0.0_f32, f32::max);
     ctx.draw_text(
         &format!(
@@ -469,7 +517,7 @@ fn render_detail_body<F: FnMut() -> u32>(
 
     ctx.fill_rounded(ram_card, 8.0, BG_CARD)?;
     ctx.stroke_rounded(ram_card, 8.0, BORDER_SUBTLE, 1.0)?;
-    let ram_samples: Vec<f32> = proj.ram_history_mb.iter().map(|&v| v as f32).collect();
+    let ram_samples: [f32; 30] = std::array::from_fn(|i| proj.ram_history_mb[i] as f32);
     let ram_peak = ram_samples.iter().copied().fold(0.0_f32, f32::max);
     ctx.draw_text(
         &format!(
@@ -501,16 +549,49 @@ fn render_detail_body<F: FnMut() -> u32>(
             (k, None) => format!("{term_hdr} · {}", k.label_for(lang)),
         })
         .unwrap_or_else(|| term_hdr.to_string());
+    let show_live_btn = state.term_scroll_offset > 0.5;
+    let hdr_right = if show_live_btn { w - 196.0 } else { w - 134.0 };
     ctx.draw_text(
         &src_label,
         &fonts.section_hdr,
-        rect(14.0, y_cursor, w - 134.0, y_cursor + 20.0),
+        rect(14.0, y_cursor, hdr_right, y_cursor + 20.0),
         ACCENT_TEAL,
         true,
     )?;
 
+    if show_live_btn {
+        let live_btn = rect(w - 192.0, y_cursor, w - 134.0, y_cursor + 19.0);
+        let lid = next_id();
+        ctx.fill_rounded(
+            live_btn,
+            5.0,
+            if state.hovered_hit_id == Some(lid) {
+                rgba(10, 132, 255, 0.28)
+            } else {
+                ACCENT_INFO_BG
+            },
+        )?;
+        ctx.draw_text(
+            lang.pick("↓ Live", "↓ Canlı"),
+            &fonts.micro_lbl,
+            live_btn,
+            ACCENT_INFO,
+            false,
+        )?;
+        hit_map.push(lid, live_btn, HitAction::JumpTerminalLive);
+    }
+
     let ref_btn = rect(w - 130.0, y_cursor, w - 76.0, y_cursor + 19.0);
-    ctx.fill_rounded(ref_btn, 5.0, BG_ELEVATED)?;
+    let ref_id = next_id();
+    ctx.fill_rounded(
+        ref_btn,
+        5.0,
+        if state.hovered_hit_id == Some(ref_id) {
+            BG_ELEVATED_HOVER
+        } else {
+            BG_ELEVATED
+        },
+    )?;
     ctx.draw_text(
         lang.pick("↻ Refresh", "↻ Yenile"),
         &fonts.micro_lbl,
@@ -518,10 +599,19 @@ fn render_detail_body<F: FnMut() -> u32>(
         TEXT_SECONDARY,
         false,
     )?;
-    hit_map.push(next_id(), ref_btn, HitAction::RefreshTerminalOutput);
+    hit_map.push(ref_id, ref_btn, HitAction::RefreshTerminalOutput);
 
     let cpy_btn = rect(w - 72.0, y_cursor, w - 14.0, y_cursor + 19.0);
-    ctx.fill_rounded(cpy_btn, 5.0, BG_ELEVATED)?;
+    let cpy_id = next_id();
+    ctx.fill_rounded(
+        cpy_btn,
+        5.0,
+        if state.hovered_hit_id == Some(cpy_id) {
+            BG_ELEVATED_HOVER
+        } else {
+            BG_ELEVATED
+        },
+    )?;
     ctx.draw_text(
         lang.pick("Copy", "Kopyala"),
         &fonts.micro_lbl,
@@ -529,10 +619,15 @@ fn render_detail_body<F: FnMut() -> u32>(
         TEXT_PRIMARY,
         false,
     )?;
-    hit_map.push(next_id(), cpy_btn, HitAction::CopyTerminalOutput);
+    hit_map.push(cpy_id, cpy_btn, HitAction::CopyTerminalOutput);
 
     y_cursor += 22.0;
-    let reserve_procs = 22.0 + (proj.procs.len().clamp(1, 3) as f32) * 46.0 + 38.0;
+    let displayed_procs: &[crate::model::ProcInfo] = if proj.jobs.len() > 1 {
+        active_job.map(|j| j.procs.as_slice()).unwrap_or(&proj.procs)
+    } else {
+        &proj.procs
+    };
+    let reserve_procs = 22.0 + (displayed_procs.len().clamp(1, 3) as f32) * 46.0 + 38.0;
     let term_h = (h - y_cursor - reserve_procs).clamp(108.0, 190.0);
     let term_box = rect(12.0, y_cursor, w - 12.0, y_cursor + term_h);
     ctx.fill_rounded(term_box, 8.0, rgba(12, 13, 16, 0.94))?;
@@ -547,6 +642,9 @@ fn render_detail_body<F: FnMut() -> u32>(
     let mut wrapped_lines: Vec<(String, D2D1_COLOR_F)> = Vec::new();
     for line in raw_term_lines {
         let low = line.to_ascii_lowercase();
+        let has_ok_word = low
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| tok == "ok");
         let col = if low.contains("error")
             || low.contains("fail")
             || low.contains("exception")
@@ -555,7 +653,7 @@ fn render_detail_body<F: FnMut() -> u32>(
             ACCENT_DANGER
         } else if low.contains("warn") {
             ACCENT_WARN
-        } else if low.contains("ready") || low.contains("listening") || low.contains("ok") {
+        } else if low.contains("ready") || low.contains("listening") || has_ok_word {
             ACCENT_LIVE
         } else {
             TEXT_PRIMARY
@@ -652,12 +750,6 @@ fn render_detail_body<F: FnMut() -> u32>(
 
     y_cursor += term_h + 10.0;
 
-    let displayed_procs: &[crate::model::ProcInfo] = if proj.jobs.len() > 1 {
-        active_job.map(|j| j.procs.as_slice()).unwrap_or(&proj.procs)
-    } else {
-        &proj.procs
-    };
-
     // Underlying Raw Processes Tree (hidden in main list, inspectable here)
     ctx.draw_text(
         &format!(
@@ -671,7 +763,7 @@ fn render_detail_body<F: FnMut() -> u32>(
         true,
     )?;
     let list_top = y_cursor + 22.0;
-    let list_bot = h - 28.0;
+    let list_bot = (h - 28.0).max(list_top);
     hit_map.scroll_viewport = Some(rect(0.0, list_top, w, list_bot));
 
     let row_h = 46.0;
@@ -710,7 +802,12 @@ fn render_detail_body<F: FnMut() -> u32>(
         )?;
 
         let meta = if pr.access_limited {
-            format!("PID {} · {} · elevated", pr.key.pid, format_uptime(pr.uptime_secs))
+            format!(
+                "PID {} · {} · {}",
+                pr.key.pid,
+                format_uptime(pr.uptime_secs),
+                lang.pick("elevated", "yükseltilmiş")
+            )
         } else {
             format!("PID {} · {}", pr.key.pid, format_uptime(pr.uptime_secs))
         };
@@ -817,17 +914,35 @@ fn render_detail_body<F: FnMut() -> u32>(
         if confirming {
             let ok_r = rect(w - 118.0, y + 9.0, w - 66.0, y + 33.0);
             ctx.fill_rounded(ok_r, 6.0, ACCENT_DANGER)?;
-            ctx.draw_text("Kill", &fonts.mono_badge, ok_r, BG_OVERLAY, false)?;
+            ctx.draw_text(
+                lang.pick("Kill", "Sonlandır"),
+                &fonts.mono_badge,
+                ok_r,
+                BG_OVERLAY,
+                false,
+            )?;
             hit_map.push_clipped(next_id(), ok_r, list_top, list_bot, HitAction::ConfirmKillProcess(pr.key));
 
             let cn_r = rect(w - 62.0, y + 9.0, w - 18.0, y + 33.0);
             ctx.fill_rounded(cn_r, 6.0, BG_ELEVATED_HOVER)?;
-            ctx.draw_text("No", &fonts.mono_badge, cn_r, TEXT_PRIMARY, false)?;
+            ctx.draw_text(
+                lang.pick("No", "Hayır"),
+                &fonts.mono_badge,
+                cn_r,
+                TEXT_PRIMARY,
+                false,
+            )?;
             hit_map.push_clipped(next_id(), cn_r, list_top, list_bot, HitAction::CancelKillConfirm);
         } else if pr.is_critical_system || !pr.can_kill {
             let lk_r = rect(w - 60.0, y + 9.0, w - 18.0, y + 33.0);
             ctx.fill_rounded(lk_r, 6.0, BG_OVERLAY)?;
-            ctx.draw_text("LOCK", &fonts.mono_badge, lk_r, TEXT_MUTED, false)?;
+            ctx.draw_text(
+                lang.pick("LOCK", "KİLİT"),
+                &fonts.mono_badge,
+                lk_r,
+                TEXT_MUTED,
+                false,
+            )?;
         } else {
             let k_r = rect(w - 44.0, y + 9.0, w - 18.0, y + 33.0);
             ctx.fill_rounded(k_r, 6.0, ACCENT_DANGER_BG)?;

@@ -1,8 +1,12 @@
 //! System tray icon (`Shell_NotifyIconW`) and Win32 context menu.
 
 use crate::config::{AppConfig, DockPosition};
+use crate::model::Language;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING, NIM_ADD,
@@ -44,32 +48,49 @@ pub struct TrayIcon {
 }
 
 impl TrayIcon {
-    pub fn new(hwnd: HWND) -> Self {
+    pub fn new(hwnd: HWND, lang: Language) -> Self {
         let icon = load_tray_icon();
         let mut tray = Self {
             hwnd,
             icon,
             added: false,
         };
-        tray.add();
+        tray.add(lang);
         tray
     }
 
-    pub fn add(&mut self) {
+    pub fn add(&mut self, lang: Language) {
         let mut nid = self.base_nid();
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_APP_TRAY;
         nid.hIcon = self.icon;
-        let tip = "bbstats — Process Monitor";
+        let tip = lang.pick("bbstats — Process Monitor", "bbstats — Süreç Monitörü");
         for (dst, src) in nid.szTip.iter_mut().zip(tip.encode_utf16()) {
             *dst = src;
         }
+        // SAFETY: `nid` has valid `cbSize`, `hWnd`, and NUL-terminated `szTip`.
         unsafe {
             if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
                 nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
                 let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
                 self.added = true;
             }
+        }
+    }
+
+    pub fn set_language(&self, lang: Language) {
+        if !self.added {
+            return;
+        }
+        let mut nid = self.base_nid();
+        nid.uFlags = NIF_TIP;
+        let tip = lang.pick("bbstats — Process Monitor", "bbstats — Süreç Monitörü");
+        for (dst, src) in nid.szTip.iter_mut().zip(tip.encode_utf16()) {
+            *dst = src;
+        }
+        // SAFETY: `nid` modifies only the NUL-terminated tooltip for the registered icon.
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
     }
 
@@ -105,6 +126,7 @@ impl TrayIcon {
         {
             *dst = src;
         }
+        // SAFETY: Valid Win32 HMENU/HICON/NOTIFYICONDATAW structs and HWND on the UI thread.
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
@@ -114,6 +136,7 @@ impl TrayIcon {
 /// Shows the Win32 popup context menu without requiring a borrow on `App`.
 pub fn show_menu_for_hwnd(hwnd: HWND, cfg: &AppConfig) -> Option<TrayAction> {
     let lang = cfg.language;
+    // SAFETY: Valid Win32 HMENU/HICON/NOTIFYICONDATAW structs and HWND on the UI thread.
     unsafe {
         let hmenu = CreatePopupMenu().ok()?;
         let _ = AppendMenuW(
@@ -202,7 +225,17 @@ pub fn show_menu_for_hwnd(hwnd: HWND, cfg: &AppConfig) -> Option<TrayAction> {
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(hwnd);
 
-        let align_flag = if pt.y < 300 {
+        let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let work_top = if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            mi.rcWork.top
+        } else {
+            0
+        };
+        let align_flag = if (pt.y - work_top) < 300 {
             windows::Win32::UI::WindowsAndMessaging::TPM_TOPALIGN
         } else {
             TPM_BOTTOMALIGN
@@ -233,6 +266,7 @@ pub fn show_menu_for_hwnd(hwnd: HWND, cfg: &AppConfig) -> Option<TrayAction> {
 
 impl Drop for TrayIcon {
     fn drop(&mut self) {
+        // SAFETY: Valid Win32 HMENU/HICON/NOTIFYICONDATAW structs and HWND on the UI thread.
         unsafe {
             if self.added {
                 let nid = self.base_nid();
@@ -251,6 +285,7 @@ fn wide(s: &str) -> Vec<u16> {
 
 /// Loads the embedded Win32 resource icon (`MAKEINTRESOURCEW(1)`) compiled by `build.rs`.
 fn load_tray_icon() -> HICON {
+    // SAFETY: Valid Win32 HMENU/HICON/NOTIFYICONDATAW structs and HWND on the UI thread.
     unsafe {
         let Ok(hinst) = GetModuleHandleW(None) else {
             return HICON::default();

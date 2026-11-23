@@ -3,19 +3,36 @@
   <h1>bbstats</h1>
   <p><strong>Dynamic Island tarzı arka plan süreç ve geliştirici proje telemetri monitörü</strong></p>
   <p>
-    <a href="README.md">English</a> · <strong>Türkçe</strong> · <a href="CHANGELOG.md">Değişiklik Günlüğü</a>
+    <a href="README.md">English</a> · <strong>Türkçe</strong> · <a href="CHANGELOG.md">Değişiklik Günlüğü</a> · <a href="SECURITY.md">Güvenlik</a> · <a href="CONTRIBUTING.md">Katkıda Bulun</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/Rust-2021-orange?logo=rust" alt="Rust 2021" />
+    <img src="https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust" alt="Rust 1.88+" />
     <img src="https://img.shields.io/badge/Windows-10%2F11%20Doğal-0A84FF?logo=windows" alt="Windows 10/11" />
-    <img src="https://img.shields.io/badge/macOS-Apple%20Silicon%20%26%20Intel-34D399?logo=apple" alt="macOS Destekleniyor" />
+    <img src="https://img.shields.io/badge/macOS-arm64%20%26%20x86__64-34D399?logo=apple" alt="macOS Destekleniyor" />
+    <img src="https://img.shields.io/badge/Linux-Terminal%20HUD-34D399?logo=linux" alt="Linux Destekleniyor" />
     <img src="https://img.shields.io/badge/Lisans-MIT-34D399" alt="MIT Lisansı" />
   </p>
 </div>
 
 ---
 
-**bbstats**, geliştiriciler için sıfır harici çalışma zamanı bağımlılığına sahip hafif bir Dynamic Island masaüstü monitörüdür. Görev Yöneticisi veya Etkinlik Monitörü gibi yüzlerce ham işletim sistemi PID'si göstermek yerine; aktif sunucularınızı, worker'larınızı, konteynerlerinizi ve zamanlanmış işlerinizi **proje** ve **mantıksal iş** bazında gruplar, canlı CPU/RAM eğrilerini, portları, log akışlarını ve güvenli kontrol düğmelerini tek merkezde sunar.
+**bbstats**, geliştiriciler için sıfır harici çalışma zamanı bağımlılığına sahip, **%100 yerel (sıfır telemetri, sıfır bulut bağlantısı)** Dynamic Island masaüstü monitörü ve geliştirici süreç aracıdır. Görev Yöneticisi veya Etkinlik Monitörü gibi yüzlerce ham işletim sistemi PID'si göstermek yerine; aktif sunucularınızı, worker'larınızı, konteynerlerinizi ve zamanlanmış işlerinizi **proje** ve **mantıksal iş** bazında gruplar, canlı CPU/RAM eğrilerini, portları, log akışlarını ve güvenli kontrol düğmelerini tek merkezde sunar.
+
+> **%100 Yerel ve Gizlilik Odaklı:** `bbstats` hiçbir analiz verisi, çökme raporu veya ağ isteği göndermez. Tüm izleme makinenizde yerel kalır (Docker sorguları yalnızca Docker çalışırken yerel soket/pipe üzerinden yapılır).
+
+## İndirme ve Kurulum
+
+### Hazır İkili Paketler (GitHub Releases)
+
+**Windows (`x86_64`)**, **macOS (`arm64` / `x86_64`)** ve **Linux (`x86_64`)** için en son sürüm arşivini [GitHub Releases](https://github.com/F0Rextasy/bbstats/releases) sayfasından indirebilirsiniz. Her sürümde bütünlüğü doğrulamak için `SHA256SUMS.txt` ve GitHub build-provenance doğrulamaları yer alır.
+
+> **Windows SmartScreen Notu:** Sürüm ikilileri henüz kurumsal kod imzalama sertifikasıyla imzalanmadığı için ilk çalıştırmada Windows SmartScreen uyarısı çıkabilir; çalıştırmadan önce arşivin SHA-256 özetini `SHA256SUMS.txt` ile doğrulayabilirsiniz.
+
+### Kaynaktan Kurulum (`cargo`)
+
+```bash
+cargo install --git https://github.com/F0Rextasy/bbstats.git --locked
+```
 
 ## Ekran Görüntüleri
 
@@ -83,58 +100,73 @@
 
 | Platform | Durum | Arayüz ve Grafik Katmanı | Telemetri ve Başlangıç |
 |---|---|---|---|
-| **Windows 10 / 11 (`x86_64`)** | Destekleniyor (`v0.2.1`) | Direct3D11 + Direct2D + DirectWrite + WinRT Composition (`WS_EX_TOOLWINDOW`, Acrylic cam) | NT PEB okuma, IP Helper TCP/UDP portları, `Shell_NotifyIconW`, Registry Run |
-| **macOS (`arm64` / `x86_64`)** | Destekleniyor (`v0.2.1`) | Doğal ANSI Dynamic Island canlı terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`, `--dump-snapshot`) | `ps` / `sysctl` / `vm_stat` / `lsof` port ve CWD tarama, `kqueue` çökme izleyici, `SIGTERM`→`SIGKILL`, Docker Unix soketi, `~/Library/LaunchAgents` |
+| **Windows 10 / 11 (`x86_64`)** | Destekleniyor | Direct3D11 + Direct2D + DirectWrite + WinRT Composition Dynamic Island kapsülü (`WS_EX_TOOLWINDOW`, Acrylic cam) | NT PEB okuma, IP Helper TCP/UDP portları, `Shell_NotifyIconW`, Registry Run |
+| **macOS (`arm64` / `x86_64`)** | Destekleniyor | Çapraz platform canlı ANSI terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`) + CLI araçları | `ps` / `sysctl` / `vm_stat` / `lsof` port ve CWD tarama, `kqueue` çökme izleyici, Docker Unix soketi, `~/Library/LaunchAgents` (`--autostart`) |
+| **Linux (`x86_64`)** | Destekleniyor | Çapraz platform canlı ANSI terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`) + CLI araçları | `/proc` CPU/RAM/CMD/CWD ve `lsof` port tarama, Docker soketi, XDG `.desktop` başlangıç (`--autostart`) |
 
 ---
 
 ## Derleme ve Çalıştırma
 
-**Ön koşullar:** Rust toolchain (`stable`). Harici Node/Electron veya ek çalışma zamanı gerekmez; Windows'ta `build.rs` gömülü **`bb`** `.ico` ve Win32 kaynağını doğrudan üretir.
+**Ön koşullar:** Rust toolchain (`>= 1.88`). Harici Node/Electron veya ek çalışma zamanı gerekmez; Windows'ta `build.rs` gömülü **`bb`** `.ico` ve Win32 kaynağını doğrudan üretir.
 
 ### Windows
 
 ```powershell
 # Clippy denetimi ve tüm birim testleri
-cargo clippy --all-targets -- -D warnings
-cargo test --no-fail-fast
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features --no-fail-fast
 
 # Release ikilisini derle (target\release\bbstats.exe)
-cargo build --release
+cargo build --release --locked
 ```
 
-### macOS (`arm64` / `x86_64`)
+### macOS & Linux
 
 ```bash
 # Clippy denetimi ve tüm birim testleri
-cargo clippy --all-targets -- -D warnings
-cargo test --no-fail-fast
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features --no-fail-fast
 
-# Canlı Dynamic Island terminal HUD'unu derle ve çalıştır
+# Canlı ANSI terminal HUD'unu derle ve çalıştır
 cargo run --release -- --watch
 
-# Tek seferlik özet tablosu veya düz metin çıktısı al
+# Tek seferlik özet, daemon veya başlangıçta otomatik başlatma
 ./target/release/bbstats --status
-./target/release/bbstats --dump-snapshot
+./target/release/bbstats --daemon
+./target/release/bbstats --autostart on
 ```
 
 ---
 
-## CLI Tanı ve Ekran Görüntüsü Bayrakları
+## Geliştirici CLI Komutları ve Tanı Bayrakları
 
-Çalışan örneği etkilemeden komut satırından anlık durum veya görsel çıktı almak için:
+Çalışan masaüstü kapsülünü etkilemeden komut çalıştırabilir, portları inceleyebilir veya proje işlerini doğrudan başlatabilirsiniz:
 
 ```powershell
-# Sürüm bilgisini veya CLI bayraklarını yazdır (Windows & macOS)
-bbstats --version
-bbstats --help
+# Mevcut ortam değişkenlerini koruyarak ve canlı çıktıyı akıtarak komut çalıştır
+bbstats run -- npm run dev
+bbstats run --cwd ./api -- cargo run
 
-# Algılanan canlı projeleri, işleri, portları ve son logları stdout'a bas (Windows & macOS)
+# Belirtilen portu dinleyen proje, iş, PID ve komutu göster (isteğe bağlı güvenli sonlandır)
+bbstats port 3000
+bbstats port 3000 --kill
+
+# bbstats.toml, Procfile veya package.json script'lerinden işleri listele veya başlat
+bbstats launch --list
+bbstats launch ./projem
+
+# Algılanan canlı projeleri, işleri, portları ve son logları stdout'a bas
 bbstats --dump-snapshot
 
-# Biçimlendirilmiş tek seferlik HUD tablosu veya arkaplan LaunchAgent daemon modu (macOS)
+# Tek seferlik HUD tablosu, daemon veya login başlangıç ayarı (macOS & Linux)
 bbstats --status
 bbstats --daemon
+bbstats --autostart on
+
+# Sürüm bilgisini veya CLI yardımını yazdır
+bbstats --version
+bbstats --help
 
 # Kişisel veri içermeyen deterministik demo ekran görüntülerini üret (--lang tr | en, Windows)
 cargo run --features screenshots -- --dump-shot out\shots --lang tr
@@ -150,6 +182,7 @@ cargo run --features screenshots -- --dump-shot out\shots --live
 ### `config.toml`
 - **Windows:** `%APPDATA%\bbstats\config.toml`
 - **macOS:** `~/Library/Application Support/bbstats/config.toml`
+- **Linux:** `~/.config/bbstats/config.toml`
 
 Uygulama içi **Ayarlar** ekranından (Windows) veya doğrudan TOML dosyasından düzenlenebilir:
 
@@ -165,7 +198,7 @@ hide_on_fullscreen = true
 notify_on_crash = true
 hover_peek_delay_ms = 190
 autostart = false
-hotkey = "alt_space"            # "alt_space" | "ctrl_shift_p"
+hotkey = "alt_shift_b"          # "alt_shift_b" | "ctrl_alt_b" | "alt_space" | "ctrl_shift_p" | "disabled"
 sort_mode = "custom"            # "custom" | "cpu" | "ram" | "name" | "uptime"
 pinned_projects = []
 hidden_projects = []
@@ -174,6 +207,7 @@ hidden_projects = []
 ### Özel Proje Kuralları (`labels.toml`)
 - **Windows:** `%APPDATA%\bbstats\labels.toml`
 - **macOS:** `~/Library/Application Support/bbstats/labels.toml`
+- **Linux:** `~/.config/bbstats/labels.toml`
 
 Özel proje adlandırma, `pid_file` durum dosyası bağlama, dizin tarama (`scan_dir`), Görev Zamanlayıcı / LaunchAgent izleme (`scheduled_task`) ve sınırlı `auto_restart` kuralları için [`assets/labels.example.toml`](assets/labels.example.toml) şablonunu kullanabilirsiniz.
 
@@ -181,11 +215,13 @@ hidden_projects = []
 
 ## Klavye ve Fare Kısayolları
 
+*(Overlay içi klavye kısayolları yalnızca kapsül kısayol veya tıklamayla odaklandığında etkindir; IDE veya terminal kısayollarınızı ezmez.)*
+
 | Kısayol / Eylem | İşlev |
 |---|---|
-| `Alt+Space` / `Ctrl+Shift+P` | Dynamic Island panelini aç / daralt (Ayarlar'dan değiştirilebilir) |
-| `↑` / `↓` + `Enter` veya `→` | İş satırlarında gezin / Detay görünümünü aç |
-| `Esc` / `←` | Aramayı temizle / Üst görünüme dön / Daralt |
+| `Alt+Shift+B` *(varsayılan)* | Dynamic Island panelini aç / daralt (Ayarlar'dan değiştirilebilir: `Ctrl+Alt+B`, `Alt+Space`, `Ctrl+Shift+P`, `Devre Dışı`) |
+| `↑` / `↓` + `Enter` veya `→` | İş satırlarında gezin / Detay görünümünü aç (`Enter` açık öldürme onayını da onaylar) |
+| `Esc` / `←` / `Backspace` *(Detay/Ayarlar)* | Aramayı temizle / Üst görünüme dön / Daralt |
 | `/` | Arama kutusuna odaklan |
 | `Alt+P` / `Alt+K` | Seçili projeyi sabitle / Seçili işi durdurmak için onay iste |
 | `Delete` (satır seçiliyken) | Seçili işi durdurmak için onay iste |
@@ -201,16 +237,12 @@ hidden_projects = []
 - `src/engine/` — Tek arka plan iş parçacığında periyodik tarama (`collector`, `win_nt`), proje/iş çözümleme (`project_resolver/`), kullanıcı kuralları (`labels`, `known_jobs`), snapshot üretimi (`snapshot`), terminal çıktı takibi (`terminal`) ve güvenli sonlandırma/yeniden başlatma (`actions`).
 - `src/render/` — Direct3D11 + Direct2D1 + DirectWrite + WinRT Composition boru hattı, tema sabitleri (`theme`), cam/Bezier çizim yardımcıları (`primitives`) ve başsız PNG dışa aktarma (`shot`).
 - `src/ui/` — Kritik sönümlü yay animasyonları (`spring`), görünüm boyutlandırma/basamaklama (`layout`), tıklama haritası (`hit_test`) ve arayüz görünümleri (`views/`).
+- `src/cli.rs` — Geliştirici CLI komutları (`run`, `port`, `launch`).
 
 ---
 
-## Katkıda Bulunma ve Lisans
+## Katkıda Bulunma, Güvenlik ve Lisans
 
-Windows ve macOS platformlarında doğal telemetri, Notch HUD iyileştirmeleri, çözümleyici kurallar ve dil desteği konularındaki tüm katkılar memnuniyetle karşılanır. Değişiklik sonrası şu kontrolleri doğrulayarak PR açabilirsiniz:
-
-```powershell
-cargo clippy --all-targets -- -D warnings
-cargo test --no-fail-fast
-```
+Windows, macOS ve Linux platformlarındaki tüm katkılar memnuniyetle karşılanır! Katkı adımları için [`CONTRIBUTING.md`](CONTRIBUTING.md), gizlilik ve güvenlik bildirimi için [`SECURITY.md`](SECURITY.md) dosyalarına göz atabilirsiniz.
 
 Sürüm geçmişi için [`CHANGELOG.md`](CHANGELOG.md) dosyasına bakabilirsiniz. [MIT Lisansı](LICENSE) altında açık kaynaklıdır.

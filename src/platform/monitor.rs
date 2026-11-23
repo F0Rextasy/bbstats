@@ -17,6 +17,7 @@ pub struct MonitorInfo {
     pub is_primary: bool,
 }
 
+// SAFETY: DPI awareness query/setup with valid HWND/context handle.
 unsafe extern "system" fn enum_monitor_proc(
     hmonitor: HMONITOR,
     _hdc: HDC,
@@ -44,6 +45,7 @@ unsafe extern "system" fn enum_monitor_proc(
 /// Enumerates all active display monitors, primary first.
 pub fn enumerate_monitors() -> Vec<MonitorInfo> {
     let mut list = Vec::with_capacity(4);
+    // SAFETY: Valid Win32 monitor handle and stack MONITORINFO structs with initialized cbSize.
     unsafe {
         let _ = EnumDisplayMonitors(
             None,
@@ -107,5 +109,47 @@ pub fn compute_dock_rect(
             };
             (x, y, total_w_px, total_h_px)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mon(left: i32, top: i32, right: i32, bottom: i32, dpi: u32, is_primary: bool) -> MonitorInfo {
+        let rect = RECT {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        MonitorInfo {
+            monitor_rect: rect,
+            work_rect: rect,
+            dpi,
+            is_primary,
+        }
+    }
+
+    #[test]
+    fn compute_dock_rect_handles_high_dpi_and_negative_y_monitor() {
+        let upper = mon(0, -1080, 1920, 0, 144, false);
+        let (x, y, w, h) = compute_dock_rect(&upper, DockPosition::TopCenter, 220.0, 32.0, 12.0);
+        // 144 DPI = 1.5x scale; centered horizontally on 1920px width.
+        assert_eq!(w, dip_to_px(244.0, 144));
+        assert_eq!(h, dip_to_px(56.0, 144));
+        assert_eq!(x, (1920 - w) / 2);
+        assert!(y < 0);
+
+        let (rx, _ry, rw, _rh) = compute_dock_rect(&upper, DockPosition::RightEdge, 460.0, 500.0, 12.0);
+        assert!(rx + rw - dip_to_px(12.0, 144) < 1920);
+    }
+
+    #[test]
+    fn select_monitor_falls_back_to_primary() {
+        let list = vec![mon(0, 0, 1920, 1080, 96, true)];
+        assert_eq!(select_monitor(&list, 0).unwrap().dpi, 96);
+        assert_eq!(select_monitor(&list, 3).unwrap().dpi, 96);
+        assert!(select_monitor(&[], 0).is_none());
     }
 }

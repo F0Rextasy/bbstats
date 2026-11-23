@@ -31,16 +31,33 @@ pub enum DockPosition {
 #[serde(rename_all = "snake_case")]
 pub enum HotkeyPreset {
     #[default]
+    AltShiftB,
+    CtrlAltB,
     AltSpace,
     CtrlShiftP,
+    Disabled,
 }
 
 impl HotkeyPreset {
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Language) -> &'static str {
         match self {
+            Self::AltShiftB => "Alt + Shift + B",
+            Self::CtrlAltB => "Ctrl + Alt + B",
             Self::AltSpace => "Alt + Space",
             Self::CtrlShiftP => "Ctrl + Shift + P",
+            Self::Disabled => lang.pick("Disabled", "Kapalı"),
+        }
+    }
+
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn next(self) -> Self {
+        match self {
+            Self::AltShiftB => Self::CtrlAltB,
+            Self::CtrlAltB => Self::AltSpace,
+            Self::AltSpace => Self::CtrlShiftP,
+            Self::CtrlShiftP => Self::Disabled,
+            Self::Disabled => Self::AltShiftB,
         }
     }
 }
@@ -95,7 +112,7 @@ impl Default for AppConfig {
             notify_on_crash: true,
             hover_peek_delay_ms: 190,
             autostart: false,
-            hotkey: HotkeyPreset::AltSpace,
+            hotkey: HotkeyPreset::AltShiftB,
             collapsed_poll_ms: 2500,
             expanded_poll_ms: 600,
             sort_mode: SortMode::Custom,
@@ -191,12 +208,33 @@ impl AppConfig {
             },
             _ => Self::default(),
         };
-        cfg.idle_opacity = cfg.idle_opacity.clamp(0.0, 0.95);
-        cfg.glass_opacity = cfg.glass_opacity.clamp(0.25, 0.98);
+        let def = Self::default();
+        cfg.idle_opacity = if cfg.idle_opacity.is_finite() {
+            cfg.idle_opacity.clamp(0.0, 0.95)
+        } else {
+            def.idle_opacity
+        };
+        cfg.glass_opacity = if cfg.glass_opacity.is_finite() {
+            cfg.glass_opacity.clamp(0.25, 0.98)
+        } else {
+            def.glass_opacity
+        };
         cfg.hover_peek_delay_ms = cfg.hover_peek_delay_ms.clamp(80, 600);
         cfg.collapsed_poll_ms = cfg.collapsed_poll_ms.clamp(500, 30_000);
         cfg.expanded_poll_ms = cfg.expanded_poll_ms.clamp(250, 10_000);
         cfg
+    }
+
+    pub fn to_sync_cmd(&self) -> crate::model::EngineCmd {
+        crate::model::EngineCmd::SyncConfigState {
+            pinned_projects: self.pinned_projects.clone(),
+            hidden_projects: self.hidden_projects.clone(),
+            project_aliases: self.project_aliases.clone(),
+            project_order: self.project_order.clone(),
+            job_order: self.job_order.clone(),
+            sort_mode: self.sort_mode,
+            language: self.language,
+        }
     }
 
     /// Atomically writes config to `AppConfig::config_path()`, refusing to overwrite a corrupt file on disk.
@@ -242,6 +280,7 @@ impl AppConfig {
                 .chain(std::iter::once(0))
                 .collect();
 
+            // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
             unsafe {
                 MoveFileExW(
                     PCWSTR(src_wide.as_ptr()),
@@ -313,6 +352,14 @@ mod tests {
         // Refusing to overwrite preserves the user's broken file until fixed.
         assert!(loaded.save_to_path(&cfg_path).is_err());
         assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), bad_toml);
+
+        // NaN opacities must fall back to finite defaults rather than poisoning render math.
+        let nan_path = dir.join("nan.toml");
+        std::fs::write(&nan_path, "idle_opacity = nan\nglass_opacity = inf\n").unwrap();
+        let nan_cfg = AppConfig::load_from_path(&nan_path);
+        assert!(nan_cfg.idle_opacity.is_finite());
+        assert!(nan_cfg.glass_opacity.is_finite());
+        assert_eq!(nan_cfg.hotkey, HotkeyPreset::AltShiftB);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

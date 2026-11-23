@@ -221,7 +221,8 @@ pub fn render_ui(
                 };
                 let off_x = anchor_x(cfg.dock_position, w, pw * fit_s);
                 let mut dummy_hits = HitMap::default();
-                state.content_enter_t = 1.0;
+                let mut prev_state = state.clone();
+                prev_state.content_enter_t = 1.0;
                 ctx.with_transformed_layer(off_x, 0.0, fit_s, fit_s, out_a, || {
                     render_mode_content(
                         ctx,
@@ -229,7 +230,7 @@ pub fn render_ui(
                         pw,
                         ph,
                         prev_mode,
-                        state,
+                        &mut prev_state,
                         snap,
                         cfg,
                         monitors,
@@ -264,6 +265,7 @@ pub fn render_ui(
                         hit_map,
                     )
                 })?;
+                hit_map.transform(off_x, 0.0, fit_s);
             }
         } else {
             let cur_mode = state.mode.clone();

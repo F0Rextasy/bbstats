@@ -9,6 +9,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::io::FromRawHandle;
@@ -36,8 +37,8 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Pipes::CreatePipe;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::{
-    CreateProcessW, CREATE_NO_WINDOW, CREATE_NEW_PROCESS_GROUP, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 use crate::engine::labels::LabelRule;
@@ -81,7 +82,7 @@ impl OutputRing {
 #[derive(Default)]
 pub struct ManagedJobStore {
     rings: Mutex<HashMap<u32, Arc<Mutex<OutputRing>>>>,
-    exited_codes: Arc<Mutex<HashMap<u32, i32>>>,
+    exited_codes: Arc<Mutex<VecDeque<(u32, i32, Instant)>>>,
 }
 
 impl ManagedJobStore {
@@ -90,13 +91,31 @@ impl ManagedJobStore {
     }
 
     pub fn take_exit_code(&self, pid: u32) -> Option<i32> {
-        self.exited_codes.lock().ok()?.remove(&pid)
+        let mut q = self.exited_codes.lock().ok()?;
+        let now = Instant::now();
+        // Prune stale exit codes older than 30s to prevent PID-reuse cross-matching.
+        while let Some((_, _, ts)) = q.front() {
+            if now.saturating_duration_since(*ts) > Duration::from_secs(30) {
+                q.pop_front();
+            } else {
+                break;
+            }
+        }
+        let pos = q.iter().rposition(|(p, _, _)| *p == pid)?;
+        q.remove(pos).map(|(_, code, _)| code)
     }
 
-    /// Launches a custom command detached with combined stdout/stderr
-    /// streamed into an 8 KB ring buffer until the child exits.
+    /// Launches a command detached with optional extra environment variables.
+    /// When `use_shell` is `false` on Unix, parses `argv` and executes directly without `/bin/sh -c`
+    /// to prevent shell injection and preserve spaces in paths.
     #[cfg(target_os = "windows")]
-    pub fn spawn_with_capture(&self, cmdline: &str, working_dir: &Path) -> Result<u32, String> {
+    pub fn spawn_with_capture_env(
+        &self,
+        cmdline: &str,
+        working_dir: &Path,
+        extra_env: &[(String, String)],
+        use_shell: bool,
+    ) -> Result<u32, String> {
         let sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
@@ -105,6 +124,7 @@ impl ManagedJobStore {
 
         let mut read_pipe = HANDLE::default();
         let mut write_pipe = HANDLE::default();
+        // SAFETY: Valid pointers to stack HANDLEs and SECURITY_ATTRIBUTES.
         unsafe {
             CreatePipe(&mut read_pipe, &mut write_pipe, Some(&sa), 4096)
                 .map_err(|e| format!("CreatePipe failed: {e}"))?;
@@ -116,6 +136,7 @@ impl ManagedJobStore {
         }
 
         let nul_wide: Vec<u16> = "\\\\.\\NUL\0".encode_utf16().collect();
+        // SAFETY: Valid NUL-terminated UTF-16 path and SECURITY_ATTRIBUTES.
         let nul_in = unsafe {
             CreateFileW(
                 PCWSTR(nul_wide.as_ptr()),
@@ -129,13 +150,34 @@ impl ManagedJobStore {
             .unwrap_or(INVALID_HANDLE_VALUE)
         };
 
-        let mut cmd_wide: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+        let effective_cmd = if use_shell || needs_windows_cmd_wrapper(cmdline) {
+            format!("cmd.exe /D /C {cmdline}")
+        } else {
+            cmdline.to_string()
+        };
+        let mut cmd_wide: Vec<u16> = effective_cmd
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let dir_wide: Vec<u16> = working_dir
             .as_os_str()
             .to_string_lossy()
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
+
+        let env_block: Option<Vec<u16>> = if extra_env.is_empty() {
+            None
+        } else {
+            Some(build_windows_env_block(extra_env))
+        };
+        let mut flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+        let env_ptr = if let Some(ref block) = env_block {
+            flags |= CREATE_UNICODE_ENVIRONMENT;
+            Some(block.as_ptr() as *const core::ffi::c_void)
+        } else {
+            None
+        };
 
         let si = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -147,6 +189,7 @@ impl ManagedJobStore {
         };
         let mut pi = PROCESS_INFORMATION::default();
 
+        // SAFETY: `cmd_wide`, `dir_wide`, and optional `env_block` stay alive across the call.
         let created = unsafe {
             CreateProcessW(
                 PCWSTR::null(),
@@ -154,8 +197,8 @@ impl ManagedJobStore {
                 None,
                 None,
                 true,
-                CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-                None,
+                flags,
+                env_ptr,
                 PCWSTR(dir_wide.as_ptr()),
                 &si,
                 &mut pi,
@@ -163,6 +206,7 @@ impl ManagedJobStore {
         };
 
         // Close parent's write end and NUL stdin immediately so ReadFile returns EOF when child exits.
+        // SAFETY: `write_pipe` and `nul_in` are owned handles created above.
         unsafe {
             let _ = CloseHandle(write_pipe);
             if nul_in != INVALID_HANDLE_VALUE && !nul_in.is_invalid() {
@@ -171,6 +215,7 @@ impl ManagedJobStore {
         }
 
         if let Err(err) = created {
+            // SAFETY: `read_pipe` is an owned handle created above.
             unsafe {
                 let _ = CloseHandle(read_pipe);
             }
@@ -178,6 +223,7 @@ impl ManagedJobStore {
         }
 
         let pid = pi.dwProcessId;
+        // SAFETY: Process/thread handles returned by CreateProcessW are owned.
         unsafe {
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);
@@ -188,6 +234,7 @@ impl ManagedJobStore {
         let spawned = thread::Builder::new()
             .name(format!("bbstats-pipe-{pid}"))
             .spawn(move || {
+                // SAFETY: `pipe_raw` transfers exclusive ownership of `read_pipe` to `File`.
                 let mut pipe_file = unsafe { File::from_raw_handle(pipe_raw as *mut core::ffi::c_void) };
                 let mut chunk = [0u8; 1024];
                 loop {
@@ -202,6 +249,10 @@ impl ManagedJobStore {
                 }
             });
         if let Err(err) = spawned {
+            if let Ok(mut map) = self.rings.lock() {
+                map.remove(&pid);
+            }
+            // SAFETY: Thread spawn failed, so `read_pipe` ownership was not transferred.
             unsafe {
                 let _ = CloseHandle(read_pipe);
             }
@@ -211,20 +262,41 @@ impl ManagedJobStore {
         Ok(pid)
     }
 
-    /// Launches a POSIX shell command detached with stdout/stderr streamed into an 8 KB ring buffer.
+    /// Launches a POSIX command detached with stdout/stderr streamed into an 8 KB ring buffer.
     #[cfg(not(target_os = "windows"))]
-    pub fn spawn_with_capture(&self, cmdline: &str, working_dir: &Path) -> Result<u32, String> {
+    pub fn spawn_with_capture_env(
+        &self,
+        cmdline: &str,
+        working_dir: &Path,
+        extra_env: &[(String, String)],
+        use_shell: bool,
+    ) -> Result<u32, String> {
+        use std::os::unix::process::ExitStatusExt;
         use std::process::{Command, Stdio};
 
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(cmdline)
-            .current_dir(working_dir)
+        let mut cmd = if use_shell {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c").arg(cmdline);
+            c
+        } else {
+            let argv = crate::engine::project_resolver::split_cmdline_args(cmdline);
+            if argv.is_empty() {
+                return Err("empty command".to_string());
+            }
+            let mut c = Command::new(&argv[0]);
+            if argv.len() > 1 {
+                c.args(&argv[1..]);
+            }
+            c
+        };
+        cmd.current_dir(working_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn failed: {e}"))?;
+            .stderr(Stdio::piped());
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
 
         let pid = child.id();
         let ring = self.register_ring(pid);
@@ -266,12 +338,15 @@ impl ManagedJobStore {
             .name(format!("bbstats-wait-{pid}"))
             .spawn(move || {
                 if let Ok(status) = child.wait() {
-                    let code = status.code().unwrap_or(1);
-                    if let Ok(mut map) = exited.lock() {
-                        if map.len() > 64 {
-                            map.clear();
+                    let code = status
+                        .code()
+                        .or_else(|| status.signal().map(|s| 128 + s))
+                        .unwrap_or(1);
+                    if let Ok(mut q) = exited.lock() {
+                        if q.len() >= 64 {
+                            q.pop_front();
                         }
-                        map.insert(pid, code);
+                        q.push_back((pid, code, Instant::now()));
                     }
                 }
             });
@@ -291,20 +366,59 @@ impl ManagedJobStore {
         ring
     }
 
-    pub fn read_lines_for_pids(&self, pids: &[u32], max_lines: usize) -> Option<Vec<String>> {
+    pub fn read_lines_for_pids(&self, pids: &[u32], max_lines: usize) -> Option<(u32, Vec<String>)> {
         let map = self.rings.lock().ok()?;
         for &pid in pids {
             if let Some(ring) = map.get(&pid) {
                 if let Ok(g) = ring.lock() {
                     let lines = g.tail_lines(max_lines);
                     if !lines.is_empty() {
-                        return Some(lines);
+                        return Some((pid, lines));
                     }
                 }
             }
         }
         None
     }
+}
+
+#[cfg(target_os = "windows")]
+fn needs_windows_cmd_wrapper(cmdline: &str) -> bool {
+    let args = crate::engine::project_resolver::split_cmdline_args(cmdline);
+    let Some(first) = args.first() else {
+        return false;
+    };
+    let low = first.to_ascii_lowercase();
+    let leaf = low.rsplit(['/', '\\']).next().unwrap_or(&low);
+    if leaf == "cmd" || leaf == "cmd.exe" {
+        return false;
+    }
+    leaf.ends_with(".cmd")
+        || leaf.ends_with(".bat")
+        || matches!(leaf, "npm" | "npx" | "pnpm" | "pnpx" | "yarn" | "yarnpkg" | "corepack")
+}
+
+#[cfg(target_os = "windows")]
+fn build_windows_env_block(extra_env: &[(String, String)]) -> Vec<u16> {
+    let mut merged: std::collections::BTreeMap<String, (String, String)> =
+        std::collections::BTreeMap::new();
+    for (k, v) in std::env::vars() {
+        merged.insert(k.to_ascii_uppercase(), (k, v));
+    }
+    for (k, v) in extra_env {
+        if !k.is_empty() && !k.contains('=') && !k.contains('\0') && !v.contains('\0') {
+            merged.insert(k.to_ascii_uppercase(), (k.clone(), v.clone()));
+        }
+    }
+    let mut block: Vec<u16> = Vec::with_capacity(4096);
+    for (_, (k, v)) in merged {
+        block.extend(k.encode_utf16());
+        block.push(b'=' as u16);
+        block.extend(v.encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 /// Resolves terminal output lazily ONLY for the active inspected project/job.
@@ -317,12 +431,12 @@ pub fn inspect_terminal_output(
     managed: &ManagedJobStore,
 ) -> TerminalOutput {
     if !pids.is_empty() {
-        if let Some(lines) = managed.read_lines_for_pids(pids, MAX_TAIL_LINES) {
+        if let Some((matched_pid, lines)) = managed.read_lines_for_pids(pids, MAX_TAIL_LINES) {
             return TerminalOutput {
                 project_id: project_id.clone(),
                 job_id: job_id.cloned(),
                 source_kind: TerminalSourceKind::ManagedPipe,
-                source_hint: Some(format!("PID {}", pids[0])),
+                source_hint: Some(format!("PID {matched_pid}")),
                 lines,
             };
         }
@@ -500,28 +614,24 @@ fn read_state_json_logs(path: &Path, max_lines: usize) -> Option<Vec<String>> {
 }
 
 #[cfg(target_os = "windows")]
-static CONSOLE_CTRL_GUARD: std::sync::Once = std::sync::Once::new();
+static CONSOLE_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(target_os = "windows")]
+// SAFETY: Best-effort attachment to parent console before CLI stdout/stderr output.
 unsafe extern "system" fn ignore_console_ctrl(_ctrl_type: u32) -> BOOL {
     BOOL(1)
-}
-
-#[cfg(target_os = "windows")]
-fn ensure_console_ctrl_guard() {
-    CONSOLE_CTRL_GUARD.call_once(|| unsafe {
-        let _ = SetConsoleCtrlHandler(Some(ignore_console_ctrl), true);
-    });
 }
 
 /// Briefly attaches to `pid`'s classic conhost console on Windows, reads recent rows, and detaches.
 #[cfg(target_os = "windows")]
 fn read_console_buffer_lines(pid: u32, max_lines: usize) -> Option<Vec<String>> {
-    ensure_console_ctrl_guard();
+    let _guard = CONSOLE_LOCK.lock().ok()?;
+    // SAFETY: Serialized by `CONSOLE_LOCK`; Ctrl handler is installed only for the brief attach window.
     unsafe {
         if AttachConsole(pid).is_err() {
             return None;
         }
+        let _ = SetConsoleCtrlHandler(Some(ignore_console_ctrl), true);
         let result = (|| {
             let h_out = GetStdHandle(STD_OUTPUT_HANDLE).ok()?;
             if h_out == INVALID_HANDLE_VALUE || h_out.0.is_null() {
@@ -561,6 +671,7 @@ fn read_console_buffer_lines(pid: u32, max_lines: usize) -> Option<Vec<String>> 
             Some(lines)
         })();
         let _ = FreeConsole();
+        let _ = SetConsoleCtrlHandler(Some(ignore_console_ctrl), false);
         result
     }
 }
@@ -610,6 +721,13 @@ pub fn strip_ansi(input: &str) -> String {
                             break;
                         }
                     }
+                }
+                Some('(' | ')' | '*' | '+') => {
+                    chars.next();
+                    let _ = chars.next();
+                }
+                Some('=' | '>' | '7' | '8' | 'c' | 'M') => {
+                    chars.next();
                 }
                 _ => {}
             }

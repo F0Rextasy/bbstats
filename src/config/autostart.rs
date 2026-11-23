@@ -4,7 +4,7 @@
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use windows::core::{PCWSTR, PWSTR};
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
@@ -22,6 +22,7 @@ mod imp {
         let subkey = to_wide(RUN_SUBKEY);
         let value = to_wide(VALUE_NAME);
         let mut hkey = HKEY::default();
+        // SAFETY: Registry HKEY is opened/closed within scope with NUL-terminated UTF-16 names and exact byte buffers.
         unsafe {
             let res = RegOpenKeyExW(
                 HKEY_CURRENT_USER,
@@ -50,6 +51,7 @@ mod imp {
         let subkey = to_wide(RUN_SUBKEY);
         let value = to_wide(VALUE_NAME);
         let mut hkey = HKEY::default();
+        // SAFETY: Registry HKEY is opened/closed within scope with NUL-terminated UTF-16 names and exact byte buffers.
         unsafe {
             let res = RegOpenKeyExW(
                 HKEY_CURRENT_USER,
@@ -86,7 +88,6 @@ mod imp {
             if op_result != ERROR_SUCCESS {
                 return Err(format!("Registry operation failed: {:?}", op_result));
             }
-            let _ = PWSTR::null();
         }
         Ok(())
     }
@@ -109,8 +110,9 @@ mod imp {
         );
         #[cfg(not(target_os = "macos"))]
         return Some(
-            PathBuf::from(home)
-                .join(".config")
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(home).join(".config"))
                 .join("autostart")
                 .join("bbstats.desktop"),
         );
@@ -168,7 +170,7 @@ mod imp {
             );
             #[cfg(not(target_os = "macos"))]
             let body = format!(
-                "[Desktop Entry]\nType=Application\nName=bbstats\nExec=\"{}\"\nX-GNOME-Autostart-enabled=true\n",
+                "[Desktop Entry]\nType=Application\nName=bbstats\nExec=\"{}\" --daemon\nX-GNOME-Autostart-enabled=true\n",
                 exe.display()
             );
             std::fs::write(&path, body).map_err(|e| format!("write autostart failed: {e}"))

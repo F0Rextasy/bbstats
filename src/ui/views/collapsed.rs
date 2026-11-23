@@ -214,9 +214,16 @@ pub(super) fn render_collapsed_vertical_rail<F: FnMut() -> u32>(
     hit_map: &mut HitMap,
     next_id: &mut F,
 ) -> windows::core::Result<()> {
-    let dot_col = if crashed_count > 0 || active_alert.is_some() {
+    let dot_col = if crashed_count > 0
+        || active_alert.is_some_and(|a| matches!(a.kind, crate::model::AlertKind::Crash { .. }))
+    {
         ACCENT_DANGER
-    } else if snap.projects.iter().any(|p| p.status == ProjectStatus::HighLoad) {
+    } else if active_alert.is_some()
+        || snap
+            .projects
+            .iter()
+            .any(|p| p.status == ProjectStatus::HighLoad)
+    {
         ACCENT_WARN
     } else if snap.total_jobs > 0 {
         ACCENT_LIVE
@@ -224,8 +231,14 @@ pub(super) fn render_collapsed_vertical_rail<F: FnMut() -> u32>(
         TEXT_MUTED
     };
 
-    // Top: live status orb + active job count + project swatches
+    // Top: live status orb + optional alert dismiss chip + active job count + project swatches
     ctx.draw_status_dot(w * 0.5, 16.0, 4.0, dot_col, snap.total_jobs > 0 || active_alert.is_some())?;
+    if let Some(alert) = active_alert {
+        let dismiss_r = rect(w - 16.0, 2.0, w - 2.0, 14.0);
+        ctx.fill_rounded(dismiss_r, 4.0, BG_ELEVATED)?;
+        ctx.draw_text("×", &fonts.micro_lbl, dismiss_r, TEXT_SECONDARY, false)?;
+        hit_map.push(next_id(), dismiss_r, HitAction::DismissAlert(alert.id));
+    }
     ctx.draw_text_hud(
         &format!("{}", snap.total_jobs),
         &fonts.title_center,

@@ -3,19 +3,36 @@
   <h1>bbstats</h1>
   <p><strong>Dynamic Island background process &amp; developer project telemetry monitor</strong></p>
   <p>
-    <strong>English</strong> · <a href="README.tr.md">Türkçe</a> · <a href="CHANGELOG.md">Changelog</a>
+    <strong>English</strong> · <a href="README.tr.md">Türkçe</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="SECURITY.md">Security</a> · <a href="CONTRIBUTING.md">Contributing</a>
   </p>
   <p>
-    <img src="https://img.shields.io/badge/Rust-2021-orange?logo=rust" alt="Rust 2021" />
+    <img src="https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust" alt="Rust 1.88+" />
     <img src="https://img.shields.io/badge/Windows-10%2F11%20Native-0A84FF?logo=windows" alt="Windows 10/11" />
-    <img src="https://img.shields.io/badge/macOS-Apple%20Silicon%20%26%20Intel-34D399?logo=apple" alt="macOS Supported" />
+    <img src="https://img.shields.io/badge/macOS-arm64%20%26%20x86__64-34D399?logo=apple" alt="macOS Supported" />
+    <img src="https://img.shields.io/badge/Linux-Terminal%20HUD-34D399?logo=linux" alt="Linux Supported" />
     <img src="https://img.shields.io/badge/License-MIT-34D399" alt="MIT License" />
   </p>
 </div>
 
 ---
 
-**bbstats** is a lightweight, zero-runtime-dependency Dynamic Island overlay for developers. Instead of drowning you in hundreds of raw OS PIDs like Task Manager or Activity Monitor, it groups your active servers, workers, containers, and scheduled jobs by **project** and **logical workload**—showing live CPU/RAM curves, bound ports, log streams, crash alerts, and one-click safe controls.
+**bbstats** is a lightweight, **100% local (zero telemetry, zero cloud connections)** Dynamic Island overlay and developer process monitor with zero runtime dependencies. Instead of drowning you in hundreds of raw OS PIDs like Task Manager or Activity Monitor, it groups your active servers, workers, containers, and scheduled jobs by **project** and **logical workload**—showing live CPU/RAM curves, bound ports, log streams, crash alerts, and one-click safe controls.
+
+> **100% Local & Privacy-First:** `bbstats` never phones home, sends analytics, or uploads snapshots. All inspection stays on your machine (Docker queries use only the local pipe/socket when Docker is running).
+
+## Download & Install
+
+### Prebuilt Binaries (GitHub Releases)
+
+Download the latest archive for **Windows (`x86_64`)**, **macOS (`arm64` / `x86_64`)**, or **Linux (`x86_64`)** from [GitHub Releases](https://github.com/F0Rextasy/bbstats/releases). Every release ships with `SHA256SUMS.txt` and GitHub build-provenance attestations (`gh attestation verify`).
+
+> **Windows SmartScreen Note:** Release binaries are currently unsigned by an EV/organization certificate, so Windows SmartScreen may show an initial prompt on first launch; verify the archive hash against `SHA256SUMS.txt` before running.
+
+### Install from Source (`cargo`)
+
+```bash
+cargo install --git https://github.com/F0Rextasy/bbstats.git --locked
+```
 
 ## Screenshots
 
@@ -83,58 +100,73 @@
 
 | Platform | Status | Interface & Rendering | Telemetry & Autostart |
 |---|---|---|---|
-| **Windows 10 / 11 (`x86_64`)** | Supported (`v0.2.1`) | Direct3D11 + Direct2D + DirectWrite + WinRT Composition (`WS_EX_TOOLWINDOW`, Acrylic backdrop) | NT PEB inspection, IP Helper TCP/UDP ports, Tray `Shell_NotifyIconW`, Registry Run |
-| **macOS (`arm64` / `x86_64`)** | Supported (`v0.2.1`) | Native ANSI Dynamic Island live terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`, `--dump-snapshot`) | `ps` / `sysctl` / `vm_stat` / `lsof` port & CWD telemetry, `kqueue` exit watcher, `SIGTERM`→`SIGKILL`, Docker Unix socket, `~/Library/LaunchAgents` |
+| **Windows 10 / 11 (`x86_64`)** | Supported | Direct3D11 + Direct2D + DirectWrite + WinRT Composition Dynamic Island overlay (`WS_EX_TOOLWINDOW`, Acrylic backdrop) | NT PEB inspection, IP Helper TCP/UDP ports, Tray `Shell_NotifyIconW`, Registry Run |
+| **macOS (`arm64` / `x86_64`)** | Supported | Cross-platform live ANSI terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`) + CLI tools | `ps` / `sysctl` / `vm_stat` / `lsof` port & CWD telemetry, `kqueue` exit watcher, Docker Unix socket, `~/Library/LaunchAgents` (`--autostart`) |
+| **Linux (`x86_64`)** | Supported | Cross-platform live ANSI terminal HUD (`bbstats`, `--watch`, `--status`, `--daemon`) + CLI tools | `/proc` CPU/RAM/CMD/CWD + `lsof` port telemetry, Docker socket, XDG `.desktop` autostart (`--autostart`) |
 
 ---
 
 ## Build & Run
 
-**Prerequisites:** Rust toolchain (`stable`). No Node/Electron or external runtime required (`build.rs` embeds the **`bb`** `.ico` & Win32 resources on Windows automatically).
+**Prerequisites:** Rust toolchain (`>= 1.88`). No Node/Electron or external runtime required (`build.rs` embeds the **`bb`** `.ico` & Win32 resources on Windows automatically).
 
 ### Windows
 
 ```powershell
 # Run clippy checks & unit tests
-cargo clippy --all-targets -- -D warnings
-cargo test --no-fail-fast
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features --no-fail-fast
 
 # Build optimized release executable (target\release\bbstats.exe)
-cargo build --release
+cargo build --release --locked
 ```
 
-### macOS (`arm64` / `x86_64`)
+### macOS & Linux
 
 ```bash
 # Run clippy checks & unit tests
-cargo clippy --all-targets -- -D warnings
-cargo test --no-fail-fast
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features --no-fail-fast
 
-# Build & run live Dynamic Island terminal HUD
+# Build & run live ANSI terminal HUD
 cargo run --release -- --watch
 
-# Single-shot overview or plain snapshot dump
+# Single-shot overview, headless daemon, or login autostart toggle
 ./target/release/bbstats --status
-./target/release/bbstats --dump-snapshot
+./target/release/bbstats --daemon
+./target/release/bbstats --autostart on
 ```
 
 ---
 
-## CLI Diagnostic & Screenshot Flags
+## Developer CLI Commands & Diagnostic Flags
 
-Without disturbing a running instance, you can inspect telemetry or render showcases directly from the CLI:
+Run commands, inspect occupied ports, launch project job stacks, or inspect snapshots directly from the terminal without disturbing a running desktop overlay:
 
 ```powershell
-# Print version or CLI usage flags (Windows & macOS)
-bbstats --version
-bbstats --help
+# Run a command inheriting your shell environment while streaming live stdout/stderr
+bbstats run -- npm run dev
+bbstats run --cwd ./api -- cargo run
 
-# Print live detected projects, jobs, ports, and last log lines to stdout (Windows & macOS)
+# Find which project, job, PID, and command is listening on a port (and optionally stop it safely)
+bbstats port 3000
+bbstats port 3000 --kill
+
+# Discover and launch jobs from bbstats.toml, Procfile, or package.json scripts
+bbstats launch --list
+bbstats launch ./my-workspace
+
+# Print live detected projects, jobs, ports, and last log lines to stdout
 bbstats --dump-snapshot
 
-# Single-shot formatted HUD table or headless LaunchAgent daemon mode (macOS)
+# Single-shot formatted HUD table, daemon mode, or autostart toggle (macOS & Linux)
 bbstats --status
 bbstats --daemon
+bbstats --autostart on
+
+# Print version or CLI usage flags
+bbstats --version
+bbstats --help
 
 # Render deterministic clean showcase screenshots to out\shots (--lang en | tr, Windows)
 cargo run --features screenshots -- --dump-shot out\shots --lang en
@@ -150,6 +182,7 @@ cargo run --features screenshots -- --dump-shot out\shots --live
 ### `config.toml`
 - **Windows:** `%APPDATA%\bbstats\config.toml`
 - **macOS:** `~/Library/Application Support/bbstats/config.toml`
+- **Linux:** `~/.config/bbstats/config.toml`
 
 Managed via the in-app **Settings** panel (Windows) or directly in TOML:
 
@@ -165,7 +198,7 @@ hide_on_fullscreen = true
 notify_on_crash = true
 hover_peek_delay_ms = 190
 autostart = false
-hotkey = "alt_space"            # "alt_space" | "ctrl_shift_p"
+hotkey = "alt_shift_b"          # "alt_shift_b" | "ctrl_alt_b" | "alt_space" | "ctrl_shift_p" | "disabled"
 sort_mode = "custom"            # "custom" | "cpu" | "ram" | "name" | "uptime"
 pinned_projects = []
 hidden_projects = []
@@ -174,6 +207,7 @@ hidden_projects = []
 ### Custom Project Rules (`labels.toml`)
 - **Windows:** `%APPDATA%\bbstats\labels.toml`
 - **macOS:** `~/Library/Application Support/bbstats/labels.toml`
+- **Linux:** `~/.config/bbstats/labels.toml`
 
 Define custom naming rules, JSON PID/state file bindings (`pid_file`), workspace directory scanners (`scan_dir`), scheduled task / LaunchAgent monitors (`scheduled_task`), and bounded `auto_restart` policies using [`assets/labels.example.toml`](assets/labels.example.toml).
 
@@ -181,11 +215,13 @@ Define custom naming rules, JSON PID/state file bindings (`pid_file`), workspace
 
 ## Keyboard & Mouse Shortcuts
 
+*(Shortcuts inside the Dynamic Island overlay require the panel to be active/focused via global hotkey or click, so they never intercept shortcuts inside your editor or terminal.)*
+
 | Shortcut / Action | Behavior |
 |---|---|
-| `Alt+Space` / `Ctrl+Shift+P` | Toggle Dynamic Island expand / collapse (configurable in Settings) |
-| `↑` / `↓` + `Enter` or `→` | Navigate job rows / Open Detail view |
-| `Esc` / `←` | Clear search / Back to overview / Collapse |
+| `Alt+Shift+B` *(default)* | Toggle Dynamic Island expand / collapse (switchable in Settings: `Ctrl+Alt+B`, `Alt+Space`, `Ctrl+Shift+P`, `Disabled`) |
+| `↑` / `↓` + `Enter` or `→` | Navigate job rows / Open Detail view (`Enter` also confirms an active kill bar) |
+| `Esc` / `←` / `Backspace` *(Detail/Settings)* | Clear search / Back to overview / Collapse |
 | `/` | Focus search bar |
 | `Alt+P` / `Alt+K` | Pin/unpin selected project / Request stop confirmation for selected job |
 | `Delete` (on selected row) | Request stop confirmation for selected job |
@@ -201,16 +237,12 @@ Define custom naming rules, JSON PID/state file bindings (`pid_file`), workspace
 - `src/engine/` — Single background telemetry thread (`collector`, `win_nt`), project & job inference pipeline (`project_resolver/`), user rules & watchers (`labels`, `known_jobs`), snapshot builder (`snapshot`), log tailing (`terminal`), and safe termination/restart (`actions`).
 - `src/render/` — Direct3D11 + Direct2D1 + DirectWrite + WinRT Composition pipeline, theme tokens (`theme`), glass/Bezier primitives (`primitives`), and offscreen PNG exporter (`shot`).
 - `src/ui/` — Critically-damped springs (`spring`), viewport/stagger math (`layout`), hit regions (`hit_test`), and views (`views/`).
+- `src/cli.rs` — Developer CLI subcommands (`run`, `port`, `launch`).
 
 ---
 
-## Contributing & License
+## Contributing, Security & License
 
-Contributions across Windows and macOS (native telemetry, AppKit Notch HUD enhancements, resolvers, and localization) are warmly welcome! Open an issue or PR after verifying:
-
-```powershell
-cargo clippy --all-targets -- -D warnings
-cargo test --no-fail-fast
-```
+Contributions across Windows, macOS, and Linux are warmly welcome! Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a PR, and [`SECURITY.md`](SECURITY.md) for local privacy guarantees and vulnerability reporting.
 
 See the release history in [`CHANGELOG.md`](CHANGELOG.md). Licensed under the [MIT License](LICENSE).

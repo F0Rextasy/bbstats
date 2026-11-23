@@ -29,6 +29,20 @@ impl SpringVal {
     }
 
     fn advance_substeps(&mut self, dt: f32, spec: SpringSpec) {
+        if !dt.is_finite() || !spec.mass.is_finite() || spec.mass <= 0.0 {
+            return;
+        }
+        if !self.value.is_finite() || !self.velocity.is_finite() || !self.target.is_finite() {
+            let safe_target = if self.target.is_finite() {
+                self.target
+            } else {
+                0.0
+            };
+            self.target = safe_target;
+            self.value = safe_target;
+            self.velocity = 0.0;
+            return;
+        }
         let clamped_dt = dt.clamp(0.001, 0.033);
         let sub_dt = clamped_dt * 0.25;
         for _ in 0..4 {
@@ -40,6 +54,17 @@ impl SpringVal {
     }
 
     fn settle_check(&mut self, pos_eps: f32, vel_eps: f32) -> bool {
+        if !self.value.is_finite() || !self.velocity.is_finite() || !self.target.is_finite() {
+            let safe_target = if self.target.is_finite() {
+                self.target
+            } else {
+                0.0
+            };
+            self.target = safe_target;
+            self.value = safe_target;
+            self.velocity = 0.0;
+            return false;
+        }
         if (self.value - self.target).abs() < pos_eps && self.velocity.abs() < vel_eps {
             self.value = self.target;
             self.velocity = 0.0;
@@ -92,5 +117,30 @@ mod tests {
             assert_eq!(close.value, 30.0);
             assert!(csteps <= 45, "collapse steps={csteps} at dt={dt}");
         }
+    }
+
+    #[test]
+    fn spring_step_unit_settles_and_recovers_from_non_finite_state() {
+        let mut s = SpringVal::new(0.0);
+        s.set_target(1.0);
+        let mut active = true;
+        for _ in 0..180 {
+            active = s.step_unit(0.016, SPRING_MORPH);
+            if !active {
+                break;
+            }
+        }
+        assert!(!active);
+        assert_eq!(s.value, 1.0);
+        assert_eq!(s.velocity, 0.0);
+
+        assert!(s.step(f32::NAN, SPRING_MORPH) || !s.step(f32::NAN, SPRING_MORPH));
+        assert!(s.value.is_finite());
+
+        s.value = f32::NAN;
+        s.velocity = f32::INFINITY;
+        assert!(!s.step_unit(0.016, SPRING_MORPH));
+        assert_eq!(s.value, 1.0);
+        assert_eq!(s.velocity, 0.0);
     }
 }

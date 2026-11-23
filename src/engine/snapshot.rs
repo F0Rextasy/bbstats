@@ -217,6 +217,12 @@ pub(super) fn build_snapshot(
             acc.primary_key = proc.key;
             acc.primary_is_wrapper = false;
         }
+        if acc.root.is_none() && meta.project_root.is_some() {
+            acc.root = meta.project_root.clone();
+        }
+        if acc.git_branch.is_none() && meta.git_branch.is_some() {
+            acc.git_branch = meta.git_branch.clone();
+        }
         if acc.log_path.is_none() && meta.log_path.is_some() {
             acc.log_path = meta.log_path.clone();
         }
@@ -256,9 +262,9 @@ pub(super) fn build_snapshot(
     let mut active_job_name_pairs: HashSet<(String, String)> = HashSet::new();
 
     for (_, mut jacc) in job_map {
-        // 8-second debounce for short-lived non-port jobs so CLI flashes never flicker in UI.
+        // 8-second debounce for short-lived non-port, non-watched jobs so CLI flashes never flicker in UI.
         let has_listening_port = jacc.ports.iter().any(|p| p.is_listening);
-        if jacc.uptime < SHORT_JOB_DEBOUNCE_SECS && !has_listening_port {
+        if jacc.uptime < SHORT_JOB_DEBOUNCE_SECS && !has_listening_port && !jacc.is_watched {
             continue;
         }
 
@@ -295,14 +301,17 @@ pub(super) fn build_snapshot(
             (Some((Some(f_line), _)), None) => Some(f_line),
             (_, inline) => inline,
         };
-        let crash_summary = job_crashes.get(&jacc.id).map(|c| {
-            format!(
-                "{} · {} {}",
-                lang.pick("Crashed", "Çöktü"),
-                lang.pick("code", "kod"),
-                c.exit_code
-            )
-        });
+        let crash_summary = job_crashes
+            .get(&jacc.id)
+            .filter(|c| now < c.until)
+            .map(|c| {
+                format!(
+                    "{} · {} {}",
+                    lang.pick("Crashed", "Çöktü"),
+                    lang.pick("code", "kod"),
+                    c.exit_code
+                )
+            });
 
         let status = if crash_summary.is_some() {
             ProjectStatus::Crashed
@@ -314,9 +323,7 @@ pub(super) fn build_snapshot(
 
         let job_procs = jacc.procs;
         let proc_cnt = job_procs.len() as u16;
-        let job_has_non_compiler = job_procs
-            .iter()
-            .any(|p| !matches!(p.role, ProcessRole::CompilerOrBuild));
+        let job_has_non_compiler = jacc.has_non_compiler;
 
         let job = Job {
             id: jacc.id,
@@ -429,7 +436,10 @@ pub(super) fn build_snapshot(
             ports: Vec::new(),
             uptime: 0,
             status: ProjectStatus::Crashed,
-            last_log: None,
+            last_log: rec
+                .log_path
+                .as_deref()
+                .and_then(|p| log_tail_cache.read_last_line(p, allow_log_io)),
             crash_summary: Some(format!(
                 "{} · {} {}",
                 lang.pick("Crashed", "Çöktü"),
@@ -496,11 +506,11 @@ pub(super) fn build_snapshot(
             root: Some(kj.root.clone()),
             primary_key: ProcessKey::new(0, 0),
             match_hint: kj.match_hint.clone(),
-            log_path: None,
-            custom_command: None,
-            is_watched: false,
+            log_path: kj.log_path.clone(),
+            custom_command: kj.custom_command.clone(),
+            is_watched: kj.is_watched,
             can_kill: false,
-            can_restart: false,
+            can_restart: kj.custom_command.as_ref().is_some_and(|c| !c.trim().is_empty()),
         });
     }
 
@@ -509,6 +519,7 @@ pub(super) fn build_snapshot(
     let active_hints: HashSet<String> = proj_map
         .values()
         .flat_map(|p| p.jobs.iter().map(|j| j.match_hint.to_ascii_lowercase()))
+        .filter(|h| !h.is_empty())
         .collect();
     for rule in resolver.labels().rules() {
         let is_watched = rule.watch == Some(true) || rule.command.is_some();
@@ -526,15 +537,24 @@ pub(super) fn build_snapshot(
             .project
             .as_deref()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| lang.pick("Custom Jobs", "Özel İşler"))
-            .to_string();
+            .map(|p| {
+                if p.eq_ignore_ascii_case("Custom Jobs") || p.eq_ignore_ascii_case("Özel İşler") {
+                    lang.pick("Custom Jobs", "Özel İşler").to_string()
+                } else {
+                    p.to_string()
+                }
+            })
+            .unwrap_or_else(|| lang.pick("Custom Jobs", "Özel İşler").to_string());
 
-        if active_hints.iter().any(|h| h.contains(&needle_low) || needle_low.contains(h))
+        if active_hints
+            .iter()
+            .any(|h| h.contains(&needle_low) || (h.len() >= 4 && h == &needle_low))
             || active_job_name_pairs
                 .contains(&(proj_name.to_ascii_lowercase(), job_title.to_ascii_lowercase()))
         {
             continue;
         }
+        active_job_name_pairs.insert((proj_name.to_ascii_lowercase(), job_title.to_ascii_lowercase()));
 
         // Attach to an existing project group with the same display name if present.
         let existing_pid = proj_map
@@ -658,7 +678,7 @@ pub(super) fn build_snapshot(
             project: id,
             project_name: proj_key.to_string(),
             title: container.name.clone(),
-            subtitle: format!("{proj_key} › Docker Container"),
+            subtitle: format!("{proj_key} › {}", lang.pick("Docker Container", "Docker Konteyneri")),
             icon: None,
             color: None,
             procs: Vec::new(),
@@ -808,7 +828,7 @@ pub(super) fn build_snapshot(
             ProjectStatus::Crashed
         } else if all_stopped {
             ProjectStatus::Stopped
-        } else if high_load || pacc.cpu > 75.0 {
+        } else if high_load || (pacc.cpu > 75.0 && !has_only_compilers) {
             ProjectStatus::HighLoad
         } else {
             ProjectStatus::Healthy
@@ -898,13 +918,10 @@ pub(super) fn build_snapshot(
 }
 
 pub(super) fn order_rank(order_list: &[String], key_a: &str, key_b: Option<&str>) -> usize {
-    let la = key_a.to_ascii_lowercase();
-    let lb = key_b.map(|s| s.to_ascii_lowercase());
     order_list
         .iter()
         .position(|k| {
-            let kl = k.to_ascii_lowercase();
-            kl == la || lb.as_ref().is_some_and(|b| &kl == b)
+            k.eq_ignore_ascii_case(key_a) || key_b.is_some_and(|b| k.eq_ignore_ascii_case(b))
         })
         .unwrap_or(usize::MAX)
 }
@@ -1057,3 +1074,253 @@ pub fn format_snapshot_text(snap: &Snapshot) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use crate::engine::project_resolver::{InferenceSource, ProcessMetadata};
+
+    fn make_job(id: &str, title: &str, match_hint: &str, cpu: f32, ram: u64, status: ProjectStatus) -> Job {
+        Job {
+            id: JobId(id.to_string()),
+            project: ProjectId("p:1".to_string()),
+            project_name: "Demo".to_string(),
+            title: title.to_string(),
+            subtitle: String::new(),
+            icon: None,
+            color: None,
+            procs: Vec::new(),
+            cpu,
+            ram,
+            ports: Vec::new(),
+            uptime: 100,
+            status,
+            last_log: None,
+            crash_summary: None,
+            root: None,
+            primary_key: ProcessKey::new(10, 100),
+            match_hint: match_hint.to_string(),
+            log_path: None,
+            custom_command: None,
+            is_watched: false,
+            can_kill: true,
+            can_restart: false,
+        }
+    }
+
+    #[test]
+    fn order_rank_and_sort_jobs_custom_and_cpu() {
+        let order = vec!["api.js".to_string(), "job:web".to_string()];
+        assert_eq!(order_rank(&order, "JOB:WEB", None), 1);
+        assert_eq!(order_rank(&order, "other", Some("API.JS")), 0);
+        assert_eq!(order_rank(&order, "missing", None), usize::MAX);
+
+        let mut jobs = vec![
+            make_job("job:web", "Web", "web.js", 5.0, 100, ProjectStatus::Healthy),
+            make_job("job:api", "API", "api.js", 50.0, 200, ProjectStatus::Healthy),
+        ];
+        sort_jobs(&mut jobs, SortMode::Custom, &order);
+        assert_eq!(jobs[0].id.0, "job:api");
+        assert_eq!(jobs[1].id.0, "job:web");
+
+        sort_jobs(&mut jobs, SortMode::Cpu, &[]);
+        assert_eq!(jobs[0].id.0, "job:api");
+    }
+
+    #[test]
+    fn build_snapshot_backfills_wrapper_root_and_exempts_compiler_and_watched_debounce() {
+        let now = Instant::now();
+        let wrapper_key = ProcessKey::new(100, 10);
+        let worker_key = ProcessKey::new(101, 20);
+        let compiler_key = ProcessKey::new(200, 30);
+
+        let procs = vec![
+            CollectedProcess {
+                key: wrapper_key,
+                parent_pid: 1,
+                session_id: 1,
+                image_name: "cmd.exe".into(),
+                cpu_percent: 0.1,
+                private_ram_bytes: 1024,
+                uptime_secs: 2,
+            },
+            CollectedProcess {
+                key: worker_key,
+                parent_pid: 100,
+                session_id: 1,
+                image_name: "python.exe".into(),
+                cpu_percent: 1.5,
+                private_ram_bytes: 8192,
+                uptime_secs: 2,
+            },
+            CollectedProcess {
+                key: compiler_key,
+                parent_pid: 1,
+                session_id: 1,
+                image_name: "rustc.exe".into(),
+                cpu_percent: 92.0,
+                private_ram_bytes: 65536,
+                uptime_secs: 30,
+            },
+        ];
+
+        let mut resolver = ProjectResolver::new(999_999);
+        resolver.insert_test_meta(
+            wrapper_key,
+            ProcessMetadata {
+                image_name: "cmd.exe".into(),
+                working_dir: None,
+                sanitized_cmdline: None,
+                access_limited: false,
+                project_id: ProjectId("p:bot".into()),
+                project_display_name: "Bot".into(),
+                project_root: None,
+                git_branch: None,
+                job_id: JobId("j:bot".into()),
+                job_title: "Worker".into(),
+                job_subtitle: String::new(),
+                job_icon: None,
+                job_color: None,
+                match_hint: "worker.py".into(),
+                log_path: None,
+                inline_last_log: None,
+                custom_command: None,
+                is_watched: false,
+                role: ProcessRole::WorkerOrQueue,
+                role_label: "Worker".into(),
+                inference_source: InferenceSource::CommandLineHeuristic,
+                is_ignored_noise: false,
+                is_wrapper_or_helper: true,
+                is_critical_system: false,
+                restart_recipe: None,
+                auto_restart: false,
+            },
+        );
+        resolver.insert_test_meta(
+            worker_key,
+            ProcessMetadata {
+                image_name: "python.exe".into(),
+                working_dir: Some(PathBuf::from("/dev/bot")),
+                sanitized_cmdline: None,
+                access_limited: false,
+                project_id: ProjectId("p:bot".into()),
+                project_display_name: "Bot".into(),
+                project_root: Some(PathBuf::from("/dev/bot")),
+                git_branch: Some("main".into()),
+                job_id: JobId("j:bot".into()),
+                job_title: "Worker".into(),
+                job_subtitle: String::new(),
+                job_icon: None,
+                job_color: None,
+                match_hint: "worker.py".into(),
+                log_path: None,
+                inline_last_log: None,
+                custom_command: None,
+                is_watched: true,
+                role: ProcessRole::WorkerOrQueue,
+                role_label: "Worker".into(),
+                inference_source: InferenceSource::ManifestPyProject,
+                is_ignored_noise: false,
+                is_wrapper_or_helper: false,
+                is_critical_system: false,
+                restart_recipe: None,
+                auto_restart: false,
+            },
+        );
+        resolver.insert_test_meta(
+            compiler_key,
+            ProcessMetadata {
+                image_name: "rustc.exe".into(),
+                working_dir: Some(PathBuf::from("/dev/crate")),
+                sanitized_cmdline: None,
+                access_limited: false,
+                project_id: ProjectId("p:crate".into()),
+                project_display_name: "Crate".into(),
+                project_root: Some(PathBuf::from("/dev/crate")),
+                git_branch: Some("dev".into()),
+                job_id: JobId("j:rustc".into()),
+                job_title: "Build".into(),
+                job_subtitle: String::new(),
+                job_icon: None,
+                job_color: None,
+                match_hint: "rustc".into(),
+                log_path: None,
+                inline_last_log: None,
+                custom_command: None,
+                is_watched: false,
+                role: ProcessRole::CompilerOrBuild,
+                role_label: "Rust Compiler".into(),
+                inference_source: InferenceSource::ManifestCargoToml,
+                is_ignored_noise: false,
+                is_wrapper_or_helper: false,
+                is_critical_system: false,
+                restart_recipe: None,
+                auto_restart: false,
+            },
+        );
+
+        let mut job_crashes = HashMap::new();
+        // Expired crash must NOT mark live job as Crashed
+        job_crashes.insert(
+            JobId("j:bot".into()),
+            CrashedJobRecord {
+                project_id: ProjectId("p:bot".into()),
+                project_name: "Bot".into(),
+                title: "Worker".into(),
+                subtitle: String::new(),
+                icon: None,
+                color: None,
+                root: None,
+                primary_key: worker_key,
+                match_hint: "worker.py".into(),
+                log_path: None,
+                custom_command: None,
+                is_watched: true,
+                can_restart: false,
+                exit_code: 1,
+                until: now - Duration::from_secs(5),
+            },
+        );
+
+        let mut states = HashMap::new();
+        let mut alerts = Vec::new();
+        let mut next_alert_id = 1;
+        let mut log_cache = LogTailCache::new();
+        let snap = build_snapshot(
+            &procs,
+            10.0,
+            1000,
+            2000,
+            [0; 24],
+            [0; 24],
+            &HashMap::new(),
+            &resolver,
+            &KnownJobsSnapshot::default(),
+            &mut log_cache,
+            &job_crashes,
+            &mut states,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            SortMode::Custom,
+            &[],
+            &[],
+            &mut alerts,
+            &mut next_alert_id,
+            PollingMode::ExpandedActive,
+            999_999,
+            &HashSet::new(),
+            Language::En,
+        );
+
+        let bot = snap.projects.iter().find(|p| p.id.0 == "p:bot").expect("watched job visible immediately");
+        assert_eq!(bot.git_branch.as_deref(), Some("main"));
+        assert_eq!(bot.root.as_deref(), Some(Path::new("/dev/bot")));
+        assert_eq!(bot.status, ProjectStatus::Healthy);
+
+        let crate_p = snap.projects.iter().find(|p| p.id.0 == "p:crate").expect("compiler project");
+        assert_eq!(crate_p.status, ProjectStatus::Healthy);
+    }
+}
+

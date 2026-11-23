@@ -32,21 +32,25 @@ fn has_unix_system_prefix(s: &str) -> bool {
         || s.contains("\\library\\application support\\")
 }
 
+fn is_excluded_system_path(s: &str) -> bool {
+    has_unix_system_prefix(s)
+        || s.contains("\\windows\\")
+        || s.ends_with("\\windows")
+        || s.contains("\\systemapps\\")
+        || s.contains("\\program files")
+        || s.contains("\\windowsapps\\")
+        || s.contains("\\programdata\\")
+        || s.ends_with("\\programdata")
+        || s.contains("\\appdata\\")
+        || s.contains("\\.vscode")
+        || s.contains("\\.antigravity")
+        || s.contains("\\.gemini")
+}
+
 pub(super) fn is_system_or_app_location(image_path: Option<&Path>, cwd: Option<&Path>) -> bool {
     for p in [image_path, cwd].into_iter().flatten() {
         let s = p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-        if has_unix_system_prefix(&s)
-            || s.contains("\\windows\\")
-            || s.ends_with("\\windows")
-            || s.contains("\\systemapps\\")
-            || s.contains("\\program files")
-            || s.contains("\\windowsapps\\")
-            || s.contains("\\programdata\\")
-            || s.contains("\\appdata\\")
-            || s.contains("\\.vscode")
-            || s.contains("\\.antigravity")
-            || s.contains("\\.gemini")
-        {
+        if is_excluded_system_path(&s) {
             return true;
         }
     }
@@ -65,26 +69,22 @@ pub(super) fn is_user_project_location(
             continue;
         };
         let s = p.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
-        if has_unix_system_prefix(&s)
-            || s.contains("\\windows\\")
-            || s.ends_with("\\windows")
-            || s.contains("\\program files")
-            || s.contains("\\programdata")
-            || s.contains("\\appdata\\")
-            || s.contains("\\.vscode")
-            || s.contains("\\.antigravity")
-            || s.contains("\\.gemini")
+        if is_excluded_system_path(&s)
             || s.contains("\\.cache")
             || s.contains("\\.cargo\\")
             || s.contains("\\.rustup\\")
         {
             continue;
         }
-        if is_user_home_dir(p) || is_generic_dir(p) {
+        let s_norm = normalize_path_str(p);
+        let is_home = match user_home {
+            Some(home) => s_norm == normalize_path_str(home),
+            None => is_user_home_dir(p),
+        };
+        if is_home || is_generic_dir(p) {
             continue;
         }
         if let Some(home) = user_home {
-            let s_norm = normalize_path_str(p);
             let home_norm = normalize_path_str(home);
             if s_norm != home_norm && path_str_starts_with_dir(&s_norm, &home_norm) {
                 return true;
@@ -182,18 +182,42 @@ pub(super) fn is_interactive_shell_process(lower_exe: &str, cmdline: Option<&str
     ) {
         return false;
     }
-    let lower_cmd = cmdline.unwrap_or("").to_ascii_lowercase();
+    let args = super::cmdline::split_cmdline_args(cmdline.unwrap_or(""));
+    let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
     if base == "cmd" {
-        return !lower_cmd.contains("/c ");
+        let has_c = rest.iter().any(|a| {
+            let low = a.to_ascii_lowercase();
+            low == "/c" || low.starts_with("/c")
+        });
+        return !has_c;
     }
     if base == "powershell" || base == "pwsh" {
-        if lower_cmd.contains("-noexit") {
+        if rest.iter().any(|a| a.eq_ignore_ascii_case("-noexit")) {
             return true;
         }
-        return !lower_cmd.contains(".ps1") && !lower_cmd.contains("-file ");
+        let has_exec = rest.iter().any(|a| {
+            let low = a.to_ascii_lowercase();
+            low.ends_with(".ps1")
+                || matches!(
+                    low.as_str(),
+                    "-file" | "-f" | "-command" | "-c" | "-encodedcommand" | "-enc" | "-e"
+                )
+        });
+        return !has_exec;
     }
     if matches!(base, "bash" | "zsh" | "sh" | "fish") {
-        return !lower_cmd.contains(" -c ");
+        let has_exec = rest.iter().any(|a| {
+            if a == "-c"
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a.len() >= 2
+                    && a.ends_with('c'))
+            {
+                return true;
+            }
+            !a.starts_with('-') && !a.is_empty()
+        });
+        return !has_exec;
     }
     true
 }
@@ -308,7 +332,7 @@ pub(super) fn is_stop_directory(dir: &Path, user_home: Option<&Path>) -> bool {
         return true;
     }
     if let Some(home) = user_home {
-        if dir == home {
+        if normalize_path_str(dir) == normalize_path_str(home) {
             return true;
         }
     }
@@ -324,6 +348,7 @@ pub(super) fn is_stop_directory(dir: &Path, user_home: Option<&Path>) -> bool {
         || s.ends_with(":\\program files (x86)")
         || s.ends_with(":\\users")
         || s == "\\users"
+        || s == "\\home"
         || s == "\\applications"
         || s == "\\library"
         || s == "\\system"
@@ -333,12 +358,16 @@ pub(super) fn is_stop_directory(dir: &Path, user_home: Option<&Path>) -> bool {
 }
 
 pub(super) fn is_generic_dir(dir: &Path) -> bool {
+    if dir.parent().is_none() {
+        return true;
+    }
     let s = dir
         .to_string_lossy()
         .replace('/', "\\")
         .trim_end_matches('\\')
         .to_ascii_lowercase();
-    s.ends_with("\\system32")
+    s.is_empty()
+        || s.ends_with("\\system32")
         || s.ends_with("\\windows")
         || s.ends_with("\\temp")
         || s.ends_with("\\tmp")
@@ -369,36 +398,20 @@ pub(super) fn is_docker_process(lower_exe: &str) -> bool {
 }
 
 pub(super) fn is_known_dev_runtime(lower_exe: &str) -> bool {
+    let base = lower_exe.strip_suffix(".exe").unwrap_or(lower_exe);
+    if base.starts_with("python") {
+        return true;
+    }
     matches!(
-        lower_exe,
-        "node.exe"
-            | "bun.exe"
-            | "deno.exe"
-            | "python.exe"
-            | "python3.exe"
-            | "pythonw.exe"
-            | "uvicorn.exe"
-            | "cargo.exe"
-            | "rustc.exe"
-            | "java.exe"
-            | "javaw.exe"
-            | "dotnet.exe"
-            | "go.exe"
-            | "air.exe"
-            | "postgres.exe"
-            | "mysqld.exe"
-            | "redis-server.exe"
-            | "mongod.exe"
-            | "node"
+        base,
+        "node"
             | "bun"
             | "deno"
-            | "python"
-            | "python3"
-            | "pythonw"
             | "uvicorn"
             | "cargo"
             | "rustc"
             | "java"
+            | "javaw"
             | "dotnet"
             | "go"
             | "air"
@@ -406,6 +419,7 @@ pub(super) fn is_known_dev_runtime(lower_exe: &str) -> bool {
             | "mysqld"
             | "redis-server"
             | "mongod"
+            | "surreal"
     )
 }
 
@@ -444,4 +458,55 @@ pub(super) fn is_helper_process(lower_exe: &str, role: ProcessRole) -> bool {
     matches!(base, "conhost" | "openconsole" | "esbuild" | "rustc")
         || matches!(role, ProcessRole::IdeTooling)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_prefix_and_stop_directory_handle_boundaries_and_case() {
+        assert!(path_str_starts_with_dir(r"c:\users\dev\app", r"c:\users\dev"));
+        assert!(!path_str_starts_with_dir(r"c:\users\dev2\app", r"c:\users\dev"));
+        assert!(path_str_starts_with_dir(r"c:\users\dev\", r"c:\users\dev"));
+
+        assert!(is_stop_directory(Path::new(r"c:\users\dev"), Some(Path::new(r"C:\Users\Dev"))));
+        assert!(is_stop_directory(Path::new("/home"), None));
+        assert!(is_generic_dir(Path::new(r"C:\")));
+        assert!(is_generic_dir(Path::new("/")));
+    }
+
+    #[test]
+    fn interactive_shell_allows_script_and_command_flags() {
+        assert!(is_interactive_shell_process("cmd.exe", Some("cmd.exe")));
+        assert!(!is_interactive_shell_process("cmd.exe", Some("cmd.exe /c node a.js")));
+        assert!(!is_interactive_shell_process("cmd.exe", Some(r#"cmd.exe /c"node a.js""#)));
+        assert!(is_interactive_shell_process("pwsh.exe", Some("pwsh.exe -NoExit -File a.ps1")));
+        assert!(!is_interactive_shell_process("pwsh.exe", Some("pwsh.exe -Command node a.js")));
+        assert!(!is_interactive_shell_process("bash", Some("bash -lc 'npm run dev'")));
+        assert!(!is_interactive_shell_process("sh", Some("sh /opt/app/worker.sh")));
+        assert!(is_interactive_shell_process("zsh", Some("zsh -l")));
+    }
+
+    #[test]
+    fn dev_runtime_and_user_project_location_work_cross_platform() {
+        assert!(is_known_dev_runtime("python3.12"));
+        assert!(is_known_dev_runtime("surreal"));
+        assert!(is_known_dev_runtime("javaw.exe"));
+        assert!(is_fast_skip_noise("svchost.exe", 500, 100, 0));
+        assert!(!is_fast_skip_noise("dockerd.exe", 500, 100, 0));
+        assert!(!is_user_project_location(
+            Some(Path::new("/tmp/fakehome")),
+            None,
+            None,
+            Some(Path::new("/tmp/fakehome"))
+        ));
+        assert!(is_user_project_location(
+            Some(Path::new("/tmp/fakehome/myapp")),
+            None,
+            None,
+            Some(Path::new("/tmp/fakehome"))
+        ));
+    }
+}
+
 

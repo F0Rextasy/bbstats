@@ -9,7 +9,7 @@ use windows::Graphics::DirectX::{DirectXAlphaMode, DirectXPixelFormat};
 use windows::System::DispatcherQueueController;
 use windows::Win32::Foundation::{HWND, POINT, SIZE};
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1DeviceContext, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    ID2D1DeviceContext, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::System::WinRT::Composition::{
     ICompositionDrawingSurfaceInterop, ICompositorDesktopInterop, ICompositorInterop,
@@ -48,6 +48,7 @@ pub struct CompositionHost {
 
 impl CompositionHost {
     pub fn new(hwnd: HWND, device: &RenderDevice, width_px: i32, height_px: i32) -> windows::core::Result<Self> {
+        // SAFETY: Valid WinRT/DXGI interop pointers on the initialized dispatcher thread.
         let dq_controller = unsafe {
             CreateDispatcherQueueController(DispatcherQueueOptions {
                 dwSize: std::mem::size_of::<DispatcherQueueOptions>() as u32,
@@ -58,6 +59,7 @@ impl CompositionHost {
 
         let compositor = Compositor::new()?;
         let desktop_interop: ICompositorDesktopInterop = compositor.cast()?;
+        // SAFETY: Valid WinRT/DXGI interop pointers on the initialized dispatcher thread.
         let target = unsafe { desktop_interop.CreateDesktopWindowTarget(hwnd, true)? };
 
         let root = compositor.CreateContainerVisual()?;
@@ -82,6 +84,7 @@ impl CompositionHost {
         let ui_settings = UISettings::new()?;
 
         let compositor_interop: ICompositorInterop = compositor.cast()?;
+        // SAFETY: Valid WinRT/DXGI interop pointers on the initialized dispatcher thread.
         let graphics_device = unsafe { compositor_interop.CreateGraphicsDevice(&device.d2d_device)? };
 
         let w = width_px.max(1);
@@ -192,6 +195,7 @@ impl CompositionHost {
 
         if (sw, sh) != self.surface_size_px {
             let interop: ICompositionDrawingSurfaceInterop = self.surface.cast()?;
+            // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
             unsafe {
                 interop.Resize(SIZE { cx: sw, cy: sh })?;
             }
@@ -209,12 +213,13 @@ impl CompositionHost {
     ) -> windows::core::Result<ID2D1DeviceContext> {
         let interop: ICompositionDrawingSurfaceInterop = self.surface.cast()?;
         let mut offset = POINT::default();
+        // SAFETY: `interop` is a valid ICompositionDrawingSurfaceInterop; `offset` is a valid out pointer.
         let dc: ID2D1DeviceContext = unsafe { interop.BeginDraw(None, &mut offset)? };
+        // SAFETY: `dc` is an active Direct2D device context between BeginDraw and EndDraw.
         unsafe {
             let scale = dpi_scale(dpi);
             dc.SetDpi(dpi as f32, dpi as f32);
             dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-            let _ = D2D1_DEVICE_CONTEXT_OPTIONS_NONE;
             dc.SetTransform(&windows_numerics_matrix(
                 offset.x as f32 / scale + island_off_x_dip,
                 offset.y as f32 / scale + island_off_y_dip,
@@ -225,7 +230,25 @@ impl CompositionHost {
 
     pub fn end_draw(&self) -> windows::core::Result<()> {
         let interop: ICompositionDrawingSurfaceInterop = self.surface.cast()?;
+        // SAFETY: Called only after a matching successful `BeginDraw`.
         unsafe { interop.EndDraw() }
+    }
+
+    /// Executes `f(&dc)` inside a `begin_draw` / `end_draw` pair, guaranteeing `end_draw` even on `Err`.
+    pub fn with_draw<F>(
+        &self,
+        dpi: u32,
+        island_off_x_dip: f32,
+        island_off_y_dip: f32,
+        f: F,
+    ) -> windows::core::Result<()>
+    where
+        F: FnOnce(&ID2D1DeviceContext) -> windows::core::Result<()>,
+    {
+        let dc = self.begin_draw(dpi, island_off_x_dip, island_off_y_dip)?;
+        let draw_res = f(&dc);
+        let end_res = self.end_draw();
+        draw_res.and(end_res)
     }
 
     /// Rebuilds the graphics device and drawing surface after GPU device loss.
@@ -236,6 +259,7 @@ impl CompositionHost {
         height_px: i32,
     ) -> windows::core::Result<()> {
         let compositor_interop: ICompositorInterop = self.compositor.cast()?;
+        // SAFETY: `device.d2d_device` is a valid ID2D1Device.
         let graphics_device = unsafe { compositor_interop.CreateGraphicsDevice(&device.d2d_device)? };
         let w = width_px.max(1);
         let h = height_px.max(1);
@@ -251,6 +275,11 @@ impl CompositionHost {
         self.graphics_device = graphics_device;
         self.surface = surface;
         self.surface_size_px = (w, h);
+        // Allow backdrop brush creation to be retried cleanly after device loss / DWM reset.
+        self.backdrop_attempted = false;
+        self.host_backdrop_brush = None;
+        self.acrylic_active = false;
+        let _ = self.backdrop_visual.SetBrush(&self.fallback_brush);
         Ok(())
     }
 }

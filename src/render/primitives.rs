@@ -5,21 +5,22 @@ use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_GRADIENT_STOP,
-    D2D_POINT_2F, D2D_RECT_F,
+    D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_GRADIENT_STOP, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_F,
 };
 use windows::Win32::Graphics::Direct2D::{
     ID2D1DeviceContext, ID2D1Factory1, ID2D1Geometry, ID2D1LinearGradientBrush,
     ID2D1RadialGradientBrush, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_BRUSH_PROPERTIES, D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_CAP_STYLE_ROUND,
+    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL, D2D1_BRUSH_PROPERTIES,
+    D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_CAP_STYLE_ROUND,
     D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED, D2D1_COLOR_SPACE_SRGB,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_ELLIPSE,
-    D2D1_EXTEND_MODE_CLAMP, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_LAYER_OPTIONS1_NONE,
-    D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
-    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES1,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES1, D2D1_SWEEP_DIRECTION_CLOCKWISE,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, IDWriteTypography, DWRITE_TEXT_RANGE,
+    IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, IDWriteTypography, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE,
 };
 
 pub struct DrawCtx<'a> {
@@ -38,6 +39,7 @@ impl<'a> DrawCtx<'a> {
         dw_factory: &'a IDWriteFactory,
         tabular: &'a IDWriteTypography,
     ) -> windows::core::Result<Self> {
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         let brush = unsafe { dc.CreateSolidColorBrush(&BORDER_SUBTLE, None)? };
         Ok(Self {
             dc,
@@ -51,6 +53,7 @@ impl<'a> DrawCtx<'a> {
 
     #[inline]
     pub fn solid(&self, color: D2D1_COLOR_F) -> &ID2D1SolidColorBrush {
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.brush.SetColor(&color);
         }
@@ -61,10 +64,12 @@ impl<'a> DrawCtx<'a> {
     where
         F: FnOnce() -> windows::core::Result<()>,
     {
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.PushAxisAlignedClip(&rect, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
         let res = f();
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.PopAxisAlignedClip();
         }
@@ -83,6 +88,7 @@ impl<'a> DrawCtx<'a> {
             radiusX: radius,
             radiusY: radius,
         };
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.FillRoundedRectangle(&rr, brush);
         }
@@ -102,6 +108,7 @@ impl<'a> DrawCtx<'a> {
             radiusX: radius,
             radiusY: radius,
         };
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.DrawRoundedRectangle(&rr, brush, width, None);
         }
@@ -147,6 +154,7 @@ impl<'a> DrawCtx<'a> {
     where
         F: FnOnce() -> windows::core::Result<()>,
     {
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         unsafe {
             let rr = D2D1_ROUNDED_RECT {
                 rect,
@@ -186,6 +194,7 @@ impl<'a> DrawCtx<'a> {
     where
         F: FnOnce() -> windows::core::Result<()>,
     {
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             let mut base = identity_matrix();
             self.dc.GetTransform(&mut base);
@@ -302,6 +311,7 @@ impl<'a> DrawCtx<'a> {
                 color: bot_c,
             },
         ];
+        // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
         unsafe {
             let stop_coll = self.dc.CreateGradientStopCollection(
                 &stops,
@@ -359,6 +369,7 @@ impl<'a> DrawCtx<'a> {
         ry: f32,
         stops: &[D2D1_GRADIENT_STOP],
     ) -> windows::core::Result<ID2D1RadialGradientBrush> {
+        // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
         unsafe {
             let stop_coll = self.dc.CreateGradientStopCollection(
                 stops,
@@ -414,6 +425,7 @@ impl<'a> DrawCtx<'a> {
             },
         ];
         let aura = self.radial_brush(center, rx, ry, &aura_stops)?;
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.FillEllipse(
                 &D2D1_ELLIPSE {
@@ -445,6 +457,7 @@ impl<'a> DrawCtx<'a> {
                     color: D2D1_COLOR_F { a: 0.0, ..color },
                 },
             ];
+            // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
             unsafe {
                 let coll = self.dc.CreateGradientStopCollection(
                     &crown_stops,
@@ -509,6 +522,7 @@ impl<'a> DrawCtx<'a> {
             right: w,
             bottom: h,
         };
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.FillRectangle(&full, &spot);
         }
@@ -547,6 +561,7 @@ impl<'a> DrawCtx<'a> {
             radiusX: (radius - 1.0).max(2.0),
             radiusY: (radius - 1.0).max(2.0),
         };
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.DrawRoundedRectangle(&rr, &rim, 1.25, None);
         }
@@ -555,6 +570,7 @@ impl<'a> DrawCtx<'a> {
 
     pub fn draw_hairline(&self, x1: f32, y: f32, x2: f32) -> windows::core::Result<()> {
         let brush = self.solid(BORDER_SUBTLE);
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.DrawLine(
                 D2D_POINT_2F { x: x1, y },
@@ -569,6 +585,7 @@ impl<'a> DrawCtx<'a> {
 
     pub fn draw_vline(&self, x: f32, y1: f32, y2: f32) -> windows::core::Result<()> {
         let brush = self.solid(BORDER_SUBTLE);
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.DrawLine(
                 D2D_POINT_2F { x, y: y1 },
@@ -591,6 +608,7 @@ impl<'a> DrawCtx<'a> {
         glow: bool,
     ) -> windows::core::Result<()> {
         if glow {
+            let glow_r = radius * 2.5;
             let stops = [
                 D2D1_GRADIENT_STOP {
                     position: 0.0,
@@ -601,26 +619,14 @@ impl<'a> DrawCtx<'a> {
                     color: D2D1_COLOR_F { a: 0.0, ..color },
                 },
             ];
+            let brush = self.radial_brush(
+                D2D_POINT_2F { x: cx, y: cy },
+                glow_r,
+                glow_r,
+                &stops,
+            )?;
+            // SAFETY: `self.dc` is valid and `brush` was just created on it.
             unsafe {
-                let stop_coll = self.dc.CreateGradientStopCollection(
-                    &stops,
-                    D2D1_COLOR_SPACE_SRGB,
-                    D2D1_COLOR_SPACE_SRGB,
-                    D2D1_BUFFER_PRECISION_8BPC_UNORM,
-                    D2D1_EXTEND_MODE_CLAMP,
-                    D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED,
-                )?;
-                let glow_r = radius * 2.5;
-                let brush: ID2D1RadialGradientBrush = self.dc.CreateRadialGradientBrush(
-                    &D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
-                        center: D2D_POINT_2F { x: cx, y: cy },
-                        gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 },
-                        radiusX: glow_r,
-                        radiusY: glow_r,
-                    },
-                    None,
-                    &stop_coll,
-                )?;
                 self.dc.FillEllipse(
                     &D2D1_ELLIPSE {
                         point: D2D_POINT_2F { x: cx, y: cy },
@@ -632,6 +638,7 @@ impl<'a> DrawCtx<'a> {
             }
         }
         let dot_brush = self.solid(color);
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             self.dc.FillEllipse(
                 &D2D1_ELLIPSE {
@@ -660,6 +667,7 @@ impl<'a> DrawCtx<'a> {
         wide.clear();
         wide.extend(text.encode_utf16());
         let brush = self.solid(color);
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         unsafe {
             let layout: IDWriteTextLayout =
                 self.dw_factory.CreateTextLayout(&wide, fmt, w, h)?;
@@ -693,22 +701,28 @@ impl<'a> DrawCtx<'a> {
         max_val: f32,
         stroke_color: D2D1_COLOR_F,
     ) -> windows::core::Result<()> {
-        if samples.len() < 2 {
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        if samples.len() < 2 || w < 2.0 || h < 6.0 {
             return Ok(());
         }
-        let w = (rect.right - rect.left).max(1.0);
-        let h = (rect.bottom - rect.top).max(1.0);
-        let ceil = max_val.max(1.0);
+        let ceil = if max_val.is_finite() { max_val.max(1.0) } else { 1.0 };
         let step_x = w / (samples.len() - 1) as f32;
+        let y_min = rect.top + 1.5;
+        let y_max = (rect.bottom - 1.5).max(y_min);
         let pts: Vec<D2D_POINT_2F> = samples
             .iter()
             .enumerate()
-            .map(|(i, &val)| D2D_POINT_2F {
-                x: rect.left + i as f32 * step_x,
-                y: rect.bottom - (val.clamp(0.0, ceil) / ceil) * (h - 6.0) - 3.0,
+            .map(|(i, &raw_val)| {
+                let val = if raw_val.is_finite() { raw_val } else { 0.0 };
+                D2D_POINT_2F {
+                    x: rect.left + i as f32 * step_x,
+                    y: rect.bottom - (val.clamp(0.0, ceil) / ceil) * (h - 6.0) - 3.0,
+                }
             })
             .collect();
 
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         unsafe {
             let fill_geo = self.d2d_factory.CreatePathGeometry()?;
             let fill_sink = fill_geo.Open()?;
@@ -740,11 +754,11 @@ impl<'a> DrawCtx<'a> {
                 let seg = D2D1_BEZIER_SEGMENT {
                     point1: D2D_POINT_2F {
                         x: p1.x + (p2.x - p0.x) / 6.0,
-                        y: (p1.y + (p2.y - p0.y) / 6.0).clamp(rect.top + 1.5, rect.bottom - 1.5),
+                        y: (p1.y + (p2.y - p0.y) / 6.0).clamp(y_min, y_max),
                     },
                     point2: D2D_POINT_2F {
                         x: p2.x - (p3.x - p1.x) / 6.0,
-                        y: (p2.y - (p3.y - p1.y) / 6.0).clamp(rect.top + 1.5, rect.bottom - 1.5),
+                        y: (p2.y - (p3.y - p1.y) / 6.0).clamp(y_min, y_max),
                     },
                     point3: p2,
                 };
@@ -839,7 +853,6 @@ impl<'a> DrawCtx<'a> {
                 );
             }
         }
-        let _ = (D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_FEATURE_LEVEL_DEFAULT);
         Ok(())
     }
 
@@ -856,6 +869,7 @@ impl<'a> DrawCtx<'a> {
         fill_color: D2D1_COLOR_F,
     ) -> windows::core::Result<()> {
         let track_brush = self.solid(track_color);
+        // SAFETY: `self.dc` is valid for the frame.
         unsafe {
             self.dc.DrawEllipse(
                 &D2D1_ELLIPSE {
@@ -869,28 +883,59 @@ impl<'a> DrawCtx<'a> {
             );
         }
 
-        let clamped = progress.clamp(0.02, 1.0);
-        let steps = 64usize;
+        let clamped = if progress.is_finite() {
+            progress.clamp(0.02, 1.0)
+        } else {
+            0.02
+        };
+        if clamped >= 0.999 {
+            let fill_brush = self.solid(fill_color);
+            // SAFETY: `self.dc` is valid for the frame.
+            unsafe {
+                self.dc.DrawEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F { x: cx, y: cy },
+                        radiusX: radius,
+                        radiusY: radius,
+                    },
+                    fill_brush,
+                    thickness,
+                    None,
+                );
+            }
+            return Ok(());
+        }
+
         let start_angle = -std::f32::consts::FRAC_PI_2;
         let sweep = clamped * std::f32::consts::TAU;
+        let end_angle = start_angle + sweep;
 
+        // SAFETY: Valid COM factory/sink calls for single hardware arc segment.
         unsafe {
             let arc_geo = self.d2d_factory.CreatePathGeometry()?;
             let sink = arc_geo.Open()?;
             let x0 = cx + radius * start_angle.cos();
             let y0 = cy + radius * start_angle.sin();
+            let x1 = cx + radius * end_angle.cos();
+            let y1 = cy + radius * end_angle.sin();
             sink.BeginFigure(
                 D2D_POINT_2F { x: x0, y: y0 },
                 windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_BEGIN_HOLLOW,
             );
-            for i in 1..=steps {
-                let t = i as f32 / steps as f32;
-                let ang = start_angle + sweep * t;
-                sink.AddLine(D2D_POINT_2F {
-                    x: cx + radius * ang.cos(),
-                    y: cy + radius * ang.sin(),
-                });
-            }
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: D2D_POINT_2F { x: x1, y: y1 },
+                size: D2D_SIZE_F {
+                    width: radius,
+                    height: radius,
+                },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: if clamped > 0.5 {
+                    D2D1_ARC_SIZE_LARGE
+                } else {
+                    D2D1_ARC_SIZE_SMALL
+                },
+            });
             sink.EndFigure(windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_OPEN);
             sink.Close()?;
 
@@ -917,8 +962,25 @@ impl<'a> DrawCtx<'a> {
         label: &str,
         fmt: &IDWriteTextFormat,
     ) -> windows::core::Result<()> {
+        let max_w = ((x2 - x1) * 0.85).max(16.0);
+        let mut wide = self.wide_buf.borrow_mut();
+        wide.clear();
+        wide.extend(label.encode_utf16());
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
+        let (est_w, layout) = unsafe {
+            let layout: IDWriteTextLayout =
+                self.dw_factory.CreateTextLayout(&wide, fmt, max_w, 16.0)?;
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            let measured = if layout.GetMetrics(&mut metrics).is_ok() {
+                metrics.widthIncludingTrailingWhitespace + 14.0
+            } else {
+                label.chars().count() as f32 * 6.5 + 16.0
+            };
+            (measured.min(max_w), layout)
+        };
+        drop(wide);
+
         let mid = (x1 + x2) * 0.5;
-        let est_w = (label.chars().count() as f32 * 5.8 + 16.0).min((x2 - x1) * 0.65);
         let left_end = (mid - est_w * 0.5).max(x1);
         let right_start = (mid + est_w * 0.5).min(x2);
 
@@ -928,18 +990,19 @@ impl<'a> DrawCtx<'a> {
         if x2 > right_start + 4.0 {
             self.draw_hairline(right_start, y, x2)?;
         }
-        self.draw_text(
-            label,
-            fmt,
-            D2D_RECT_F {
-                left: left_end,
-                top: y - 8.0,
-                right: right_start,
-                bottom: y + 8.0,
-            },
-            TEXT_MUTED,
-            false,
-        )?;
+        let brush = self.solid(TEXT_MUTED);
+        // SAFETY: `self.dc` and `layout` are valid; `layout` was measured within `max_w`.
+        unsafe {
+            self.dc.DrawTextLayout(
+                D2D_POINT_2F {
+                    x: mid - max_w * 0.5,
+                    y: y - 8.0,
+                },
+                &layout,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+            );
+        }
         Ok(())
     }
 
@@ -955,19 +1018,26 @@ impl<'a> DrawCtx<'a> {
         let r = h * 0.5;
         self.fill_rounded(rect, r, track_color)?;
 
-        let sum: f32 = segments.iter().map(|(v, _)| v.max(0.0)).sum();
-        if sum <= 0.0 {
+        let valid: Vec<(f32, D2D1_COLOR_F)> = segments
+            .iter()
+            .copied()
+            .filter(|(v, _)| v.is_finite() && *v > 0.0)
+            .collect();
+        let sum: f32 = valid.iter().map(|(v, _)| *v).sum();
+        if sum <= 0.0 || valid.is_empty() {
             return Ok(());
         }
 
         let mut cursor = rect.left;
         let gap = 1.5f32;
-        for (idx, &(val, col)) in segments.iter().enumerate() {
-            if val <= 0.0 {
-                continue;
+        for (idx, &(val, col)) in valid.iter().enumerate() {
+            let is_last = idx + 1 == valid.len();
+            let remaining = rect.right - cursor;
+            if remaining <= 1.0 {
+                break;
             }
             let seg_w = (total_w * (val / sum)).max(3.0);
-            let right = if idx + 1 == segments.len() {
+            let right = if is_last {
                 rect.right
             } else {
                 (cursor + seg_w - gap).min(rect.right)
@@ -1049,22 +1119,35 @@ impl<'a> DrawCtx<'a> {
         if samples.is_empty() {
             return Ok(());
         }
-        let w = (rect.right - rect.left).max(4.0);
+        let w = rect.right - rect.left;
         let h = (rect.bottom - rect.top).max(4.0);
-        let n = samples.len() as f32;
+        if w < 4.0 {
+            return Ok(());
+        }
         let gap = 1.2_f32;
+        let max_fit = ((w + gap) / (1.5 + gap)).floor().max(1.0) as usize;
+        let slice = if samples.len() > max_fit {
+            &samples[samples.len() - max_fit..]
+        } else {
+            samples
+        };
+        let n = slice.len() as f32;
         let bar_w = ((w - gap * (n - 1.0)) / n).max(1.5);
-        let ceil = max_val.max(1.0);
+        let ceil = if max_val.is_finite() { max_val.max(1.0) } else { 1.0 };
 
-        for (i, &val) in samples.iter().enumerate() {
+        for (i, &val) in slice.iter().enumerate() {
             let x = rect.left + i as f32 * (bar_w + gap);
+            let right = (x + bar_w).min(rect.right);
+            if right <= x + 0.5 {
+                break;
+            }
             let ratio = (val as f32 / ceil).clamp(0.08, 1.0);
             let bh = (h * ratio).max(2.0);
             self.fill_rounded(
                 D2D_RECT_F {
                     left: x,
                     top: rect.top,
-                    right: x + bar_w,
+                    right,
                     bottom: rect.bottom,
                 },
                 0.8,
@@ -1074,7 +1157,7 @@ impl<'a> DrawCtx<'a> {
                 D2D_RECT_F {
                     left: x,
                     top: rect.bottom - bh,
-                    right: x + bar_w,
+                    right,
                     bottom: rect.bottom,
                 },
                 0.8,
@@ -1119,6 +1202,7 @@ impl<'a> DrawCtx<'a> {
         let cx = (r.left + r.right) * 0.5;
         let cy = (r.top + r.bottom) * 0.5;
         let brush = self.solid(color);
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         unsafe {
             let geo = self.d2d_factory.CreatePathGeometry()?;
             let sink = geo.Open()?;

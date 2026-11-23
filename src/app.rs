@@ -5,7 +5,7 @@ use crate::engine::EngineHandle;
 use crate::model::{Alert, AlertKind, EngineCmd, PollingMode, Snapshot, SortMode};
 use crate::platform::dpi::{dip_to_px, is_reduced_motion, window_dpi};
 use crate::platform::fullscreen::is_fullscreen_active;
-use crate::platform::hotkey::register_hotkey;
+use crate::platform::hotkey::{register_hotkey, unregister_hotkey};
 use crate::platform::monitor::{
     compute_dock_rect, enumerate_monitors, monitor_work_height_dip, select_monitor, MonitorInfo,
 };
@@ -59,7 +59,7 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
-    GlobalAlloc, GlobalLock, GlobalUnlock, SetProcessWorkingSetSizeEx, GMEM_MOVEABLE,
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, SetProcessWorkingSetSizeEx, GMEM_MOVEABLE,
     SETPROCESSWORKINGSETSIZEEX_FLAGS,
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
@@ -114,6 +114,7 @@ pub struct App {
     last_collapsed_sig: Option<u64>,
     last_notified_alert_id: u64,
     last_seen_action_error_id: u64,
+    last_render_err_log: Option<Instant>,
     pub menu_open: bool,
 }
 
@@ -167,6 +168,7 @@ impl App {
             last_collapsed_sig: None,
             last_notified_alert_id: 0,
             last_seen_action_error_id: 0,
+            last_render_err_log: None,
             menu_open: false,
         };
         if let Some(ref err) = app.cfg.load_error {
@@ -179,6 +181,12 @@ impl App {
                     "Bozuk config.toml .bak olarak yedeklendi",
                 )
                 .to_string();
+            app.tray.show_balloon(
+                app.cfg
+                    .language
+                    .pick("bbstats — Config Recovery", "bbstats — Ayar Kurtarma"),
+                &msg,
+            );
             app.set_toast(msg);
         }
         app.sync_engine_intervals();
@@ -186,6 +194,7 @@ impl App {
         set_window_topmost(app.hwnd, app.cfg.always_on_top);
         let _ = app.render_frame();
         app.sync_fullscreen_timer();
+        // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
         unsafe {
             SetTimer(hwnd, TIMER_TRIM, 1500, None);
         }
@@ -236,6 +245,15 @@ impl App {
                 self.set_toast(err_msg.clone());
             }
         }
+        let filtered_jobs: usize = filter_project_jobs(&self.snap, &self.ui.search_query)
+            .iter()
+            .map(|(_, jobs)| jobs.len())
+            .sum();
+        if filtered_jobs == 0 {
+            self.ui.selected_index = 0;
+        } else if self.ui.selected_index >= filtered_jobs {
+            self.ui.selected_index = filtered_jobs - 1;
+        }
         if matches!(self.ui.mode, ViewMode::Collapsed) && !self.animating {
             let sig = collapsed_visual_sig(&self.snap);
             if self.last_collapsed_sig == Some(sig) && !toast_expired {
@@ -248,6 +266,7 @@ impl App {
         self.recompute_targets(false);
         let _ = self.render_frame();
         if matches!(self.ui.mode, ViewMode::Collapsed) && !self.animating {
+            // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
             unsafe {
                 SetTimer(self.hwnd, TIMER_TRIM, 900, None);
             }
@@ -258,6 +277,7 @@ impl App {
         if self.ui.mode == mode {
             return;
         }
+        // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_HOVER_PEEK);
             let _ = KillTimer(self.hwnd, TIMER_LEAVE_COLLAPSE);
@@ -383,6 +403,7 @@ impl App {
         }
 
         if activate && interactive {
+            // SAFETY: HWND is valid for this window's lifetime on the UI thread.
             unsafe {
                 let _ = SetForegroundWindow(self.hwnd);
                 let _ = SetFocus(self.hwnd);
@@ -397,6 +418,7 @@ impl App {
     pub fn toggle_expanded(&mut self) {
         if self.fullscreen_hidden {
             self.fullscreen_hidden = false;
+            // SAFETY: HWND is valid for this window's lifetime on the UI thread.
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOW);
             }
@@ -462,6 +484,7 @@ impl App {
         if !self.animating {
             self.animating = true;
             self.last_anim_tick = Instant::now();
+            // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
             unsafe {
                 SetTimer(self.hwnd, TIMER_ANIM, 8, None);
             }
@@ -472,6 +495,7 @@ impl App {
         match id {
             TIMER_ANIM => self.step_animation(),
             TIMER_HOVER_PEEK => {
+                // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
                 unsafe {
                     let _ = KillTimer(self.hwnd, TIMER_HOVER_PEEK);
                 }
@@ -483,6 +507,7 @@ impl App {
                 }
             }
             TIMER_LEAVE_COLLAPSE => {
+                // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
                 unsafe {
                     let _ = KillTimer(self.hwnd, TIMER_LEAVE_COLLAPSE);
                 }
@@ -491,11 +516,13 @@ impl App {
                 }
             }
             TIMER_TRIM => {
+                // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
                 unsafe {
                     let _ = KillTimer(self.hwnd, TIMER_TRIM);
                 }
                 if matches!(self.ui.mode, ViewMode::Collapsed) && !self.animating {
                     self.device.trim();
+                    // SAFETY: Current process pseudo-handle trim call with valid flags.
                     unsafe {
                         let _ = SetProcessWorkingSetSizeEx(
                             GetCurrentProcess(),
@@ -542,6 +569,7 @@ impl App {
             self.ui.detail_tab_t = 1.0;
             self.snap_window_to_current();
             let _ = self.render_frame();
+            // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
             unsafe {
                 let _ = KillTimer(self.hwnd, TIMER_ANIM);
                 if matches!(self.ui.mode, ViewMode::Collapsed) {
@@ -556,6 +584,7 @@ impl App {
             return;
         }
         self.win_rect_px = rect;
+        // SAFETY: HWND is valid for this window's lifetime on the UI thread.
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -603,6 +632,7 @@ impl App {
     }
 
     fn sync_fullscreen_timer(&self) {
+        // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
         unsafe {
             if self.cfg.hide_on_fullscreen {
                 SetTimer(self.hwnd, TIMER_FULLSCREEN, 1500, None);
@@ -616,6 +646,7 @@ impl App {
         if !self.cfg.hide_on_fullscreen {
             if self.fullscreen_hidden {
                 self.fullscreen_hidden = false;
+                // SAFETY: HWND is valid for this window's lifetime on the UI thread.
                 unsafe {
                     let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
                 }
@@ -636,6 +667,7 @@ impl App {
             if matches!(self.ui.mode, ViewMode::HoverPeek) {
                 self.set_mode(ViewMode::Collapsed, false);
             }
+            // SAFETY: HWND is valid for this window's lifetime on the UI thread.
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
@@ -644,6 +676,7 @@ impl App {
         } else if !fs && self.fullscreen_hidden {
             self.fullscreen_hidden = false;
             set_window_topmost(self.hwnd, self.cfg.always_on_top);
+            // SAFETY: HWND is valid for this window's lifetime on the UI thread.
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
@@ -661,14 +694,24 @@ impl App {
     }
 
     pub fn render_frame(&mut self) -> windows::core::Result<()> {
-        match self.render_frame_once() {
+        let res = match self.render_frame_once() {
             Ok(()) => Ok(()),
             Err(e) if is_device_lost_error(e.code()) => {
                 self.recreate_graphics_resources()?;
                 self.render_frame_once()
             }
             Err(e) => Err(e),
+        };
+        if let Err(ref e) = res {
+            let should_log = self
+                .last_render_err_log
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(30));
+            if should_log {
+                self.last_render_err_log = Some(Instant::now());
+                crate::config::log_error(&format!("render_frame failed: {e}"));
+            }
         }
+        res
     }
 
     fn render_frame_once(&mut self) -> windows::core::Result<()> {
@@ -700,51 +743,54 @@ impl App {
             r_px,
         )?;
 
-        let dc = self.comp.begin_draw(self.dpi, off_x_dip, off_y_dip)?;
-
-        unsafe {
-            dc.Clear(Some(&D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }));
-        }
-
-        let ctx = DrawCtx::new(
-            &dc,
-            &self.device.d2d_factory,
-            &self.device.dwrite_factory,
-            &self.device.fonts.tabular_typography,
-        )?;
         let acrylic_eff = self.comp.is_acrylic_effective(want_acrylic);
+        let morph_prev = self.prev_mode.as_ref().map(|(m, pw, ph)| (m, *pw, *ph));
         let morph = MorphParams {
-            prev: self
-                .prev_mode
-                .as_ref()
-                .map(|(m, pw, ph)| (m, *pw, *ph)),
+            prev: morph_prev,
             target_w: self.w_dip.target.max(40.0),
             target_h: self.h_dip.target.max(24.0),
             morph_t: self.morph_t.value.clamp(0.0, 1.0),
             bg_opacity: self.bg_alpha.value.clamp(0.0, 0.99),
         };
-        let draw_res = render_ui(
-            &ctx,
-            &self.device.fonts,
-            w_dip,
-            h_dip,
-            r_dip,
-            morph,
-            &mut self.ui,
-            &self.snap,
-            &self.cfg,
-            &self.monitors,
-            acrylic_eff,
-            &mut self.hit_map,
-        );
+        let dpi = self.dpi;
+        let device = &self.device;
+        let ui = &mut self.ui;
+        let snap = &self.snap;
+        let cfg = &self.cfg;
+        let monitors = &self.monitors;
+        let hit_map = &mut self.hit_map;
 
-        let end_res = self.comp.end_draw();
-        draw_res.and(end_res)
+        self.comp.with_draw(dpi, off_x_dip, off_y_dip, |dc| {
+            // SAFETY: `dc` is an active Direct2D device context inside BeginDraw/EndDraw.
+            unsafe {
+                dc.Clear(Some(&D2D1_COLOR_F {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                }));
+            }
+            let ctx = DrawCtx::new(
+                dc,
+                &device.d2d_factory,
+                &device.dwrite_factory,
+                &device.fonts.tabular_typography,
+            )?;
+            render_ui(
+                &ctx,
+                &device.fonts,
+                w_dip,
+                h_dip,
+                r_dip,
+                morph,
+                ui,
+                snap,
+                cfg,
+                monitors,
+                acrylic_eff,
+                hit_map,
+            )
+        })
     }
 
     #[inline]
@@ -783,11 +829,13 @@ impl App {
                 hwndTrack: self.hwnd,
                 dwHoverTime: 0,
             };
+            // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
             unsafe {
                 let _ = TrackMouseEvent(&mut tme);
             }
         }
 
+        // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_LEAVE_COLLAPSE);
         }
@@ -795,6 +843,7 @@ impl App {
         if matches!(self.ui.mode, ViewMode::Collapsed)
             && self.cfg.dock_position == DockPosition::TopCenter
         {
+            // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
             unsafe {
                 SetTimer(
                     self.hwnd,
@@ -846,6 +895,7 @@ impl App {
 
     pub fn on_mouse_leave(&mut self) {
         self.mouse_tracked = false;
+        // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_HOVER_PEEK);
         }
@@ -854,6 +904,7 @@ impl App {
             let _ = self.render_frame();
         }
         if self.should_auto_collapse_on_leave() {
+            // SAFETY: Win32 UI timer id/handle belongs to this active HWND on the UI thread.
             unsafe {
                 SetTimer(self.hwnd, TIMER_LEAVE_COLLAPSE, 250, None);
             }
@@ -878,6 +929,13 @@ impl App {
                     .clone()
                     .unwrap_or_else(|| format!("http://localhost:{port}"));
                 copy_to_clipboard(self.hwnd, &target);
+                self.set_toast(
+                    self.cfg
+                        .language
+                        .pick("Copied to clipboard", "Panoya kopyalandı")
+                        .to_string(),
+                );
+                let _ = self.render_frame();
                 return None;
             }
             if let Some(r_act) = hit.right_click_action.clone() {
@@ -890,7 +948,10 @@ impl App {
     }
 
     pub fn on_mouse_wheel(&mut self, delta: i16, x_px: i32, y_px: i32) {
-        if !matches!(self.ui.mode, ViewMode::Expanded | ViewMode::Detail { .. }) {
+        if !matches!(
+            self.ui.mode,
+            ViewMode::Expanded | ViewMode::Detail { .. } | ViewMode::Settings
+        ) {
             return;
         }
         self.last_mouse_dip = self.client_to_island_dip(x_px, y_px);
@@ -918,7 +979,9 @@ impl App {
             return;
         }
 
+        // SAFETY: HWND is valid for this window's lifetime on the UI thread.
         let ctrl_down = unsafe { (GetKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000) != 0 };
+        // SAFETY: HWND is valid for this window's lifetime on the UI thread.
         let alt_down = unsafe { (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 };
 
         // Inline Add Custom Job mode
@@ -1058,7 +1121,16 @@ impl App {
             }
             v if v == VK_UP.0 => {
                 if matches!(self.ui.mode, ViewMode::Expanded) {
-                    self.ui.selected_index = self.ui.selected_index.saturating_sub(1);
+                    let count: usize = filter_project_jobs(&self.snap, &self.ui.search_query)
+                        .iter()
+                        .map(|(_, jobs)| jobs.len())
+                        .sum();
+                    if count == 0 {
+                        self.ui.selected_index = 0;
+                    } else {
+                        self.ui.selected_index =
+                            self.ui.selected_index.min(count - 1).saturating_sub(1);
+                    }
                     let vh = self
                         .hit_map
                         .scroll_viewport
@@ -1089,6 +1161,22 @@ impl App {
                 }
             }
             v if v == VK_RETURN.0 || v == VK_RIGHT.0 => {
+                if v == VK_RETURN.0 {
+                    if let Some(pk) = self.ui.pending_kill.clone() {
+                        match pk {
+                            PendingKill::Project(id) => {
+                                self.execute_hit_action(HitAction::ConfirmKillProject(id));
+                            }
+                            PendingKill::Job(id) => {
+                                self.execute_hit_action(HitAction::ConfirmKillJob(id));
+                            }
+                            PendingKill::Process(key) => {
+                                self.execute_hit_action(HitAction::ConfirmKillProcess(key));
+                            }
+                        }
+                        return;
+                    }
+                }
                 if matches!(self.ui.mode, ViewMode::Expanded) {
                     let target = filter_project_jobs(&self.snap, &self.ui.search_query)
                         .into_iter()
@@ -1114,13 +1202,7 @@ impl App {
                 }
             }
             v if v == VK_BACK.0 => {
-                if self.ui.search_focused && !self.ui.search_query.is_empty() {
-                    self.ui.search_query.pop();
-                    self.recompute_targets(false);
-                    let _ = self.render_frame();
-                } else if matches!(self.ui.mode, ViewMode::Detail { .. } | ViewMode::Settings)
-                    && self.ui.search_query.is_empty()
-                {
+                if matches!(self.ui.mode, ViewMode::Detail { .. } | ViewMode::Settings) {
                     self.set_mode(ViewMode::Expanded, true);
                 }
             }
@@ -1155,6 +1237,7 @@ impl App {
         {
             return false;
         }
+        // SAFETY: HWND is valid for this window's lifetime on the UI thread.
         let alt_down = unsafe { (GetKeyState(VK_MENU.0 as i32) as u16 & 0x8000) != 0 };
         if !alt_down {
             return false;
@@ -1249,6 +1332,7 @@ impl App {
                 } else {
                     self.ui.unpinned_auto_collapse = true;
                     set_window_activatable(self.hwnd, true);
+                    // SAFETY: HWND is valid for this window's lifetime on the UI thread.
                     unsafe {
                         let _ = SetForegroundWindow(self.hwnd);
                         let _ = SetFocus(self.hwnd);
@@ -1306,6 +1390,11 @@ impl App {
                     shell_open(&root.to_string_lossy());
                 }
             }
+            HitAction::OpenConfigDir => {
+                if let Some(dir) = AppConfig::config_path().parent() {
+                    shell_open(&dir.to_string_lossy());
+                }
+            }
             HitAction::TogglePinProject(id) => {
                 if let Some(p) = self.snap.projects.iter().find(|p| p.id == id) {
                     let next = !p.pinned;
@@ -1339,19 +1428,27 @@ impl App {
                 }
             }
             HitAction::MoveJobOrder(key, delta) => {
-                let current_ids: Vec<String> = self
+                let job_key = |j: &crate::model::Job| {
+                    if !j.match_hint.is_empty() {
+                        j.match_hint.clone()
+                    } else {
+                        j.id.0.clone()
+                    }
+                };
+                let project_job_ids: Option<Vec<String>> = self
                     .snap
                     .projects
                     .iter()
-                    .flat_map(|p| p.jobs.iter())
-                    .map(|j| {
-                        if !j.match_hint.is_empty() {
-                            j.match_hint.clone()
-                        } else {
-                            j.id.0.clone()
-                        }
-                    })
-                    .collect();
+                    .find(|p| p.jobs.iter().any(|j| job_key(j).eq_ignore_ascii_case(&key)))
+                    .map(|p| p.jobs.iter().map(job_key).collect());
+                let current_ids: Vec<String> = project_job_ids.unwrap_or_else(|| {
+                    self.snap
+                        .projects
+                        .iter()
+                        .flat_map(|p| p.jobs.iter())
+                        .map(job_key)
+                        .collect()
+                });
                 if reorder_vec(&mut self.cfg.job_order, &current_ids, &key, delta) {
                     self.cfg.sort_mode = SortMode::Custom;
                     self.save_cfg_or_toast();
@@ -1364,6 +1461,13 @@ impl App {
             }
             HitAction::CopyText(text) => {
                 copy_to_clipboard(self.hwnd, &text);
+                self.set_toast(
+                    self.cfg
+                        .language
+                        .pick("Copied to clipboard", "Panoya kopyalandı")
+                        .to_string(),
+                );
+                let _ = self.render_frame();
             }
             HitAction::HideProject(id) => {
                 if !self
@@ -1467,11 +1571,14 @@ impl App {
                         }
                     }
                 }
+                self.ui.text_all_selected = false;
+                self.ui.search_focused = matches!(self.ui.mode, ViewMode::Expanded);
                 self.recompute_targets(false);
                 let _ = self.render_frame();
             }
             HitAction::CancelRename => {
                 self.ui.rename_draft = None;
+                self.ui.text_all_selected = false;
                 self.ui.search_focused = matches!(self.ui.mode, ViewMode::Expanded);
                 self.recompute_targets(false);
                 let _ = self.render_frame();
@@ -1505,12 +1612,7 @@ impl App {
                     };
                     if !raw_cmd.is_empty() {
                         let match_substr = derive_match_hint(&raw_cmd);
-                        let is_cmd = raw_cmd.contains(' ')
-                            || raw_cmd.ends_with(".py")
-                            || raw_cmd.ends_with(".js")
-                            || raw_cmd.ends_with(".bat")
-                            || raw_cmd.ends_with(".cmd")
-                            || raw_cmd.ends_with(".ps1");
+                        let is_cmd = is_runnable_command(&raw_cmd);
                         let working_dir = derive_workdir_from_cmd(&raw_cmd);
                         let log_file = {
                             let lf = add.log_file.trim();
@@ -1522,12 +1624,7 @@ impl App {
                         };
                         self.engine.send(EngineCmd::SaveLabelRule {
                             match_substr,
-                            project: Some(
-                                self.cfg
-                                    .language
-                                    .pick("Custom Jobs", "Özel İşler")
-                                    .to_string(),
-                            ),
+                            project: Some("Custom Jobs".to_string()),
                             job: title,
                             icon: None,
                             color: None,
@@ -1538,11 +1635,14 @@ impl App {
                         });
                     }
                 }
+                self.ui.text_all_selected = false;
+                self.ui.search_focused = matches!(self.ui.mode, ViewMode::Expanded);
                 self.recompute_targets(false);
                 let _ = self.render_frame();
             }
             HitAction::CancelAddJob => {
                 self.ui.add_job_draft = None;
+                self.ui.text_all_selected = false;
                 self.ui.search_focused = matches!(self.ui.mode, ViewMode::Expanded);
                 self.recompute_targets(false);
                 let _ = self.render_frame();
@@ -1554,12 +1654,7 @@ impl App {
             } => {
                 self.engine.send(EngineCmd::SaveLabelRule {
                     match_substr,
-                    project: Some(
-                        self.cfg
-                            .language
-                            .pick("Custom Jobs", "Özel İşler")
-                            .to_string(),
-                    ),
+                    project: Some("Custom Jobs".to_string()),
                     job: title,
                     icon: None,
                     color: None,
@@ -1577,11 +1672,22 @@ impl App {
                 if let Some(ref term) = self.snap.active_terminal {
                     if !term.lines.is_empty() {
                         copy_to_clipboard(self.hwnd, &term.lines.join("\r\n"));
+                        self.set_toast(
+                            self.cfg
+                                .language
+                                .pick("Copied to clipboard", "Panoya kopyalandı")
+                                .to_string(),
+                        );
+                        let _ = self.render_frame();
                     }
                 }
             }
             HitAction::RefreshTerminalOutput => {
                 self.engine.send(EngineCmd::ForceRescan);
+            }
+            HitAction::JumpTerminalLive => {
+                self.ui.term_scroll_offset = 0.0;
+                let _ = self.render_frame();
             }
             HitAction::RequestKillProject(id) => {
                 self.ui.pending_kill = Some(PendingKill::Project(id));
@@ -1616,6 +1722,7 @@ impl App {
             HitAction::SetLanguage(lang) => {
                 if self.cfg.language != lang {
                     self.cfg.language = lang;
+                    self.tray.set_language(lang);
                     self.save_cfg_or_toast();
                     self.sync_config_to_engine();
                     let _ = self.render_frame();
@@ -1628,7 +1735,7 @@ impl App {
                     self.cfg.monitor_index = (self.cfg.monitor_index + 1) % self.monitors.len();
                     self.dpi = self.monitors[self.cfg.monitor_index].dpi;
                     self.save_cfg_or_toast();
-                    self.recompute_targets(false);
+                    self.recompute_targets(true);
                     let _ = self.render_frame();
                 }
             }
@@ -1667,15 +1774,17 @@ impl App {
                 let _ = self.render_frame();
             }
             HitAction::ToggleHotkeyPreset => {
-                self.cfg.hotkey = match self.cfg.hotkey {
-                    HotkeyPreset::AltSpace => HotkeyPreset::CtrlShiftP,
-                    HotkeyPreset::CtrlShiftP => HotkeyPreset::AltSpace,
-                };
-                match register_hotkey(self.hwnd, self.cfg.hotkey) {
-                    Ok(()) => self.ui.hotkey_failed = false,
-                    Err(err) => {
-                        crate::config::log_error(&format!("hotkey registration failed: {err}"));
-                        self.ui.hotkey_failed = true;
+                self.cfg.hotkey = self.cfg.hotkey.next();
+                if self.cfg.hotkey == HotkeyPreset::Disabled {
+                    let _ = unregister_hotkey(self.hwnd);
+                    self.ui.hotkey_failed = false;
+                } else {
+                    match register_hotkey(self.hwnd, self.cfg.hotkey) {
+                        Ok(()) => self.ui.hotkey_failed = false,
+                        Err(err) => {
+                            crate::config::log_error(&format!("hotkey registration failed: {err}"));
+                            self.ui.hotkey_failed = true;
+                        }
                     }
                 }
                 self.save_cfg_or_toast();
@@ -1698,17 +1807,28 @@ impl App {
         self.cfg.dock_position = pos;
         self.last_collapsed_sig = None;
         self.save_cfg_or_toast();
-        // Animate the move across the screen using spring.morph!
-        self.recompute_targets(false);
+        self.recompute_targets(true);
         let _ = self.render_frame();
     }
 
     pub fn toggle_autostart(&mut self) {
         let next = !self.cfg.autostart;
-        if autostart::set_autostart_enabled(next).is_ok() {
-            self.cfg.autostart = next;
-            self.save_cfg_or_toast();
-            let _ = self.render_frame();
+        match autostart::set_autostart_enabled(next) {
+            Ok(()) => {
+                self.cfg.autostart = next;
+                self.save_cfg_or_toast();
+                let _ = self.render_frame();
+            }
+            Err(err) => {
+                crate::config::log_error(&format!("autostart toggle failed: {err}"));
+                let msg = self
+                    .cfg
+                    .language
+                    .pick("Could not update startup setting.", "Başlangıç ayarı güncellenemedi.")
+                    .to_string();
+                self.set_toast(msg);
+                let _ = self.render_frame();
+            }
         }
     }
 
@@ -1730,10 +1850,12 @@ impl App {
                 self.save_cfg_or_toast();
                 self.sync_fullscreen_timer();
                 self.check_fullscreen();
+                let _ = self.render_frame();
             }
             TrayAction::OpenSettings => {
                 if self.fullscreen_hidden {
                     self.fullscreen_hidden = false;
+                    // SAFETY: HWND is valid for this window's lifetime on the UI thread.
                     unsafe {
                         let _ = ShowWindow(self.hwnd, SW_SHOW);
                     }
@@ -1742,6 +1864,7 @@ impl App {
             }
             TrayAction::Quit => {
                 self.engine.send(EngineCmd::Shutdown);
+                // SAFETY: Posts quit message to the active Win32 message loop.
                 unsafe {
                     PostQuitMessage(0);
                 }
@@ -1803,15 +1926,7 @@ impl App {
     }
 
     fn sync_config_to_engine(&self) {
-        self.engine.send(EngineCmd::SyncConfigState {
-            pinned_projects: self.cfg.pinned_projects.clone(),
-            hidden_projects: self.cfg.hidden_projects.clone(),
-            project_aliases: self.cfg.project_aliases.clone(),
-            project_order: self.cfg.project_order.clone(),
-            job_order: self.cfg.job_order.clone(),
-            sort_mode: self.cfg.sort_mode,
-            language: self.cfg.language,
-        });
+        self.engine.send(self.cfg.to_sync_cmd());
     }
 }
 
@@ -1824,15 +1939,33 @@ fn reorder_vec(order: &mut Vec<String>, visible_ids: &[String], target: &str, de
     let Some(idx) = order.iter().position(|x| x.eq_ignore_ascii_case(target)) else {
         return false;
     };
-    if order.len() < 2 {
+    let dir = delta.signum();
+    if dir == 0 {
         return false;
     }
-    let next = (idx as isize + delta as isize).clamp(0, order.len() as isize - 1) as usize;
-    if next == idx {
-        return false;
+    let is_visible = |id: &str| visible_ids.iter().any(|v| v.eq_ignore_ascii_case(id));
+    let mut cursor = idx as isize + dir as isize;
+    while cursor >= 0 && (cursor as usize) < order.len() {
+        let u = cursor as usize;
+        if is_visible(&order[u]) {
+            order.swap(idx, u);
+            return true;
+        }
+        cursor += dir as isize;
     }
-    order.swap(idx, next);
-    true
+    false
+}
+
+fn is_runnable_command(raw: &str) -> bool {
+    let low = raw.to_ascii_lowercase();
+    raw.contains(' ')
+        || raw.contains('\\')
+        || raw.contains('/')
+        || [
+            ".py", ".pyw", ".js", ".mjs", ".ts", ".bat", ".cmd", ".ps1", ".exe",
+        ]
+        .iter()
+        .any(|ext| low.ends_with(ext))
 }
 
 fn derive_match_hint(raw: &str) -> String {
@@ -1881,6 +2014,7 @@ fn derive_workdir_from_cmd(raw: &str) -> Option<String> {
 }
 
 pub fn paste_from_clipboard(hwnd: HWND) -> Option<String> {
+    // SAFETY: Clipboard and HGLOBAL lock/unlock stay balanced on the UI thread; read length is bounded by GlobalSize.
     unsafe {
         if OpenClipboard(hwnd).is_err() {
             return None;
@@ -1888,14 +2022,25 @@ pub fn paste_from_clipboard(hwnd: HWND) -> Option<String> {
         let mut out = None;
         if let Ok(hdata) = GetClipboardData(13u32 /* CF_UNICODETEXT */) {
             let hmem = windows::Win32::Foundation::HGLOBAL(hdata.0);
+            let max_chars = (GlobalSize(hmem) / 2).min(4096);
             let ptr = GlobalLock(hmem) as *const u16;
-            if !ptr.is_null() {
+            if !ptr.is_null() && max_chars > 0 {
                 let mut len = 0usize;
-                while len < 4096 && *ptr.add(len) != 0 {
+                while len < max_chars && *ptr.add(len) != 0 {
                     len += 1;
                 }
                 let slice = std::slice::from_raw_parts(ptr, len);
-                out = Some(String::from_utf16_lossy(slice));
+                let sanitized: String = String::from_utf16_lossy(slice)
+                    .chars()
+                    .filter_map(|c| match c {
+                        '\r' | '\n' | '\t' => Some(' '),
+                        c if c.is_control() => None,
+                        c => Some(c),
+                    })
+                    .collect();
+                out = Some(sanitized);
+                let _ = GlobalUnlock(hmem);
+            } else if !ptr.is_null() {
                 let _ = GlobalUnlock(hmem);
             }
         }
@@ -2040,6 +2185,7 @@ fn collapsed_visual_sig(snap: &Snapshot) -> u64 {
 fn shell_open(target: &str) {
     let op: Vec<u16> = "open\0".encode_utf16().collect();
     let tgt: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: Null-terminated UTF-16 verb and target strings remain live across the call.
     unsafe {
         let _ = ShellExecuteW(
             None,
@@ -2054,6 +2200,7 @@ fn shell_open(target: &str) {
 
 pub fn copy_to_clipboard(hwnd: HWND, text: &str) {
     let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: Clipboard handle and HGLOBAL memory remain valid and balanced on the UI thread.
     unsafe {
         if OpenClipboard(hwnd).is_err() {
             return;
@@ -2233,5 +2380,45 @@ mod tests {
         assert_eq!(off_col_x, 138.0);
         assert!(off_exp_x + expanded.2 as f32 <= env.2 as f32 - 14.0);
         assert!(off_col_x + collapsed.2 as f32 <= env.2 as f32 - 14.0);
+    }
+
+    #[test]
+    fn reorder_vec_skips_stale_ids_and_finds_visible_neighbor() {
+        let mut order = vec![
+            "a".to_string(),
+            "stale_offline".to_string(),
+            "b".to_string(),
+        ];
+        let visible = vec!["a".to_string(), "b".to_string()];
+        assert!(reorder_vec(&mut order, &visible, "b", -1));
+        assert_eq!(order, vec!["b", "stale_offline", "a"]);
+        assert!(!reorder_vec(&mut order, &visible, "b", -1));
+    }
+
+    #[test]
+    fn derive_workdir_and_runnable_command_behave_consistently() {
+        assert!(is_runnable_command("bot.PYW"));
+        assert!(is_runnable_command(r"bin\worker"));
+        assert!(!is_runnable_command("redis-server"));
+
+        let cwd = std::env::current_dir().unwrap();
+        let script = cwd.join("Cargo.toml");
+        let cmd = format!(r#"cargo build "{}""#, script.display());
+        assert_eq!(
+            derive_workdir_from_cmd(&cmd),
+            Some(cwd.to_string_lossy().into_owned())
+        );
+        assert_eq!(derive_workdir_from_cmd("python relative_bot.py"), None);
+    }
+
+    #[test]
+    fn apply_text_edit_key_handles_delete_and_leaves_regular_keys() {
+        let mut buf = "hello".to_string();
+        let mut sel = true;
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, VK_DELETE.0, false), Some(true));
+        assert!(buf.is_empty());
+        assert!(!sel);
+
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, VK_RETURN.0, false), None);
     }
 }

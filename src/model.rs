@@ -161,7 +161,7 @@ impl TerminalSourceKind {
             Self::ManagedPipe => lang.pick("Live Pipe", "Canlı Pipe"),
             Self::LogFile => lang.pick("Log File", "Log Dosyası"),
             Self::ConsoleBuffer => lang.pick("Console Buffer", "Konsol Tamponu"),
-            Self::StateJson => "State Log",
+            Self::StateJson => lang.pick("State Log", "Durum Logu"),
             Self::None => lang.pick("No Output", "Çıktı Yok"),
         }
     }
@@ -443,7 +443,7 @@ pub fn fold_search_lower(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Language;
+    use super::{fold_search_lower, Language, SortMode, TerminalSourceKind};
 
     #[test]
     fn language_plural_handles_zero_one_and_many() {
@@ -453,5 +453,29 @@ mod tests {
         assert_eq!(Language::Tr.plural(0, "job", "jobs", "iş"), "iş");
         assert_eq!(Language::Tr.plural(1, "job", "jobs", "iş"), "iş");
         assert_eq!(Language::Tr.plural(2, "job", "jobs", "iş"), "iş");
+    }
+
+    #[test]
+    fn fold_search_lower_handles_turkish_and_nfd() {
+        assert_eq!(fold_search_lower("İŞLEM IĞDIR ÖÜŞĞÇ"), "işlem igdir öüşğç".replace('g', "ğ"));
+        assert_eq!(fold_search_lower("I\u{0307}stanbul"), "istanbul");
+        assert_eq!(fold_search_lower("API_Gateway"), "api_gateway");
+    }
+
+    #[test]
+    fn sort_mode_cycles_and_terminal_source_localizes() {
+        let mut m = SortMode::Custom;
+        for expected in [
+            SortMode::Cpu,
+            SortMode::Ram,
+            SortMode::Name,
+            SortMode::Uptime,
+            SortMode::Custom,
+        ] {
+            m = m.next();
+            assert_eq!(m, expected);
+        }
+        assert_eq!(TerminalSourceKind::StateJson.label_for(Language::En), "State Log");
+        assert_eq!(TerminalSourceKind::StateJson.label_for(Language::Tr), "Durum Logu");
     }
 }

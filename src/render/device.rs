@@ -1,6 +1,6 @@
 //! Direct3D 11, DXGI, Direct2D 1.1, and DirectWrite device/factory management.
 
-use crate::render::theme::{FONT_DISPLAY, FONT_MONO, FONT_UI};
+use crate::render::theme::{FONT_DISPLAY, FONT_MONO, FONT_TABULAR, FONT_UI};
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Device, ID2D1Factory1, D2D1_FACTORY_OPTIONS,
@@ -55,13 +55,16 @@ pub struct FontSet {
 impl RenderDevice {
     pub fn new() -> windows::core::Result<Self> {
         let (d3d_device, dxgi_device) = create_d3d_device()?;
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         let d2d_factory: ID2D1Factory1 = unsafe {
             D2D1CreateFactory(
                 D2D1_FACTORY_TYPE_SINGLE_THREADED,
                 Some(&D2D1_FACTORY_OPTIONS::default()),
             )?
         };
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         let d2d_device = unsafe { d2d_factory.CreateDevice(&dxgi_device)? };
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         let dwrite_factory: IDWriteFactory = unsafe {
             DWriteCreateFactory(windows::Win32::Graphics::DirectWrite::DWRITE_FACTORY_TYPE_SHARED)?
         };
@@ -79,6 +82,7 @@ impl RenderDevice {
     /// Rebuilds GPU device resources after `DXGI_ERROR_DEVICE_REMOVED`.
     pub fn recreate(&mut self) -> windows::core::Result<()> {
         let (d3d_device, dxgi_device) = create_d3d_device()?;
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         let d2d_device = unsafe { self.d2d_factory.CreateDevice(&dxgi_device)? };
         self.d3d_device = d3d_device;
         self.dxgi_device = dxgi_device;
@@ -88,6 +92,7 @@ impl RenderDevice {
 
     /// Returns temporary DXGI/D3D driver caches to the OS (used after collapsing).
     pub fn trim(&self) {
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         unsafe {
             self.dxgi_device.Trim();
         }
@@ -102,6 +107,7 @@ fn create_d3d_device() -> windows::core::Result<(ID3D11Device, IDXGIDevice3)> {
     ];
     let mut device: Option<ID3D11Device> = None;
 
+    // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
     let hr = unsafe {
         D3D11CreateDevice(
             None,
@@ -117,6 +123,7 @@ fn create_d3d_device() -> windows::core::Result<(ID3D11Device, IDXGIDevice3)> {
     };
 
     if hr.is_err() || device.is_none() {
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         unsafe {
             D3D11CreateDevice(
                 None,
@@ -150,7 +157,7 @@ impl FontSet {
         )?;
         let pill_mono = make_format(
             dw,
-            FONT_MONO,
+            FONT_TABULAR,
             DWRITE_FONT_WEIGHT_SEMI_BOLD,
             12.0,
             DWRITE_TEXT_ALIGNMENT_LEADING,
@@ -240,7 +247,7 @@ impl FontSet {
         )?;
         let mono_metric = make_format(
             dw,
-            FONT_MONO,
+            FONT_TABULAR,
             DWRITE_FONT_WEIGHT_MEDIUM,
             11.5,
             DWRITE_TEXT_ALIGNMENT_TRAILING,
@@ -249,7 +256,7 @@ impl FontSet {
         )?;
         let mono_badge = make_format(
             dw,
-            FONT_MONO,
+            FONT_TABULAR,
             DWRITE_FONT_WEIGHT_MEDIUM,
             10.5,
             DWRITE_TEXT_ALIGNMENT_CENTER,
@@ -267,14 +274,16 @@ impl FontSet {
         )?;
         let term_line = make_format(
             dw,
-            "Consolas",
+            FONT_MONO,
             DWRITE_FONT_WEIGHT_NORMAL,
             10.5,
             DWRITE_TEXT_ALIGNMENT_LEADING,
             DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
             true,
         )?;
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         let tabular_typography = unsafe { dw.CreateTypography()? };
+        // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         unsafe {
             tabular_typography.AddFontFeature(DWRITE_FONT_FEATURE {
                 nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES,
@@ -312,8 +321,9 @@ fn make_format(
     valign: windows::Win32::Graphics::DirectWrite::DWRITE_PARAGRAPH_ALIGNMENT,
     no_wrap: bool,
 ) -> windows::core::Result<IDWriteTextFormat> {
-    let locale = HSTRING::from("en-US");
+    let locale = HSTRING::from("");
     let fam = HSTRING::from(family);
+    // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
     unsafe {
         let fmt = dw.CreateTextFormat(
             &fam,

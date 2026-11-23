@@ -11,8 +11,8 @@ use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
     MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_LISTEN, MIB_UDP6ROW_OWNER_PID,
-    MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
-    UDP_TABLE_OWNER_PID,
+    MIB_UDP6TABLE_OWNER_PID, MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+    TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID,
 };
 #[cfg(target_os = "windows")]
 use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
@@ -182,7 +182,7 @@ impl ProcessCollector {
         cpu
     }
 
-    /// Collects listening TCP/UDP ports and established TCP counts per PID.
+    /// Collects listening TCP/UDP ports per PID.
     pub fn collect_ports(&mut self) -> HashMap<u32, PidNetworkInfo> {
         #[cfg(target_os = "windows")]
         {
@@ -199,18 +199,10 @@ impl ProcessCollector {
         }
         #[cfg(not(target_os = "windows"))]
         {
-            let Ok(output) = std::process::Command::new("lsof")
-                .args(["-iTCP", "-iUDP", "-P", "-n", "-F", "pPnT"])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .output()
-            else {
+            let Some(stdout) = run_lsof_bounded(&["-iTCP", "-iUDP", "-P", "-n", "-F", "pPnT"]) else {
                 return HashMap::new();
             };
-            if !output.status.success() {
-                return HashMap::new();
-            }
-            parse_lsof_ports(&String::from_utf8_lossy(&output.stdout))
+            parse_lsof_ports(&String::from_utf8_lossy(&stdout))
         }
     }
 
@@ -276,6 +268,7 @@ impl ProcessCollector {
 
     #[cfg(target_os = "windows")]
     fn collect_udp_v4(&mut self, by_pid: &mut HashMap<u32, PidNetworkInfo>) {
+        // SAFETY: Buffer pointer and length match the Win32 IP Helper allocation and returned table size.
         if !query_ip_table(&mut self.net_buf, |ptr, sz| unsafe {
             GetExtendedUdpTable(
                 Some(ptr),
@@ -293,6 +286,7 @@ impl ProcessCollector {
         if byte_len < std::mem::size_of::<MIB_UDPTABLE_OWNER_PID>() {
             return;
         }
+        // SAFETY: Table pointer and dwNumEntries bounds were populated by the preceding Win32 IP Helper query.
         let table = unsafe { &*(self.net_buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID) };
         let count = table.dwNumEntries as usize;
         let rows_offset = std::mem::offset_of!(MIB_UDPTABLE_OWNER_PID, table);
@@ -302,6 +296,7 @@ impl ProcessCollector {
         if rows_offset.saturating_add(rows_bytes) > byte_len {
             return;
         }
+        // SAFETY: Table pointer and dwNumEntries bounds were populated by the preceding Win32 IP Helper query.
         let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) };
 
         for row in rows {
@@ -325,6 +320,7 @@ impl ProcessCollector {
 
     #[cfg(target_os = "windows")]
     fn collect_udp_v6(&mut self, by_pid: &mut HashMap<u32, PidNetworkInfo>) {
+        // SAFETY: Buffer pointer and length match the Win32 IP Helper allocation and returned table size.
         if !query_ip_table(&mut self.net_buf, |ptr, sz| unsafe {
             GetExtendedUdpTable(
                 Some(ptr),
@@ -342,6 +338,7 @@ impl ProcessCollector {
         if byte_len < std::mem::size_of::<MIB_UDP6TABLE_OWNER_PID>() {
             return;
         }
+        // SAFETY: Table pointer and dwNumEntries bounds were populated by the preceding Win32 IP Helper query.
         let table = unsafe { &*(self.net_buf.as_ptr() as *const MIB_UDP6TABLE_OWNER_PID) };
         let count = table.dwNumEntries as usize;
         let rows_offset = std::mem::offset_of!(MIB_UDP6TABLE_OWNER_PID, table);
@@ -351,6 +348,7 @@ impl ProcessCollector {
         if rows_offset.saturating_add(rows_bytes) > byte_len {
             return;
         }
+        // SAFETY: Table pointer and dwNumEntries bounds were populated by the preceding Win32 IP Helper query.
         let rows = unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) };
 
         for row in rows {
@@ -375,8 +373,9 @@ impl ProcessCollector {
 
 #[cfg(target_os = "windows")]
 fn query_tcp_v4_rows(buf: &mut Vec<u64>) -> Option<&[MIB_TCPROW_OWNER_PID]> {
+    // SAFETY: Buffer pointer and length match the Win32 IP Helper allocation and returned table size.
     if !query_ip_table(buf, |ptr, sz| unsafe {
-        GetExtendedTcpTable(Some(ptr), sz, false, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0)
+        GetExtendedTcpTable(Some(ptr), sz, false, AF_INET.0 as u32, TCP_TABLE_OWNER_PID_LISTENER, 0)
     }) {
         return None;
     }
@@ -384,6 +383,7 @@ fn query_tcp_v4_rows(buf: &mut Vec<u64>) -> Option<&[MIB_TCPROW_OWNER_PID]> {
     if byte_len < std::mem::size_of::<MIB_TCPTABLE_OWNER_PID>() {
         return None;
     }
+    // SAFETY: Buffer pointer and length match the Win32 IP Helper allocation and returned table size.
     let table = unsafe { &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID) };
     let count = table.dwNumEntries as usize;
     let rows_offset = std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table);
@@ -391,13 +391,15 @@ fn query_tcp_v4_rows(buf: &mut Vec<u64>) -> Option<&[MIB_TCPROW_OWNER_PID]> {
     if rows_offset.saturating_add(rows_bytes) > byte_len {
         return None;
     }
+    // SAFETY: Buffer pointer and length match the Win32 IP Helper allocation and returned table size.
     Some(unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) })
 }
 
 #[cfg(target_os = "windows")]
 fn query_tcp_v6_rows(buf: &mut Vec<u64>) -> Option<&[MIB_TCP6ROW_OWNER_PID]> {
+    // SAFETY: Buffer pointer and length match the Win32 IP Helper allocation and returned table size.
     if !query_ip_table(buf, |ptr, sz| unsafe {
-        GetExtendedTcpTable(Some(ptr), sz, false, AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_ALL, 0)
+        GetExtendedTcpTable(Some(ptr), sz, false, AF_INET6.0 as u32, TCP_TABLE_OWNER_PID_LISTENER, 0)
     }) {
         return None;
     }
@@ -405,6 +407,7 @@ fn query_tcp_v6_rows(buf: &mut Vec<u64>) -> Option<&[MIB_TCP6ROW_OWNER_PID]> {
     if byte_len < std::mem::size_of::<MIB_TCP6TABLE_OWNER_PID>() {
         return None;
     }
+    // SAFETY: Table pointer and dwNumEntries bounds were populated by the preceding Win32 IP Helper query.
     let table = unsafe { &*(buf.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID) };
     let count = table.dwNumEntries as usize;
     let rows_offset = std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
@@ -412,7 +415,48 @@ fn query_tcp_v6_rows(buf: &mut Vec<u64>) -> Option<&[MIB_TCP6ROW_OWNER_PID]> {
     if rows_offset.saturating_add(rows_bytes) > byte_len {
         return None;
     }
+    // SAFETY: Table pointer and dwNumEntries bounds were populated by the preceding Win32 IP Helper query.
     Some(unsafe { std::slice::from_raw_parts(table.table.as_ptr(), count) })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_lsof_bounded(args: &[&str]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    const MAX_LSOF_BYTES: u64 = 1024 * 1024;
+    let mut child = Command::new("lsof")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let reader = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.take(MAX_LSOF_BYTES).read_to_end(&mut buf);
+            buf
+        })
+    });
+    let deadline = Instant::now() + Duration::from_millis(1800);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    let bytes = reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    if bytes.is_empty() {
+        None
+    } else {
+        Some(bytes)
+    }
 }
 
 /// Lightweight check for whether any port in `ports` is currently listening on IPv4/IPv6 TCP.
@@ -443,18 +487,10 @@ pub fn are_tcp_ports_listening(ports: &[u16]) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let Ok(output) = std::process::Command::new("lsof")
-            .args(["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pPnT"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-        else {
+        let Some(stdout) = run_lsof_bounded(&["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-F", "pPnT"]) else {
             return false;
         };
-        if !output.status.success() {
-            return false;
-        }
-        let map = parse_lsof_ports(&String::from_utf8_lossy(&output.stdout));
+        let map = parse_lsof_ports(&String::from_utf8_lossy(&stdout));
         map.values()
             .any(|info| info.ports.iter().any(|b| ports.contains(&b.port)))
     }

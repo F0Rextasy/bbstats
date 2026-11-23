@@ -5,6 +5,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ---
 
+## [Unreleased]
+
+### Security, Correctness & Architecture
+- **100% Local Privacy & Secret Redaction:** Context-aware `-p` redaction preserves port flags (`next dev -p 3001`, `docker run -p 8080:80`, `psql -p 5432`) while redacting secret flags (`--token`, `--api-key`, `--header`, `-u`/`-a`, URL query tokens, and `mysql -p`); non-shell Unix job spawning avoids `/bin/sh -c` injection.
+- **Process Lifecycle & Crash Reliability:** Double-restart lock (`restarting_jobs`), case-insensitive aliases, project-scoped `RestartProject`, `TCP_TABLE_OWNER_PID_LISTENER` Win32 port table queries, bounded `lsof` timeout on Unix, Linux `/proc/stat` + `/proc/meminfo` native telemetry, and `ExitWatcher` start-timestamp verification.
+- **Safety Documentation & Tests:** Added `// SAFETY:` comments across all `unsafe` Win32/COM/FFI blocks and expanded unit test coverage across resolvers, snapshots, UI springs/hit-testing/layout, and CLI parsers.
+
+### UI, Developer CLI & Ecosystem
+- **New CLI Commands:** Added `bbstats run [--cwd DIR] -- <cmd...>`, `bbstats port <PORT> [--kill]`, and `bbstats launch [DIR] [--list]` (`bbstats.toml`, `Procfile`, `package.json` scripts).
+- **UI & Accessibility Polish:** Changed default global shortcut to `Alt+Shift+B` (plus `Ctrl+Alt+B`, `Alt+Space`, `Ctrl+Shift+P`, `Disabled`), made Settings scrollable with hover highlights and clickable config folder link, added `"↓ Live"` / `"↓ Canlı"` terminal scroll reset button, localized `"Custom Jobs"` / tray / detail strings, split `FONT_TABULAR` / `FONT_MONO`, and synced `HitMap` coordinates across panel morph & tab slide transitions.
+- **CI, Release & Community Docs:** Added Linux CI, macOS `arm64` + `x86_64` release builds, unified `SHA256SUMS.txt` and build-provenance attestations, `SECURITY.md`, `CONTRIBUTING.md`, issue/PR templates, and installation guides.
+
+---
+
 ## [0.2.1] - 2026-11-21
 
 UI polish, bilingual singular/plural grammar, alert banner clarity, and PNG screenshot compression patch release (**v0.2.1**).

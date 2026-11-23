@@ -482,6 +482,7 @@ pub fn dump_shots(
         std::fs::create_dir_all(out_path).map_err(|e| e.to_string())?;
     }
 
+    // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
     let dc: ID2D1DeviceContext = unsafe {
         device
             .d2d_device
@@ -512,13 +513,13 @@ pub fn dump_shots(
                 .unwrap_or_default();
             let log_path = first_job.and_then(|j| j.log_path.as_deref());
             let managed = crate::engine::terminal::ManagedJobStore::new();
-            let labels = crate::engine::labels::LabelsStore::new();
+            let empty_rules: &[crate::engine::labels::LabelRule] = &[];
             detail_snap.active_terminal = Some(crate::engine::terminal::inspect_terminal_output(
                 &first_proj.id,
                 first_job.map(|j| &j.id),
                 &pids,
                 log_path,
-                labels.rules(),
+                empty_rules,
                 &managed,
             ));
         }
@@ -934,6 +935,7 @@ pub fn dump_shots(
             width: w,
             height: h,
         };
+        // SAFETY: Active Direct2D device context or geometry sink inside a valid draw frame.
         unsafe {
             let target_bmp: ID2D1Bitmap1 = dc
                 .CreateBitmap(size, None, 0, &target_props)
@@ -945,92 +947,98 @@ pub fn dump_shots(
             dc.SetTarget(&target_bmp);
             dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             dc.BeginDraw();
-            // Subtle wallpaper backdrop so smoked glass transparency & specular rim show accurately
-            dc.Clear(Some(&D2D1_COLOR_F {
-                r: 0.08,
-                g: 0.11,
-                b: 0.17,
-                a: 1.0,
-            }));
-            dc.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
-                M11: 1.0,
-                M12: 0.0,
-                M21: 0.0,
-                M22: 1.0,
-                M31: pad as f32,
-                M32: pad as f32,
-            });
+            let draw_res: Result<(), String> = (|| {
+                // Subtle wallpaper backdrop so smoked glass transparency & specular rim show accurately
+                dc.Clear(Some(&D2D1_COLOR_F {
+                    r: 0.08,
+                    g: 0.11,
+                    b: 0.17,
+                    a: 1.0,
+                }));
+                dc.SetTransform(&windows::Foundation::Numerics::Matrix3x2 {
+                    M11: 1.0,
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: 1.0,
+                    M31: pad as f32,
+                    M32: pad as f32,
+                });
 
-            let ctx = DrawCtx::new(
-                &dc,
-                &device.d2d_factory,
-                &device.dwrite_factory,
-                &device.fonts.tabular_typography,
-            )
-            .map_err(|e| e.to_string())?;
-            let mut hit_map = HitMap::default();
-            let morph = MorphParams {
-                prev: frame.prev.as_ref().map(|(m, pw, ph)| (m, *pw, *ph)),
-                target_w: frame.target_w,
-                target_h: frame.target_h,
-                morph_t: frame.morph_t,
-                bg_opacity: frame.bg_opacity,
-            };
-            render_ui(
-                &ctx,
-                &device.fonts,
-                w_dip,
-                h_dip,
-                r_dip,
-                MorphParams {
-                    prev: morph.prev,
-                    target_w: morph.target_w,
-                    target_h: morph.target_h,
-                    morph_t: morph.morph_t,
-                    bg_opacity: morph.bg_opacity,
-                },
-                &mut state,
-                frame.snap,
-                &frame.cfg,
-                monitors,
-                false,
-                &mut hit_map,
-            )
-            .map_err(|e| e.to_string())?;
+                let ctx = DrawCtx::new(
+                    &dc,
+                    &device.d2d_factory,
+                    &device.dwrite_factory,
+                    &device.fonts.tabular_typography,
+                )
+                .map_err(|e| e.to_string())?;
+                let mut hit_map = HitMap::default();
+                let morph = MorphParams {
+                    prev: frame.prev.as_ref().map(|(m, pw, ph)| (m, *pw, *ph)),
+                    target_w: frame.target_w,
+                    target_h: frame.target_h,
+                    morph_t: frame.morph_t,
+                    bg_opacity: frame.bg_opacity,
+                };
+                render_ui(
+                    &ctx,
+                    &device.fonts,
+                    w_dip,
+                    h_dip,
+                    r_dip,
+                    MorphParams {
+                        prev: morph.prev,
+                        target_w: morph.target_w,
+                        target_h: morph.target_h,
+                        morph_t: morph.morph_t,
+                        bg_opacity: morph.bg_opacity,
+                    },
+                    &mut state,
+                    frame.snap,
+                    &frame.cfg,
+                    monitors,
+                    false,
+                    &mut hit_map,
+                )
+                .map_err(|e| e.to_string())?;
 
-            if frame.hover_first_job {
-                if let Some(first_job_hit) = hit_map
-                    .regions
-                    .iter()
-                    .find(|r| matches!(r.action, crate::ui::hit_test::HitAction::OpenJobDetail(_, _)))
-                    .map(|r| r.id)
-                {
-                    state.hovered_hit_id = Some(first_job_hit);
-                    dc.Clear(Some(&D2D1_COLOR_F {
-                        r: 0.08,
-                        g: 0.11,
-                        b: 0.17,
-                        a: 1.0,
-                    }));
-                    render_ui(
-                        &ctx,
-                        &device.fonts,
-                        w_dip,
-                        h_dip,
-                        r_dip,
-                        morph,
-                        &mut state,
-                        frame.snap,
-                        &frame.cfg,
-                        monitors,
-                        false,
-                        &mut hit_map,
-                    )
-                    .map_err(|e| e.to_string())?;
+                if frame.hover_first_job {
+                    if let Some(first_job_hit) = hit_map
+                        .regions
+                        .iter()
+                        .find(|r| matches!(r.action, crate::ui::hit_test::HitAction::OpenJobDetail(_, _)))
+                        .map(|r| r.id)
+                    {
+                        state.hovered_hit_id = Some(first_job_hit);
+                        hit_map.regions.clear();
+                        dc.Clear(Some(&D2D1_COLOR_F {
+                            r: 0.08,
+                            g: 0.11,
+                            b: 0.17,
+                            a: 1.0,
+                        }));
+                        render_ui(
+                            &ctx,
+                            &device.fonts,
+                            w_dip,
+                            h_dip,
+                            r_dip,
+                            morph,
+                            &mut state,
+                            frame.snap,
+                            &frame.cfg,
+                            monitors,
+                            false,
+                            &mut hit_map,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
                 }
-            }
+                Ok(())
+            })();
 
-            dc.EndDraw(None, None).map_err(|e| e.to_string())?;
+            let end_res = dc.EndDraw(None, None).map_err(|e| e.to_string());
+            draw_res?;
+            end_res?;
             cpu_bmp
                 .CopyFromBitmap(None, &target_bmp, None)
                 .map_err(|e| e.to_string())?;

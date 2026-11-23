@@ -1,29 +1,30 @@
 # bbstats Custom Rules Example
-# Windows: copy desired rules into %APPDATA%\bbstats\labels.toml
-# macOS: ~/Library/Application Support/bbstats/labels.toml
+# Windows: %APPDATA%\bbstats\labels.toml
+# macOS:   ~/Library/Application Support/bbstats/labels.toml
+# Linux:   ~/.config/bbstats/labels.toml
 
 [[rule]]
 # Case-insensitive substring matched against process cmdline, script path, or working directory.
-match = "worker-bot\\auto_updater"
+match = "worker-bot"
 project = "WorkerBot"
-job = "Auto Updater"
+job = "Queue Worker"
 icon = "🤖"
 color = "#F5B73B"
 
 # Optional JSON state file binding for processes whose cmdline/cwd is restricted or that emit structured status logs.
-pid_file = "%USERPROFILE%\\.omp\\local\\worker-bot\\auto-state.json"
+pid_file = "%USERPROFILE%\\projects\\worker-bot\\state.json"
 pid_key = "pid"
-log_file = "%USERPROFILE%\\.omp\\local\\worker-bot\\auto-console.log"
+log_file = "%USERPROFILE%\\projects\\worker-bot\\worker.log"
 
 # Optional folder scan for stopped automation scripts & Task Scheduler watchdog enrichment.
-scan_dir = "%USERPROFILE%\\.omp\\local\\worker-bot"
+scan_dir = "%USERPROFILE%\\projects\\worker-bot"
 scheduled_task = "WorkerBotWatchdog"
 
 # Optional toggle: keep periodic watchdog scripts out of active job rows.
 # hide_transient = true
 
 # Optional launch command & watching when stopped.
-# command = "pythonw auto_updater.py"
+# command = "pythonw worker.py"
 # working_dir = "%USERPROFILE%\\projects\\worker-bot"
 # watch = true
 
@@ -31,7 +32,7 @@ scheduled_task = "WorkerBotWatchdog"
 # auto_restart = true
 
 [[rule]]
-match = "api-server"
+match = "acme-api"
 project = "Acme API"
 job = "Backend"
 command = "python -m uvicorn app.main:app --port 8000"
@@ -39,3 +40,13 @@ working_dir = "%USERPROFILE%\\dev\\acme-api"
 log_file = "%USERPROFILE%\\dev\\acme-api\\server.log"
 watch = true
 auto_restart = true
+
+# --- macOS / Linux Example ---
+# [[rule]]
+# match = "celery-worker"
+# project = "Acme Platform"
+# job = "Celery Worker"
+# command = "celery -A app.worker worker --loglevel=info"
+# working_dir = "~/dev/acme-platform"
+# log_file = "~/dev/acme-platform/worker.log"
+# watch = true

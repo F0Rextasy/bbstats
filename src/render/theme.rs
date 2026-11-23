@@ -79,7 +79,8 @@ pub const PROJECT_PALETTE: [D2D1_COLOR_F; 6] = [
 
 pub const FONT_UI: &str = "Segoe UI Variable Text";
 pub const FONT_DISPLAY: &str = "Segoe UI Variable Display";
-pub const FONT_MONO: &str = "Segoe UI Variable Text";
+pub const FONT_TABULAR: &str = "Segoe UI Variable Text";
+pub const FONT_MONO: &str = "Consolas";
 
 /// Critical-damped and alert spring parameters for island morphing.
 #[derive(Debug, Clone, Copy)]

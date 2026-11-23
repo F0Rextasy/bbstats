@@ -12,6 +12,7 @@ pub const BASE_DPI: u32 = 96;
 
 /// Enables Per-Monitor v2 DPI awareness as a runtime safeguard alongside the embedded manifest.
 pub fn enable_per_monitor_v2() {
+    // SAFETY: DPI awareness query/setup with valid HWND/context handle.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -19,6 +20,7 @@ pub fn enable_per_monitor_v2() {
 
 /// Returns the effective DPI for `hwnd`, defaulting to 96 if unavailable.
 pub fn window_dpi(hwnd: HWND) -> u32 {
+    // SAFETY: DPI awareness query/setup with valid HWND/context handle.
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     if dpi == 0 {
         BASE_DPI
@@ -45,6 +47,7 @@ pub fn px_to_dip(px: i32, dpi: u32) -> f32 {
 /// Checks Windows `SPI_GETCLIENTAREAANIMATION` to respect the user's Reduced Motion setting.
 pub fn is_reduced_motion() -> bool {
     let mut animations_enabled: i32 = 1;
+    // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
     let ok = unsafe {
         SystemParametersInfoW(
             SPI_GETCLIENTAREAANIMATION,

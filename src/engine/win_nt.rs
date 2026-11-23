@@ -29,6 +29,8 @@ pub struct PebInspection {
     pub peb_readable: bool,
     pub virtual_env: Option<String>,
     pub compose_project_env: Option<String>,
+    /// Safe developer-oriented env vars captured in memory for faithful restarts (never logged or serialized).
+    pub dev_env: Vec<(String, String)>,
 }
 
 /// Summary of a running Docker container parsed from Engine API `/containers/json`.
@@ -95,15 +97,39 @@ pub fn parse_docker_containers_json(body: &str) -> Vec<DockerContainerSummary> {
         .collect()
 }
 
-fn parse_http_200_body(raw_http: &[u8]) -> Option<&str> {
+fn parse_http_200_body(raw_http: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(raw_http).ok()?;
     let (head, body) = text.split_once("\r\n\r\n")?;
     let status_line = head.lines().next()?;
-    if status_line.starts_with("HTTP/1.") && status_line.contains(" 200 ") {
-        Some(body)
-    } else {
-        None
+    if !(status_line.starts_with("HTTP/1.") && status_line.contains(" 200 ")) {
+        return None;
     }
+    let is_chunked = head
+        .lines()
+        .any(|l| l.to_ascii_lowercase().contains("transfer-encoding:") && l.to_ascii_lowercase().contains("chunked"));
+    if is_chunked {
+        decode_http_chunked(body)
+    } else {
+        Some(body.to_string())
+    }
+}
+
+fn decode_http_chunked(mut rest: &str) -> Option<String> {
+    let mut out = String::with_capacity(rest.len());
+    loop {
+        let (size_line, after_size) = rest.split_once("\r\n")?;
+        let hex = size_line.split(';').next().unwrap_or(size_line).trim();
+        let len = usize::from_str_radix(hex, 16).ok()?;
+        if len == 0 {
+            break;
+        }
+        if after_size.len() < len {
+            return None;
+        }
+        out.push_str(&after_size[..len]);
+        rest = after_size[len..].strip_prefix("\r\n")?;
+    }
+    Some(out)
 }
 
 /// Parses a single `ps -axo pid=,ppid=,rss=,etime=,time=,comm=` output line cleanly,
@@ -359,6 +385,7 @@ mod platform_imp {
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
             if !self.0.is_invalid() {
+                // SAFETY: Process/window Win32 handles and callbacks remain valid within scope.
                 unsafe {
                     let _ = CloseHandle(self.0);
                 }
@@ -368,6 +395,7 @@ mod platform_imp {
 
     /// Returns the number of logical CPU cores on this machine (minimum 1).
     pub fn logical_core_count() -> u32 {
+        // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
         unsafe {
             let mut info: SYSTEM_INFO = zeroed();
             GetSystemInfo(&mut info);
@@ -378,6 +406,7 @@ mod platform_imp {
     /// Queries system-wide `(idle_100ns, kernel_100ns, user_100ns)`.
     /// Note: on Windows, `kernel_100ns` includes `idle_100ns`.
     pub fn query_system_times_100ns() -> Option<(u64, u64, u64)> {
+        // SAFETY: Win32 time struct pointer is valid and aligned for the call.
         unsafe {
             let mut idle = FILETIME::default();
             let mut kernel = FILETIME::default();
@@ -393,6 +422,7 @@ mod platform_imp {
 
     /// Queries physical memory `(used_bytes, total_bytes)`.
     pub fn query_system_memory() -> (u64, u64) {
+        // SAFETY: Initialized MEMORYSTATUSEX struct with valid dwLength.
         unsafe {
             let mut mem = MEMORYSTATUSEX {
                 dwLength: size_of::<MEMORYSTATUSEX>() as u32,
@@ -410,6 +440,7 @@ mod platform_imp {
 
     /// Returns the current Windows file time in 100ns intervals since 1601-01-01 (matches `CreateTime`).
     pub fn current_system_time_100ns() -> i64 {
+        // SAFETY: Win32 time struct pointer is valid and aligned for the call.
         let ft = unsafe { GetSystemTimeAsFileTime() };
         (((ft.dwHighDateTime as u64) << 32) | (ft.dwLowDateTime as u64)) as i64
     }
@@ -426,6 +457,7 @@ mod platform_imp {
         let mut ret_len: u32 = 0;
         loop {
             let byte_len = (scratch_buf.len() * size_of::<u64>()) as u32;
+            // SAFETY: Process HANDLE and output buffers/lengths match the Win32/NT API ABI.
             let status = unsafe {
                 NtQuerySystemInformation(
                     SYSTEM_PROCESS_INFORMATION,
@@ -458,6 +490,7 @@ mod platform_imp {
         let mut offset: usize = 0;
 
         while offset + size_of::<SystemProcessInformation>() <= valid_len {
+            // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
             let entry = unsafe {
                 std::ptr::read_unaligned(base_ptr.add(offset) as *const SystemProcessInformation)
             };
@@ -507,6 +540,7 @@ mod platform_imp {
         if buf_addr < base_addr || str_end > end_addr {
             return None;
         }
+        // SAFETY: Table pointer and dwNumEntries bounds were populated by the preceding Win32 IP Helper query.
         let bytes = unsafe { std::slice::from_raw_parts(buf_addr as *const u8, byte_len) };
         let units: Vec<u16> = bytes
             .as_chunks::<2>()
@@ -539,6 +573,7 @@ mod platform_imp {
 
         let mut wow64_peb: usize = 0;
         let mut ret_len: u32 = 0;
+        // SAFETY: Process HANDLE and output buffers/lengths match the Win32/NT API ABI.
         let wow_status = unsafe {
             NtQueryInformationProcess(
                 handle.raw(),
@@ -556,7 +591,9 @@ mod platform_imp {
             return out;
         }
 
+        // SAFETY: Process HANDLE and output buffers/lengths match the Win32/NT API ABI.
         let mut pbi: ProcessBasicInformation64 = unsafe { zeroed() };
+        // SAFETY: Process HANDLE and output buffers/lengths match the Win32/NT API ABI.
         let basic_status = unsafe {
             NtQueryInformationProcess(
                 handle.raw(),
@@ -680,6 +717,7 @@ mod platform_imp {
         }
         let mut buf = vec![0u16; capped / 2];
         let mut read_bytes = 0usize;
+        // SAFETY: Process HANDLE and output buffers/lengths match the Win32/NT API ABI.
         let ok = unsafe {
             ReadProcessMemory(
                 handle,
@@ -704,10 +742,15 @@ mod platform_imp {
             }
             let entry = String::from_utf16_lossy(&buf[start..start + rel_end]);
             if let Some((k, v)) = entry.split_once('=') {
-                if k.eq_ignore_ascii_case("VIRTUAL_ENV") && !v.is_empty() {
-                    out.virtual_env = Some(v.to_string());
-                } else if k.eq_ignore_ascii_case("COMPOSE_PROJECT_NAME") && !v.is_empty() {
-                    out.compose_project_env = Some(v.to_string());
+                if !v.is_empty() {
+                    if k.eq_ignore_ascii_case("VIRTUAL_ENV") {
+                        out.virtual_env = Some(v.to_string());
+                    } else if k.eq_ignore_ascii_case("COMPOSE_PROJECT_NAME") {
+                        out.compose_project_env = Some(v.to_string());
+                    }
+                    if is_safe_restart_env_key(k) && out.dev_env.len() < 16 {
+                        out.dev_env.push((k.to_string(), v.to_string()));
+                    }
                 }
             }
             start += rel_end + 1;
@@ -723,6 +766,7 @@ mod platform_imp {
     }
 
     fn read_remote_struct<T: Copy>(handle: HANDLE, addr: u64) -> Option<T> {
+        // SAFETY: Process HANDLE and output buffers/lengths match the Win32/NT API ABI.
         unsafe {
             let mut val: T = zeroed();
             let mut read = 0usize;
@@ -750,6 +794,7 @@ mod platform_imp {
         let capped_bytes = byte_len.min(32 * 1024);
         let mut buf = vec![0u16; capped_bytes / 2];
         let mut read = 0usize;
+        // SAFETY: Process HANDLE and output buffers/lengths match the Win32/NT API ABI.
         let ok = unsafe {
             ReadProcessMemory(
                 handle,
@@ -769,6 +814,7 @@ mod platform_imp {
     pub fn query_full_image_name(handle: HANDLE) -> Option<PathBuf> {
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
+        // SAFETY: Valid Win32 handle/buffer sized for the query.
         let ok = unsafe {
             QueryFullProcessImageNameW(
                 handle,
@@ -785,6 +831,7 @@ mod platform_imp {
     }
 
     pub fn open_process_owned(rights: PROCESS_ACCESS_RIGHTS, pid: u32) -> Option<OwnedHandle> {
+        // SAFETY: Process/window Win32 handles and callbacks remain valid within scope.
         unsafe { OpenProcess(rights, false, pid).ok().map(OwnedHandle) }
     }
 
@@ -793,6 +840,7 @@ mod platform_imp {
         let mut exit = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
+        // SAFETY: Process/window Win32 handles and callbacks remain valid within scope.
         unsafe {
             GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).ok()?;
         }
@@ -800,6 +848,7 @@ mod platform_imp {
     }
 
     pub fn is_process_alive_handle(handle: HANDLE) -> bool {
+        // SAFETY: Process/window Win32 handles and callbacks remain valid within scope.
         unsafe { WaitForSingleObject(handle, 0) == WAIT_TIMEOUT }
     }
 
@@ -830,6 +879,7 @@ mod platform_imp {
             return false;
         };
         let mut critical = BOOL(0);
+        // SAFETY: Current process pseudo-handle trim call with valid flags.
         unsafe {
             if IsProcessCritical(h.raw(), &mut critical).is_ok() {
                 critical.as_bool()
@@ -840,11 +890,13 @@ mod platform_imp {
     }
 
     pub fn current_pid() -> u32 {
+        // SAFETY: Current process pseudo-handle trim call with valid flags.
         unsafe { GetCurrentProcessId() }
     }
 
     pub fn get_exit_code(handle: HANDLE) -> Option<i32> {
         let mut code = 0u32;
+        // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
         unsafe {
             if GetExitCodeProcess(handle, &mut code).is_ok() {
                 Some(code as i32)
@@ -860,6 +912,7 @@ mod platform_imp {
             .encode_utf16()
             .collect();
         let mut root_key = HKEY::default();
+        // SAFETY: Registry HKEY is opened/closed within scope with NUL-terminated UTF-16 names and exact byte buffers.
         let open_res = unsafe {
             RegOpenKeyExW(
                 HKEY_CURRENT_USER,
@@ -879,6 +932,7 @@ mod platform_imp {
         for idx in 0..32u32 {
             let mut name_buf = [0u16; 128];
             let mut name_len = name_buf.len() as u32;
+            // SAFETY: FFI/Win32 call uses valid handles and initialized buffers scoped to this call.
             let enum_res = unsafe {
                 RegEnumKeyExW(
                     root_key,
@@ -896,6 +950,7 @@ mod platform_imp {
             }
 
             let mut child_key = HKEY::default();
+            // SAFETY: Registry HKEY is opened/closed within scope with NUL-terminated UTF-16 names and exact byte buffers.
             let child_open = unsafe {
                 RegOpenKeyExW(
                     root_key,
@@ -912,6 +967,7 @@ mod platform_imp {
             let mut data = [0u16; 128];
             let mut data_bytes = (data.len() * 2) as u32;
             let mut val_type = REG_VALUE_TYPE::default();
+            // SAFETY: Registry HKEY is opened/closed within scope with NUL-terminated UTF-16 names and exact byte buffers.
             let q_res = unsafe {
                 RegQueryValueExW(
                     child_key,
@@ -922,6 +978,7 @@ mod platform_imp {
                     Some(&mut data_bytes),
                 )
             };
+            // SAFETY: Registry HKEY is opened/closed within scope with NUL-terminated UTF-16 names and exact byte buffers.
             unsafe {
                 let _ = RegCloseKey(child_key);
             }
@@ -937,6 +994,7 @@ mod platform_imp {
             }
         }
 
+        // SAFETY: Registry HKEY is opened/closed within scope with NUL-terminated UTF-16 names and exact byte buffers.
         unsafe {
             let _ = RegCloseKey(root_key);
         }
@@ -960,6 +1018,7 @@ mod platform_imp {
         }
 
         let pipe_name_wide: Vec<u16> = "\\\\.\\pipe\\docker_engine\0".encode_utf16().collect();
+        // SAFETY: Null-terminated UTF-16 pipe path lives across WaitNamedPipeW.
         let ready = unsafe { WaitNamedPipeW(PCWSTR(pipe_name_wide.as_ptr()), 40) };
         if !ready.as_bool() {
             IN_FLIGHT.store(false, Ordering::Release);
@@ -980,14 +1039,16 @@ mod platform_imp {
                     pipe.write_all(req).ok()?;
                     let mut raw = Vec::with_capacity(8192);
                     let mut chunk = [0u8; 4096];
-                    while raw.len() < 512 * 1024 {
+                    while raw.len() < 2 * 1024 * 1024 {
                         match pipe.read(&mut chunk) {
                             Ok(0) => break,
                             Ok(n) => raw.extend_from_slice(&chunk[..n]),
                             Err(_) => break,
                         }
                     }
-                    parse_http_200_body(&raw).map(parse_docker_containers_json)
+                    parse_http_200_body(&raw)
+                        .as_deref()
+                        .map(parse_docker_containers_json)
                 })()
                 .unwrap_or_default();
                 IN_FLIGHT.store(false, Ordering::Release);
@@ -1023,7 +1084,28 @@ mod platform_imp {
     }
 
     pub fn query_system_times_100ns() -> Option<(u64, u64, u64)> {
-        None
+        #[cfg(target_os = "linux")]
+        {
+            let text = std::fs::read_to_string("/proc/stat").ok()?;
+            let cpu_line = text.lines().find(|l| l.starts_with("cpu "))?;
+            let nums: Vec<u64> = cpu_line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|s| s.parse::<u64>().ok())
+                .collect();
+            if nums.len() >= 4 {
+                let user = nums[0] + nums[1];
+                let kernel = nums[2] + nums.get(5).copied().unwrap_or(0) + nums.get(6).copied().unwrap_or(0);
+                let idle = nums[3] + nums.get(4).copied().unwrap_or(0);
+                // Scale ticks by 100_000 (ratios only matter in collector.rs).
+                return Some((idle * 100_000, kernel * 100_000, user * 100_000));
+            }
+            None
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     pub fn query_system_memory() -> (u64, u64) {
@@ -1057,7 +1139,25 @@ mod platform_imp {
                 .unwrap_or(0);
             (used.min(total), total)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+                return (0, 0);
+            };
+            let mut total_kb = 0u64;
+            let mut avail_kb = 0u64;
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    total_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                    avail_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                }
+            }
+            let total = total_kb.saturating_mul(1024);
+            let used = total_kb.saturating_sub(avail_kb).saturating_mul(1024);
+            (used.min(total), total)
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
         {
             (0, 0)
         }
@@ -1071,16 +1171,14 @@ mod platform_imp {
         ((secs + WINDOWS_EPOCH_OFFSET_SECS as f64) * 10_000_000.0) as i64
     }
 
+    static ANCHORS: OnceLock<Mutex<HashMap<u32, (i64, i64)>>> = OnceLock::new();
+
     fn stable_create_time_100ns(pid: u32, etime_100ns: i64, now_100ns: i64) -> i64 {
-        static ANCHORS: OnceLock<Mutex<HashMap<u32, (i64, i64)>>> = OnceLock::new();
         let cache = ANCHORS.get_or_init(|| Mutex::new(HashMap::with_capacity(256)));
         let approx = now_100ns.saturating_sub(etime_100ns).max(1);
         let Ok(mut map) = cache.lock() else {
             return approx;
         };
-        if map.len() > 2048 {
-            map.clear();
-        }
         if let Some(&(anchored, prev_etime)) = map.get(&pid) {
             if etime_100ns + 20_000_000 >= prev_etime && (approx - anchored).abs() <= 50_000_000 {
                 map.insert(pid, (anchored, etime_100ns));
@@ -1089,6 +1187,16 @@ mod platform_imp {
         }
         map.insert(pid, (approx, etime_100ns));
         approx
+    }
+
+    fn prune_stale_anchors(active_pids: &std::collections::HashSet<u32>) {
+        if let Some(cache) = ANCHORS.get() {
+            if let Ok(mut map) = cache.lock() {
+                if map.len() > active_pids.len().saturating_add(128) {
+                    map.retain(|pid, _| active_pids.contains(pid));
+                }
+            }
+        }
     }
 
     /// Verifies that `key.pid` is still alive and belongs to the same process start time.
@@ -1120,7 +1228,8 @@ mod platform_imp {
             return false;
         };
         let approx = current_system_time_100ns().saturating_sub(etime_100ns);
-        (approx - key.create_time_100ns).abs() <= 60_000_000
+        // Tightened to 2.5 seconds to minimize PID-reuse window while allowing 1s ps jitter.
+        (approx - key.create_time_100ns).abs() <= 25_000_000
     }
 
     pub fn enumerate_processes(_scratch_buf: &mut Vec<u64>, out: &mut Vec<RawProcessEntry>) {
@@ -1138,12 +1247,14 @@ mod platform_imp {
         }
         let now_100ns = current_system_time_100ns();
         let text = String::from_utf8_lossy(&output.stdout);
+        let mut active_pids = std::collections::HashSet::with_capacity(256);
         for line in text.lines() {
             let Some((pid, ppid, rss_kb, etime_100ns, cpu_time_100ns, comm_raw)) =
                 parse_ps_line(line)
             else {
                 continue;
             };
+            active_pids.insert(pid);
             let image_name = Path::new(comm_raw)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
@@ -1161,6 +1272,7 @@ mod platform_imp {
                 image_name,
             });
         }
+        prune_stale_anchors(&active_pids);
     }
 
     /// Batch-prefetches `comm`, `args`, and `cwd` for many PIDs at once to avoid per-PID subprocess storms.
@@ -1292,7 +1404,7 @@ mod platform_imp {
             }
             let mut raw = Vec::with_capacity(8192);
             let mut chunk = [0u8; 4096];
-            while raw.len() < 512 * 1024 {
+            while raw.len() < 2 * 1024 * 1024 {
                 match stream.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => raw.extend_from_slice(&chunk[..n]),
@@ -1300,11 +1412,31 @@ mod platform_imp {
                 }
             }
             if let Some(body) = parse_http_200_body(&raw) {
-                return parse_docker_containers_json(body);
+                return parse_docker_containers_json(&body);
             }
         }
         Vec::new()
     }
+}
+
+fn is_safe_restart_env_key(k: &str) -> bool {
+    let up = k.to_ascii_uppercase();
+    matches!(
+        up.as_str(),
+        "VIRTUAL_ENV"
+            | "CONDA_PREFIX"
+            | "CONDA_DEFAULT_ENV"
+            | "NODE_ENV"
+            | "PORT"
+            | "HOST"
+            | "COMPOSE_PROJECT_NAME"
+            | "PYTHONPATH"
+            | "RUST_LOG"
+            | "ASPNETCORE_ENVIRONMENT"
+            | "FLASK_ENV"
+            | "DJANGO_SETTINGS_MODULE"
+            | "PATH"
+    )
 }
 
 pub use platform_imp::*;

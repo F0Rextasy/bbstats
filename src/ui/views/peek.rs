@@ -1,11 +1,11 @@
 use super::rect;
 use crate::config::AppConfig;
-use crate::model::{ProjectGroup, ProjectStatus, Snapshot};
+use crate::model::{ProjectGroup, Snapshot};
 use crate::render::device::FontSet;
 use crate::render::primitives::DrawCtx;
 use crate::render::theme::*;
 use crate::ui::hit_test::{HitAction, HitMap};
-use crate::ui::layout::format_ram;
+use crate::ui::layout::{format_ram, select_peek_projects};
 
 pub(super) fn render_hover_peek(
     ctx: &DrawCtx<'_>,
@@ -57,20 +57,7 @@ pub(super) fn render_hover_peek(
         &fonts.section_hdr_center,
     )?;
 
-    let mut sorted: Vec<&ProjectGroup> = snap
-        .projects
-        .iter()
-        .filter(|p| p.jobs.iter().any(|j| j.status != ProjectStatus::Stopped))
-        .collect();
-    if sorted.is_empty() {
-        sorted = snap.projects.iter().filter(|p| !p.jobs.is_empty()).collect();
-    }
-    sorted.sort_by(|a, b| {
-        b.pinned
-            .cmp(&a.pinned)
-            .then_with(|| b.ram.cmp(&a.ram))
-            .then_with(|| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal))
-    });
+    let sorted: Vec<&ProjectGroup> = select_peek_projects(snap);
 
     let total_ram_max = snap.total_dev_ram_bytes.max(1) as f32;
 
@@ -86,11 +73,7 @@ pub(super) fn render_hover_peek(
         for (idx, proj) in sorted.iter().take(3).enumerate() {
             let y = 52.0 + idx as f32 * 34.0;
             let row_rect = rect(10.0, y, w - 10.0, y + 32.0);
-            let swatch = proj
-                .color
-                .as_deref()
-                .and_then(parse_hex_color)
-                .unwrap_or(PROJECT_PALETTE[idx % PROJECT_PALETTE.len()]);
+            let swatch = super::project_swatch_color(proj, idx);
             ctx.fill_rounded(rect(16.0, y + 12.0, 24.0, y + 20.0), 2.5, swatch)?;
 
             let name_txt = if proj.pinned {
@@ -101,7 +84,7 @@ pub(super) fn render_hover_peek(
             ctx.draw_text(
                 &name_txt,
                 &fonts.row_primary,
-                rect(32.0, y, 186.0, y + 32.0),
+                rect(32.0, y, 180.0, y + 32.0),
                 TEXT_PRIMARY,
                 false,
             )?;
@@ -113,18 +96,18 @@ pub(super) fn render_hover_peek(
                     lang.plural(proj.jobs.len(), "job", "jobs", "iş")
                 ),
                 &fonts.row_secondary,
-                rect(190.0, y, 228.0, y + 32.0),
+                rect(184.0, y, 222.0, y + 32.0),
                 TEXT_MUTED,
                 true,
             )?;
 
             let share = (proj.ram as f32 / total_ram_max).clamp(0.06, 1.0);
-            ctx.draw_progress_bar(rect(234.0, y + 13.5, 290.0, y + 18.5), share, BG_TRACK, swatch)?;
+            ctx.draw_progress_bar(rect(226.0, y + 13.5, 274.0, y + 18.5), share, BG_TRACK, swatch)?;
 
             ctx.draw_text(
                 &format_ram(proj.ram),
                 &fonts.mono_metric,
-                rect(294.0, y, 346.0, y + 32.0),
+                rect(278.0, y, 326.0, y + 32.0),
                 TEXT_PRIMARY,
                 true,
             )?;
@@ -132,7 +115,7 @@ pub(super) fn render_hover_peek(
             ctx.draw_text(
                 &format!("{:.1}%", proj.cpu),
                 &fonts.mono_metric,
-                rect(348.0, y, w - 16.0, y + 32.0),
+                rect(330.0, y, w - 14.0, y + 32.0),
                 if proj.cpu > 75.0 { ACCENT_WARN } else { TEXT_SECONDARY },
                 true,
             )?;
@@ -150,14 +133,14 @@ pub(super) fn render_hover_peek(
     ctx.draw_text(
         lang.pick("Click for details", "Detaylar için tıkla"),
         &fonts.row_secondary,
-        rect(16.0, fy + 2.0, 260.0, h - 2.0),
+        rect(16.0, fy + 2.0, 240.0, h - 2.0),
         TEXT_MUTED,
         false,
     )?;
     ctx.draw_text(
-        cfg.hotkey.label(),
+        cfg.hotkey.label(lang),
         &fonts.mono_badge,
-        rect(w - 130.0, fy + 3.0, w - 14.0, h - 3.0),
+        rect(w - 150.0, fy + 3.0, w - 14.0, h - 3.0),
         TEXT_SECONDARY,
         false,
     )?;

@@ -55,8 +55,10 @@ pub fn analyze_command_and_paths(
         .and_then(|p| p.parent())
         .map(Path::to_path_buf);
 
+    let exe_base = effective_exe.strip_suffix(".exe").unwrap_or(&effective_exe);
+
     // Python `-m module.name`
-    let module_name = if effective_exe.starts_with("python") || effective_exe == "uvicorn.exe" {
+    let module_name = if exe_base.starts_with("python") || exe_base == "uvicorn" {
         extract_python_module(args)
     } else {
         None
@@ -93,14 +95,44 @@ pub fn analyze_command_and_paths(
         });
 
     // Determine role & role_label
-    if matches!(effective_exe.as_str(), "node.exe" | "node" | "bun.exe" | "bun" | "deno.exe" | "deno") {
-        let (role, label) = if lower_cmd.contains("next") && (lower_cmd.contains("dev") || lower_cmd.contains("start")) {
+    let has_arg_token = |needle: &str| {
+        args.iter().any(|a| {
+            let low = a.to_ascii_lowercase();
+            let leaf = low.rsplit(['/', '\\']).next().unwrap_or(&low);
+            let stem = leaf
+                .strip_suffix(".js")
+                .or_else(|| leaf.strip_suffix(".mjs"))
+                .or_else(|| leaf.strip_suffix(".cjs"))
+                .or_else(|| leaf.strip_suffix(".ts"))
+                .or_else(|| leaf.strip_suffix(".cmd"))
+                .unwrap_or(leaf);
+            low == needle || stem == needle
+        })
+    };
+    let script_or_mod_has_word = |needle: &str| {
+        let check = |s: &str| {
+            s.to_ascii_lowercase()
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| w == needle)
+        };
+        script_file_name.as_deref().is_some_and(check)
+            || module_name.as_deref().is_some_and(check)
+    };
+
+    if matches!(exe_base, "node" | "bun" | "deno") {
+        let is_next = has_arg_token("next")
+            || lower_cmd.contains("next/dist/bin/next")
+            || lower_cmd.contains("next\\dist\\bin\\next");
+        let is_vite = has_arg_token("vite")
+            || lower_cmd.contains("vite/bin/vite")
+            || lower_cmd.contains("vite\\bin\\vite");
+        let (role, label) = if is_next && (has_arg_token("dev") || has_arg_token("start")) {
             (ProcessRole::DevServer, "Next.js Dev".to_string())
-        } else if lower_cmd.contains("vite") {
+        } else if is_vite {
             (ProcessRole::DevServer, "Vite Dev".to_string())
-        } else if lower_cmd.contains("rotator") {
+        } else if script_or_mod_has_word("rotator") {
             (ProcessRole::ApiBackend, "Node Service".to_string())
-        } else if lower_cmd.contains("watchdog") {
+        } else if script_or_mod_has_word("watchdog") {
             (ProcessRole::WorkerOrQueue, "Watchdog".to_string())
         } else {
             (ProcessRole::ApiBackend, "Node Service".to_string())
@@ -120,12 +152,15 @@ pub fn analyze_command_and_paths(
         };
     }
 
-    let exe_base = effective_exe.strip_suffix(".exe").unwrap_or(&effective_exe);
-
     if exe_base.starts_with("python") || exe_base == "uvicorn" {
-        let (role, label) = if lower_cmd.contains("uvicorn") || lower_cmd.contains("fastapi") {
+        let (role, label) = if exe_base == "uvicorn"
+            || has_arg_token("uvicorn")
+            || has_arg_token("fastapi")
+            || script_or_mod_has_word("uvicorn")
+            || script_or_mod_has_word("fastapi")
+        {
             (ProcessRole::ApiBackend, "Python API".to_string())
-        } else if lower_cmd.contains("poller") || lower_cmd.contains("bot") {
+        } else if script_or_mod_has_word("poller") || script_or_mod_has_word("bot") {
             (ProcessRole::WorkerOrQueue, "Python Bot".to_string())
         } else {
             (ProcessRole::WorkerOrQueue, "Python Worker".to_string())
@@ -160,7 +195,10 @@ pub fn analyze_command_and_paths(
         let jar_seed = args
             .windows(2)
             .find(|w| w[0] == "-jar")
-            .and_then(|w| strip_build_output_dir(Path::new(&w[1])));
+            .and_then(|w| {
+                let resolved = resolve_relative_path(&w[1], cwd);
+                strip_build_output_dir(&resolved)
+            });
         return ParsedCommand {
             role: ProcessRole::ApiBackend,
             role_label: "Spring / JVM".to_string(),
@@ -304,8 +342,14 @@ pub(super) fn unwrap_shell_wrapper(args: &[String]) -> UnwrappedCmd {
     let shell_flag_pos = if exe0 == "cmd.exe" || exe0 == "cmd" {
         args.iter()
             .position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))
-    } else if matches!(exe0.as_str(), "sh" | "bash" | "zsh") {
-        args.iter().position(|a| a == "-c")
+    } else if matches!(exe0.as_str(), "sh" | "bash" | "zsh" | "dash") {
+        args.iter().position(|a| {
+            a == "-c"
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && a.len() >= 2
+                    && a.ends_with('c'))
+        })
     } else {
         None
     };
@@ -319,7 +363,22 @@ pub(super) fn unwrap_shell_wrapper(args: &[String]) -> UnwrappedCmd {
             } else {
                 rest.to_vec()
             };
-            let inner_exe = expanded.first().and_then(|a| {
+            // Skip leading `ENV=VAL`, `env`, `exec` tokens when resolving the inner executable.
+            let mut skip = 0usize;
+            while let Some(tok) = expanded.get(skip) {
+                let low = tok.to_ascii_lowercase();
+                if low == "exec" || low == "env" || (tok.contains('=') && !tok.starts_with('-')) {
+                    skip += 1;
+                } else {
+                    break;
+                }
+            }
+            let effective_args = if skip < expanded.len() {
+                expanded[skip..].to_vec()
+            } else {
+                expanded
+            };
+            let inner_exe = effective_args.first().and_then(|a| {
                 a.rsplit(['/', '\\']).next().map(|s| {
                     let low = s.to_ascii_lowercase();
                     if low.ends_with(".exe") {
@@ -331,7 +390,7 @@ pub(super) fn unwrap_shell_wrapper(args: &[String]) -> UnwrappedCmd {
             });
             return UnwrappedCmd {
                 inner_exe,
-                args: expanded,
+                args: effective_args,
             };
         }
     }
@@ -374,7 +433,7 @@ pub fn format_job_title(
                 .filter(|p| !is_skippable_dir_name(p) && !p.eq_ignore_ascii_case(project_name))
             {
                 let norm_parent = humanize_identifier(parent_name, "", "");
-                format!("{norm_parent} service")
+                format!("{norm_parent} {}", lang.pick("service", "servisi"))
             } else {
                 humanize_identifier(stem, project_name, folder_name)
             }
@@ -472,6 +531,8 @@ pub(super) fn extract_mode_flag(args: &[String]) -> Option<String> {
         if let Some(val) = arg
             .strip_prefix("--sources=")
             .or_else(|| arg.strip_prefix("--source="))
+            .or_else(|| arg.strip_prefix("--profile="))
+            .or_else(|| arg.strip_prefix("--target="))
         {
             if !val.is_empty() {
                 return Some(val.to_string());
@@ -543,16 +604,21 @@ pub(super) fn discover_script_log_path(
     }
 
     let mut log_dirs: Vec<PathBuf> = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        if !log_dirs.contains(&p) {
+            log_dirs.push(p);
+        }
+    };
     if let Some(dir) = sdir {
-        log_dirs.push(dir.join("logs"));
+        push_unique(dir.join("logs"));
         if let Some(parent) = dir.parent() {
-            log_dirs.push(parent.join("logs"));
-            log_dirs.push(parent.join("outputs"));
+            push_unique(parent.join("logs"));
+            push_unique(parent.join("outputs"));
         }
     }
     if let Some(seed) = parsed.project_seed_dir.as_deref().or(cwd) {
-        log_dirs.push(seed.join("logs"));
-        log_dirs.push(seed.join("outputs"));
+        push_unique(seed.join("logs"));
+        push_unique(seed.join("outputs"));
     }
 
     if let Some(st) = stem {
@@ -587,24 +653,30 @@ pub(super) fn discover_script_log_path(
     None
 }
 
-/// Extracts a log file path from `>> file.log` or `>>"file.log"` redirections in a command line.
+/// Extracts a log file path from `>> file.log`, `> file.log`, `1>>`, or `1>` redirections in a command line.
 pub fn extract_log_redirect_path(cmdline: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     let tokens = split_cmdline_args(cmdline);
     let mut i = 0usize;
     while i < tokens.len() {
         let tok = &tokens[i];
-        let candidate = if tok == ">>" || tok == "1>>" {
+        let candidate = if matches!(tok.as_str(), ">>" | "1>>" | ">" | "1>") {
             tokens.get(i + 1).map(String::as_str)
+        } else if tok.starts_with("2>") {
+            None
         } else {
             tok.strip_prefix(">>")
                 .or_else(|| tok.strip_prefix("1>>"))
+                .or_else(|| tok.strip_prefix("1>"))
+                .or_else(|| tok.strip_prefix('>'))
                 .filter(|rest| !rest.is_empty())
         };
 
         if let Some(raw) = candidate {
-            let trimmed = raw.trim_matches('"');
+            let trimmed = raw.trim_matches(['"', '\'']);
             if !trimmed.is_empty()
                 && !trimmed.eq_ignore_ascii_case("nul")
+                && !trimmed.eq_ignore_ascii_case("\\\\.\\nul")
+                && trimmed != "/dev/null"
                 && !trimmed.starts_with('&')
             {
                 return Some(resolve_relative_path(trimmed, cwd));
@@ -708,13 +780,31 @@ pub(super) fn normalize_project_display_name(raw: &str) -> String {
 
 pub(super) fn build_subtitle_path(project_root: Option<&Path>, script_or_cwd: Option<&Path>) -> Option<String> {
     let dir = script_or_cwd?;
+    let sep = std::path::MAIN_SEPARATOR;
+    let sep_s = sep.to_string();
     if let Some(root) = project_root {
         if let Ok(rel) = dir.strip_prefix(root) {
-            let s = rel.to_string_lossy().replace('/', "\\");
+            let s = rel.to_string_lossy().replace(['/', '\\'], &sep_s);
             if !s.is_empty() {
-                return Some(format!("...\\{s}"));
+                return Some(format!("...{sep}{s}"));
             }
             return None;
+        }
+        let dir_norm = normalize_path_str(dir);
+        let root_norm = normalize_path_str(root);
+        if dir_norm == root_norm {
+            return None;
+        }
+        if path_str_starts_with_dir(&dir_norm, &root_norm) {
+            let raw_dir = dir.to_string_lossy().replace('/', "\\");
+            let trimmed_raw = raw_dir.trim_end_matches('\\');
+            if trimmed_raw.len() > root_norm.len() + 1 {
+                let rel = &trimmed_raw[root_norm.len() + 1..];
+                let s = rel.replace('\\', &sep_s);
+                if !s.is_empty() {
+                    return Some(format!("...{sep}{s}"));
+                }
+            }
         }
     }
     let components: Vec<String> = dir
@@ -729,22 +819,38 @@ pub(super) fn build_subtitle_path(project_root: Option<&Path>, script_or_cwd: Op
     if components.is_empty() {
         None
     } else {
-        Some(format!("...\\{}", components.join("\\")))
+        Some(format!("...{sep}{}", components.join(&sep_s)))
     }
 }
 
-
-pub(super) fn split_cmdline_preserving_quotes(s: &str) -> Vec<String> {
+fn split_cmdline_inner(s: &str, preserve_quotes: bool) -> Vec<String> {
     let mut res = Vec::new();
     let mut cur = String::new();
-    let mut in_quotes = false;
-    for ch in s.chars() {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
-            '"' => {
-                in_quotes = !in_quotes;
-                cur.push(ch);
+            '\\' if in_double && chars.peek() == Some(&'"') => {
+                let q = chars.next().unwrap();
+                if preserve_quotes {
+                    cur.push('\\');
+                }
+                cur.push(q);
             }
-            c if c.is_whitespace() && !in_quotes => {
+            '"' if !in_single => {
+                in_double = !in_double;
+                if preserve_quotes {
+                    cur.push(ch);
+                }
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                if preserve_quotes {
+                    cur.push(ch);
+                }
+            }
+            c if c.is_whitespace() && !in_double && !in_single => {
                 if !cur.is_empty() {
                     res.push(std::mem::take(&mut cur));
                 }
@@ -756,27 +862,14 @@ pub(super) fn split_cmdline_preserving_quotes(s: &str) -> Vec<String> {
         res.push(cur);
     }
     res
+}
+
+pub(super) fn split_cmdline_preserving_quotes(s: &str) -> Vec<String> {
+    split_cmdline_inner(s, true)
 }
 
 pub fn split_cmdline_args(s: &str) -> Vec<String> {
-    let mut res = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    for ch in s.chars() {
-        match ch {
-            '"' => in_quotes = !in_quotes,
-            c if c.is_whitespace() && !in_quotes => {
-                if !cur.is_empty() {
-                    res.push(std::mem::take(&mut cur));
-                }
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if !cur.is_empty() {
-        res.push(cur);
-    }
-    res
+    split_cmdline_inner(s, false)
 }
 
 /// Converts Windows `\` separators to native `/` on non-Windows hosts so `Path` ops work uniformly.
@@ -824,12 +917,17 @@ pub(super) fn resolve_relative_path(raw: &str, cwd: Option<&Path>) -> PathBuf {
 }
 
 pub(super) fn strip_node_modules_parent(path: &Path) -> Option<PathBuf> {
-    let s = path.to_string_lossy();
-    if let Some(idx) = s.to_ascii_lowercase().find("node_modules") {
-        let prefix = s[..idx].trim_end_matches(['\\', '/']);
-        if !prefix.is_empty() {
-            return Some(coerce_platform_path(prefix));
+    let mut cur = Some(path);
+    while let Some(p) = cur {
+        if let Some(name) = p.file_name().and_then(|s| s.to_str()) {
+            if name.eq_ignore_ascii_case("node_modules") {
+                return p
+                    .parent()
+                    .filter(|par| !par.as_os_str().is_empty())
+                    .map(Path::to_path_buf);
+            }
         }
+        cur = p.parent();
     }
     None
 }
@@ -870,4 +968,146 @@ pub(super) fn strip_build_output_dir(path: &Path) -> Option<PathBuf> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_cmdline_handles_double_single_and_escaped_quotes() {
+        assert_eq!(
+            split_cmdline_args(r#"node "C:\My App\server.js" --port 3000"#),
+            vec!["node", r"C:\My App\server.js", "--port", "3000"]
+        );
+        assert_eq!(
+            split_cmdline_args(r#"sh -c 'node "/path/with spaces/app.js"'"#),
+            vec!["sh", "-c", r#"node "/path/with spaces/app.js""#]
+        );
+        assert_eq!(
+            split_cmdline_preserving_quotes("node app.js --api-key 'sk-secret part2'"),
+            vec!["node", "app.js", "--api-key", "'sk-secret part2'"]
+        );
+        assert_eq!(
+            split_cmdline_args(r#"app --msg "say \"hi\"""#),
+            vec!["app", "--msg", r#"say "hi""#]
+        );
+        assert!(split_cmdline_args("   ").is_empty());
+    }
+
+    #[test]
+    fn unwrap_shell_wrapper_handles_cmd_bash_lc_and_env_prefixes() {
+        let u1 = unwrap_shell_wrapper(&[
+            "cmd.exe".to_string(),
+            "/c".to_string(),
+            "node app.js --port 8080".to_string(),
+        ]);
+        assert_eq!(u1.inner_exe.as_deref(), Some("node.exe"));
+
+        let u2 = unwrap_shell_wrapper(&[
+            "bash".to_string(),
+            "-lc".to_string(),
+            "NODE_ENV=prod exec node server.js".to_string(),
+        ]);
+        assert_eq!(u2.inner_exe.as_deref(), Some("node.exe"));
+        assert_eq!(u2.args[0], "node");
+
+        let u3 = unwrap_shell_wrapper(&["python.exe".to_string(), "app.py".to_string()]);
+        assert_eq!(u3.inner_exe, None);
+    }
+
+    #[test]
+    fn analyze_command_avoids_path_substring_false_positives_and_resolves_jar() {
+        let p_node = analyze_command_and_paths(
+            "node.exe",
+            Some(r"node C:\dev\invite-service\server.js"),
+            Some(Path::new(r"C:\dev\invite-service")),
+            None,
+            None,
+        );
+        assert_eq!(p_node.role, ProcessRole::ApiBackend);
+        assert_eq!(p_node.role_label, "Node Service");
+
+        let p_vite = analyze_command_and_paths(
+            "node.exe",
+            Some(r"node C:\dev\web\node_modules\vite\bin\vite.js"),
+            Some(Path::new(r"C:\dev\web")),
+            None,
+            None,
+        );
+        assert_eq!(p_vite.role, ProcessRole::DevServer);
+        assert_eq!(p_vite.role_label, "Vite Dev");
+
+        let p_java = analyze_command_and_paths(
+            "java",
+            Some("java -Dspring.application.name=orders -jar target/orders.jar"),
+            Some(Path::new(r"C:\dev\orders-api")),
+            None,
+            None,
+        );
+        assert_eq!(p_java.explicit_project_name.as_deref(), Some("orders"));
+        assert_eq!(
+            p_java.project_seed_dir.as_deref(),
+            Some(Path::new(r"C:\dev\orders-api"))
+        );
+    }
+
+    #[test]
+    fn extract_mode_flag_and_log_redirect_and_node_modules_and_root_guard() {
+        assert_eq!(
+            extract_mode_flag(&["app".into(), "--profile=prod".into()]).as_deref(),
+            Some("prod")
+        );
+        assert_eq!(
+            extract_mode_flag(&["app".into(), "--target=staging".into()]).as_deref(),
+            Some("staging")
+        );
+        assert_eq!(
+            extract_log_redirect_path("sh -c 'node app.js >> /dev/null 2>&1'", Some(Path::new("/app"))),
+            None
+        );
+        assert_eq!(
+            extract_log_redirect_path("node app.js > out.log", Some(Path::new("/app"))),
+            Some(PathBuf::from("/app").join("out.log"))
+        );
+        assert_eq!(
+            strip_node_modules_parent(Path::new(r"C:\dev\clean_node_modules\index.js")),
+            None
+        );
+        assert!(strip_node_modules_parent(Path::new(r"C:\dev\app\node_modules\.bin\vite.js")).is_some());
+        assert_eq!(
+            infer_project_dir_from_paths(None, Some(Path::new(r"C:\scripts\worker.py")), None),
+            None
+        );
+        assert_eq!(
+            infer_project_dir_from_paths(None, Some(Path::new("/scripts/worker.py")), None),
+            None
+        );
+    }
+
+    #[test]
+    fn format_job_title_localizes_service_suffix() {
+        let parsed = ParsedCommand {
+            role: ProcessRole::ApiBackend,
+            role_label: "Node Service".into(),
+            script_path: Some(PathBuf::from(r"C:\dev\acme\packages\standalone\cli.mjs")),
+            script_dir: Some(PathBuf::from(r"C:\dev\acme\packages\standalone")),
+            script_file_name: Some("cli.mjs".into()),
+            module_name: None,
+            mode_suffix: None,
+            project_seed_dir: None,
+            inferred_project_dir: None,
+            explicit_project_name: None,
+            canonical_entrypoint: None,
+        };
+        assert_eq!(
+            format_job_title(&parsed, "Acme", "acme", "node.exe", None, false, Language::En),
+            "Standalone service"
+        );
+        assert_eq!(
+            format_job_title(&parsed, "Acme", "acme", "node.exe", None, false, Language::Tr),
+            "Standalone servisi"
+        );
+    }
+}
+
 

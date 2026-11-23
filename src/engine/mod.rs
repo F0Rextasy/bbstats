@@ -46,6 +46,7 @@ enum EngineMsg {
     Cmd(EngineCmd),
     Exited(ExitEvent),
     ActionError(String),
+    RestartFinished(Vec<JobId>),
 }
 
 /// Thread-safe handle held by the UI layer to read the latest `Snapshot` and send `EngineCmd`s.
@@ -154,13 +155,15 @@ struct EngineRuntime {
     job_crashes: HashMap<JobId, CrashedJobRecord>,
     last_procs: Vec<CollectedProcess>,
     last_ports: HashMap<u32, PidNetworkInfo>,
+    last_ports_keys: HashMap<u32, i64>,
     user_kills: HashMap<ProcessKey, Instant>,
     restart_recipes: HashMap<JobId, StoredRestartRecipe>,
+    restarting_jobs: HashMap<JobId, Instant>,
     auto_restart_attempts: HashMap<JobId, Vec<Instant>>,
     alerts: Vec<Alert>,
     next_alert_id: u64,
     tick_counter: u64,
-    last_summary_sig: (u16, u16, u16, usize, i32, u64),
+    last_summary_sig: (u16, u16, u16, usize, i32, u64, u64),
     language: Language,
     vanished_since: HashMap<ProcessKey, Instant>,
     last_action_error: Option<(u64, String)>,
@@ -205,13 +208,15 @@ impl EngineRuntime {
             job_crashes: HashMap::new(),
             last_procs: Vec::new(),
             last_ports: HashMap::new(),
+            last_ports_keys: HashMap::new(),
             user_kills: HashMap::new(),
             restart_recipes: HashMap::new(),
+            restarting_jobs: HashMap::new(),
             auto_restart_attempts: HashMap::new(),
             alerts: Vec::new(),
             next_alert_id: 1,
             tick_counter: 0,
-            last_summary_sig: (0, 0, 0, 0, -1, 0),
+            last_summary_sig: (0, 0, 0, 0, -1, 0, 0),
             language: Language::En,
             vanished_since: HashMap::new(),
             last_action_error: None,
@@ -279,6 +284,12 @@ impl EngineRuntime {
                 self.record_action_error(err);
                 true
             }
+            EngineMsg::RestartFinished(job_ids) => {
+                for jid in job_ids {
+                    self.restarting_jobs.remove(&jid);
+                }
+                false
+            }
             EngineMsg::Cmd(cmd) => match cmd {
                 EngineCmd::Shutdown => false,
                 EngineCmd::SetPollingMode(mode) => {
@@ -324,24 +335,49 @@ impl EngineRuntime {
                 }
                 EngineCmd::Restart(key) => {
                     let managed = Arc::clone(&self.managed_jobs);
-                    self.execute_restart_target_with(RestartTarget::Process(key), true, |cmd, cwd| {
-                        managed.spawn_with_capture(cmd, cwd)
-                    });
+                    let _ = self.execute_restart_target_with(
+                        RestartTarget::Process(key),
+                        true,
+                        |rec| {
+                            managed.spawn_with_capture_env(
+                                &rec.raw_cmdline,
+                                &rec.working_dir,
+                                &rec.env_vars,
+                                rec.use_shell,
+                            )
+                        },
+                    );
                     true
                 }
                 EngineCmd::RestartJob(job_id) => {
                     let managed = Arc::clone(&self.managed_jobs);
-                    self.execute_restart_target_with(RestartTarget::Job(job_id), true, |cmd, cwd| {
-                        managed.spawn_with_capture(cmd, cwd)
-                    });
+                    let _ = self.execute_restart_target_with(
+                        RestartTarget::Job(job_id),
+                        true,
+                        |rec| {
+                            managed.spawn_with_capture_env(
+                                &rec.raw_cmdline,
+                                &rec.working_dir,
+                                &rec.env_vars,
+                                rec.use_shell,
+                            )
+                        },
+                    );
                     true
                 }
                 EngineCmd::RestartProject(project_id) => {
                     let managed = Arc::clone(&self.managed_jobs);
-                    self.execute_restart_target_with(
+                    let _ = self.execute_restart_target_with(
                         RestartTarget::Project(project_id),
                         true,
-                        |cmd, cwd| managed.spawn_with_capture(cmd, cwd),
+                        |rec| {
+                            managed.spawn_with_capture_env(
+                                &rec.raw_cmdline,
+                                &rec.working_dir,
+                                &rec.env_vars,
+                                rec.use_shell,
+                            )
+                        },
                     );
                     true
                 }
@@ -364,7 +400,10 @@ impl EngineRuntime {
                         .into_iter()
                         .map(|s| s.to_ascii_lowercase())
                         .collect();
-                    self.alias_keys = project_aliases;
+                    self.alias_keys = project_aliases
+                        .into_iter()
+                        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+                        .collect();
                     self.project_order = project_order;
                     self.job_order = job_order;
                     self.sort_mode = sort_mode;
@@ -372,7 +411,7 @@ impl EngineRuntime {
                         let key_l = pid.0.to_ascii_lowercase();
                         st.pinned = self.pinned_keys.contains(&key_l);
                         st.hidden = self.hidden_keys.contains(&key_l);
-                        st.display_name_override = self.alias_keys.get(&pid.0).cloned();
+                        st.display_name_override = self.alias_keys.get(&key_l).cloned();
                     }
                     true
                 }
@@ -392,10 +431,11 @@ impl EngineRuntime {
                     custom_name,
                 } => {
                     let cleaned = custom_name.filter(|s| !s.trim().is_empty());
+                    let key_l = project_id.0.to_ascii_lowercase();
                     if let Some(ref name) = cleaned {
-                        self.alias_keys.insert(project_id.0.clone(), name.clone());
+                        self.alias_keys.insert(key_l, name.clone());
                     } else {
-                        self.alias_keys.remove(&project_id.0);
+                        self.alias_keys.remove(&key_l);
                     }
                     let st = self.project_states.entry(project_id).or_default();
                     st.display_name_override = cleaned;
@@ -436,7 +476,7 @@ impl EngineRuntime {
                     log_file,
                     watch,
                 } => {
-                    let _ = self.resolver.save_label_rule(LabelRule {
+                    if let Err(err) = self.resolver.save_label_rule(LabelRule {
                         match_substr,
                         project,
                         job,
@@ -447,11 +487,15 @@ impl EngineRuntime {
                         working_dir,
                         watch,
                         ..Default::default()
-                    });
+                    }) {
+                        self.record_action_error(format!("labels.toml save failed: {err}"));
+                    }
                     true
                 }
                 EngineCmd::RemoveLabelRule(match_substr) => {
-                    let _ = self.resolver.remove_label_rule(&match_substr);
+                    if let Err(err) = self.resolver.remove_label_rule(&match_substr) {
+                        self.record_action_error(format!("labels.toml remove failed: {err}"));
+                    }
                     true
                 }
                 EngineCmd::StartCustomJob(job_id) => {
@@ -507,8 +551,7 @@ impl EngineRuntime {
         self.project_states.entry(proj_id.clone()).or_default().crashed_until =
             Some(Instant::now() + Duration::from_secs(300));
 
-        let can_restart = watched.meta.restart_recipe.is_some()
-            || self.restart_recipes.contains_key(&watched.meta.job_id);
+        let can_restart = self.restart_recipes.contains_key(&watched.meta.job_id);
         self.job_crashes.insert(
             watched.meta.job_id.clone(),
             CrashedJobRecord {
@@ -538,13 +581,25 @@ impl EngineRuntime {
         let auto_suffix = if watched.meta.auto_restart && can_restart {
             if self.record_and_should_auto_restart(&watched.meta.job_id, Instant::now()) {
                 let managed = Arc::clone(&self.managed_jobs);
-                self.execute_restart_target_with(
+                let started = self.execute_restart_target_with(
                     RestartTarget::Job(watched.meta.job_id.clone()),
                     true,
-                    |cmd, cwd| managed.spawn_with_capture(cmd, cwd),
+                    |rec| {
+                        managed.spawn_with_capture_env(
+                            &rec.raw_cmdline,
+                            &rec.working_dir,
+                            &rec.env_vars,
+                            rec.use_shell,
+                        )
+                    },
                 );
-                self.language
-                    .pick(" · auto-restarting", " · otomatik yeniden başlatılıyor")
+                if started {
+                    self.language
+                        .pick(" · auto-restarting", " · otomatik yeniden başlatılıyor")
+                } else {
+                    self.language
+                        .pick(" · auto-restart failed", " · otomatik yeniden başlatma başarısız")
+                }
             } else {
                 self.language.pick(
                     " · auto-restart limit (3/10m) reached",
@@ -639,6 +694,24 @@ impl EngineRuntime {
         };
         if should_poll_ports {
             self.last_ports = self.collector.collect_ports();
+            self.last_ports_keys = collected
+                .processes
+                .iter()
+                .map(|p| (p.key.pid, p.key.create_time_100ns))
+                .collect();
+        } else {
+            // Evict ports whose owning PID exited or was reused since the last port poll.
+            let live_times: HashMap<u32, i64> = collected
+                .processes
+                .iter()
+                .map(|p| (p.key.pid, p.key.create_time_100ns))
+                .collect();
+            self.last_ports.retain(|pid, _| {
+                match (live_times.get(pid), self.last_ports_keys.get(pid)) {
+                    (Some(&cur_ct), Some(&snap_ct)) => cur_ct == snap_ct,
+                    _ => false,
+                }
+            });
         }
 
         let allow_expanded_io = matches!(self.mode, PollingMode::ExpandedActive);
@@ -854,6 +927,7 @@ impl EngineRuntime {
             snapshot.alerts.len(),
             (snapshot.total_dev_cpu + snapshot.system_cpu * 0.25).round() as i32,
             snapshot.total_dev_ram_bytes / (16 * 1024 * 1024),
+            self.next_error_id,
         );
         let should_wake = match self.mode {
             PollingMode::ExpandedActive | PollingMode::HoverPeek => true,
@@ -988,16 +1062,24 @@ impl EngineRuntime {
                 (kill_keys, recipes)
             }
             RestartTarget::Project(project_id) => {
+                let mut active_project_jobs: HashSet<JobId> = HashSet::new();
                 let kill_keys: Vec<ProcessKey> = self
                     .watched_meta
                     .iter()
                     .filter(|(_, w)| w.meta.project_id == project_id && !w.meta.is_critical_system)
-                    .map(|(k, _)| *k)
+                    .map(|(k, w)| {
+                        active_project_jobs.insert(w.meta.job_id.clone());
+                        *k
+                    })
                     .collect();
                 let mut recipes: Vec<StoredRestartRecipe> = self
                     .restart_recipes
                     .values()
-                    .filter(|r| r.project_id == project_id)
+                    .filter(|r| {
+                        r.project_id == project_id
+                            && (active_project_jobs.contains(&r.job_id)
+                                || self.job_crashes.contains_key(&r.job_id))
+                    })
                     .cloned()
                     .collect();
                 recipes.sort_by(|a, b| a.job_id.0.cmp(&b.job_id.0));
@@ -1011,12 +1093,21 @@ impl EngineRuntime {
         target: RestartTarget,
         async_port_wait: bool,
         mut spawn_sync: F,
-    ) where
-        F: FnMut(&str, &std::path::Path) -> Result<u32, String>,
+    ) -> bool
+    where
+        F: FnMut(&crate::engine::project_resolver::RestartRecipe) -> Result<u32, String>,
     {
-        let (kill_keys, recipes) = self.collect_restart_recipes(target);
+        let now = Instant::now();
+        self.restarting_jobs
+            .retain(|_, ts| now.saturating_duration_since(*ts) < Duration::from_secs(10));
+
+        let (kill_keys, all_recipes) = self.collect_restart_recipes(target);
+        let recipes: Vec<StoredRestartRecipe> = all_recipes
+            .into_iter()
+            .filter(|r| !self.restarting_jobs.contains_key(&r.job_id))
+            .collect();
         if recipes.is_empty() {
-            return;
+            return false;
         }
         if !kill_keys.is_empty() {
             execute_safe_kill_many(&kill_keys, &self.last_procs, true, &mut self.user_kills);
@@ -1033,20 +1124,27 @@ impl EngineRuntime {
 
         if !async_port_wait || expected_ports.is_empty() {
             let mut errs = Vec::new();
+            let mut any_ok = false;
             for rec in &recipes {
-                if let Err(err) = spawn_sync(&rec.recipe.raw_cmdline, &rec.recipe.working_dir) {
-                    errs.push(err);
+                match spawn_sync(&rec.recipe) {
+                    Ok(_) => any_ok = true,
+                    Err(err) => errs.push(err),
                 }
             }
             for err in errs {
                 self.record_action_error(err);
             }
-            return;
+            return any_ok;
         }
 
+        let job_ids: Vec<JobId> = recipes.iter().map(|r| r.job_id.clone()).collect();
+        let job_ids_cleanup = job_ids.clone();
+        for jid in &job_ids {
+            self.restarting_jobs.insert(jid.clone(), now);
+        }
         let managed = Arc::clone(&self.managed_jobs);
         let tx = self.cmd_tx.clone();
-        let _ = thread::Builder::new()
+        let spawned = thread::Builder::new()
             .name("bbstats-restart".to_string())
             .spawn(move || {
                 let deadline = Instant::now() + Duration::from_millis(2000);
@@ -1057,14 +1155,25 @@ impl EngineRuntime {
                     thread::sleep(Duration::from_millis(100));
                 }
                 for rec in &recipes {
-                    if let Err(err) =
-                        managed.spawn_with_capture(&rec.recipe.raw_cmdline, &rec.recipe.working_dir)
-                    {
+                    if let Err(err) = managed.spawn_with_capture_env(
+                        &rec.recipe.raw_cmdline,
+                        &rec.recipe.working_dir,
+                        &rec.recipe.env_vars,
+                        rec.recipe.use_shell,
+                    ) {
                         let _ = tx.send(EngineMsg::ActionError(err));
                     }
                 }
+                let _ = tx.send(EngineMsg::RestartFinished(job_ids));
                 let _ = tx.send(EngineMsg::Cmd(EngineCmd::ForceRescan));
             });
+        if spawned.is_err() {
+            for jid in job_ids_cleanup {
+                self.restarting_jobs.remove(&jid);
+            }
+            return false;
+        }
+        true
     }
 
     fn reconcile_vanished_watched(&mut self, current_keys: &HashSet<ProcessKey>, now: Instant) {
@@ -1096,16 +1205,26 @@ impl EngineRuntime {
 
     fn start_custom_job(&mut self, job_id: &JobId) {
         let j_low = job_id.0.to_ascii_lowercase();
-        let rule = self
-            .resolver
-            .labels()
-            .rules()
+        let rules = self.resolver.labels().rules();
+        // Prefer exact `custom:<needle>` match; fallback to longest `contains` match.
+        let rule = rules
             .iter()
             .find(|r| {
                 let needle = r.match_substr.trim().to_ascii_lowercase();
                 !needle.is_empty()
                     && r.command.as_ref().is_some_and(|c| !c.trim().is_empty())
-                    && (j_low == format!("custom:{needle}") || j_low.contains(&needle))
+                    && j_low == format!("custom:{needle}")
+            })
+            .or_else(|| {
+                rules
+                    .iter()
+                    .filter(|r| {
+                        let needle = r.match_substr.trim().to_ascii_lowercase();
+                        !needle.is_empty()
+                            && r.command.as_ref().is_some_and(|c| !c.trim().is_empty())
+                            && j_low.contains(&needle)
+                    })
+                    .max_by_key(|r| r.match_substr.trim().len())
             })
             .cloned();
         if let Some(rule) = rule {
@@ -1113,6 +1232,8 @@ impl EngineRuntime {
                 let cwd = rule
                     .working_dir
                     .as_deref()
+                    .map(str::trim)
+                    .filter(|w| !w.is_empty())
                     .map(|w| PathBuf::from(expand_win_env_vars(w)))
                     .or_else(|| {
                         std::env::var_os("USERPROFILE")
@@ -1120,7 +1241,14 @@ impl EngineRuntime {
                             .map(PathBuf::from)
                     })
                     .unwrap_or_else(|| PathBuf::from("."));
-                if let Err(err) = self.managed_jobs.spawn_with_capture(cmd, &cwd) {
+                let extra_env = rule
+                    .env_file
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| crate::engine::labels::load_env_file_vars(&PathBuf::from(expand_win_env_vars(p))))
+                    .unwrap_or_default();
+                if let Err(err) = self.managed_jobs.spawn_with_capture_env(cmd, &cwd, &extra_env, true) {
                     self.record_action_error(err);
                 }
             }
@@ -1341,6 +1469,9 @@ mod tests {
             root: PathBuf::from(r"C:\Users\dev\.omp\local\worker-bot"),
             match_hint: "auto_updater.py".to_string(),
             last_log: Some("19:14 ok".to_string()),
+            log_path: None,
+            custom_command: None,
+            is_watched: false,
         });
         known.watchdog_notes.insert(
             bot_id.clone(),
@@ -1735,6 +1866,8 @@ mod tests {
                 restart_recipe: Some(RestartRecipe {
                     raw_cmdline: cmd.to_string(),
                     working_dir: PathBuf::from(r"C:\dev\api"),
+                    env_vars: Vec::new(),
+                    use_shell: false,
                 }),
                 auto_restart: false,
             })
@@ -1835,15 +1968,15 @@ mod tests {
 
         // RestartProject & RestartJob must still respawn root recipe exactly once despite empty watched_meta!
         let mut spawned: Vec<String> = Vec::new();
-        rt.execute_restart_target_with(RestartTarget::Project(proj_id), false, |cmd, _cwd| {
-            spawned.push(cmd.to_string());
+        rt.execute_restart_target_with(RestartTarget::Project(proj_id), false, |rec| {
+            spawned.push(rec.raw_cmdline.clone());
             Ok(9001)
         });
         assert_eq!(spawned, vec![r"C:\dev\api\.venv\Scripts\pythonw.exe run.py"]);
 
         spawned.clear();
-        rt.execute_restart_target_with(RestartTarget::Job(job_id.clone()), false, |cmd, _cwd| {
-            spawned.push(cmd.to_string());
+        rt.execute_restart_target_with(RestartTarget::Job(job_id.clone()), false, |rec| {
+            spawned.push(rec.raw_cmdline.clone());
             Ok(9002)
         });
         assert_eq!(spawned, vec![r"C:\dev\api\.venv\Scripts\pythonw.exe run.py"]);

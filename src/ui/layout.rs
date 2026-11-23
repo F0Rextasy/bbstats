@@ -238,6 +238,30 @@ pub fn detail_tab_row_count(jobs: &[Job], panel_w: f32) -> usize {
     rows
 }
 
+/// Selects up to 3 featured projects for `HoverPeek` (active jobs prioritized, fallback to all non-empty).
+pub fn select_peek_projects(snap: &Snapshot) -> Vec<&ProjectGroup> {
+    let mut sorted: Vec<&ProjectGroup> = snap
+        .projects
+        .iter()
+        .filter(|p| p.jobs.iter().any(|j| j.status != ProjectStatus::Stopped))
+        .collect();
+    if sorted.is_empty() {
+        sorted = snap
+            .projects
+            .iter()
+            .filter(|p| !p.jobs.is_empty())
+            .collect();
+    }
+    sorted.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| b.ram.cmp(&a.ram))
+            .then_with(|| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    sorted.truncate(3);
+    sorted
+}
+
 /// Computes target `(width_dip, height_dip, radius_dip)` for the current `ViewMode`, `DockPosition`, & `Snapshot`.
 pub fn target_dimensions(
     state: &UiState,
@@ -262,12 +286,7 @@ pub fn target_dimensions(
             }
         },
         ViewMode::HoverPeek => {
-            let count = snap
-                .projects
-                .iter()
-                .filter(|p| !p.jobs.is_empty())
-                .count()
-                .clamp(1, 3) as f32;
+            let count = select_peek_projects(snap).len().clamp(1, 3) as f32;
             (396.0, 82.0 + count * 34.0, 15.0)
         }
         ViewMode::Expanded => {
@@ -328,8 +347,9 @@ pub fn target_dimensions(
                 active_job.is_some_and(|j| !j.ports.is_empty()) || !p.ports.is_empty()
             });
             let ports_h = if active_has_ports { 26.0 } else { 0.0 };
+            let pending_h = if state.pending_kill.is_some() { 38.0 } else { 0.0 };
             let total_h =
-                (44.0 + tabs_h + ports_h + 76.0 + 184.0 + 24.0 + proc_count * 46.0 + 32.0)
+                (44.0 + tabs_h + ports_h + 76.0 + 184.0 + 24.0 + proc_count * 46.0 + pending_h + 32.0)
                     .clamp(430.0, max_panel_h.min(740.0));
             (540.0, total_h, 16.0)
         }
@@ -516,5 +536,16 @@ mod tests {
         }
 
         assert_eq!(stagger_row_progress(0.996, 8), (1.0, 0.0));
+    }
+
+    #[test]
+    fn format_ram_and_uptime_format_boundaries() {
+        assert_eq!(format_ram(512 * 1024), "0.5M");
+        assert_eq!(format_ram(150 * 1024 * 1024), "150M");
+        assert_eq!(format_ram(2 * 1024 * 1024 * 1024), "2.00G");
+
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(120), "2m");
+        assert_eq!(format_uptime(3720), "1h 2m");
     }
 }

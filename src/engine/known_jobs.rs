@@ -31,6 +31,9 @@ pub struct KnownStoppedJob {
     pub root: PathBuf,
     pub match_hint: String,
     pub last_log: Option<String>,
+    pub log_path: Option<PathBuf>,
+    pub custom_command: Option<String>,
+    pub is_watched: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -171,7 +174,7 @@ fn scan_known_dir(dir: &Path, labels: &LabelsStore, lang: Language, snap: &mut K
                     .and_then(|e| e.to_str())
                     .map(|s| s.to_ascii_lowercase())
                     .as_deref(),
-                Some("py" | "pyw" | "js" | "mjs")
+                Some("py" | "pyw" | "js" | "mjs" | "sh" | "ps1")
             ) {
                 continue;
             }
@@ -206,35 +209,34 @@ fn scan_known_dir(dir: &Path, labels: &LabelsStore, lang: Language, snap: &mut K
                 full_str.replace('/', "\\").to_ascii_lowercase()
             ));
 
-            let last_log = if lower.contains("updater") || lower.contains("service") {
-                fallback_log
-                    .clone()
-                    .or_else(|| {
-                        rule.log_file
-                            .as_deref()
-                            .map(|p| PathBuf::from(expand_win_env_vars(p)))
-                    })
-                    .as_deref()
-                    .and_then(tail_last_4kb_line)
-            } else {
-                rule.log_file
-                    .as_deref()
-                    .map(|p| PathBuf::from(expand_win_env_vars(p)))
-                    .as_deref()
-                    .and_then(tail_last_4kb_line)
-            };
+            let rule_log = rule
+                .log_file
+                .as_deref()
+                .map(|p| PathBuf::from(expand_win_env_vars(p)));
+            let effective_log = rule_log.or_else(|| {
+                if lower.contains("updater") || lower.contains("service") {
+                    fallback_log.clone()
+                } else {
+                    None
+                }
+            });
+            let last_log = effective_log.as_deref().and_then(tail_last_4kb_line);
+            let sep = std::path::MAIN_SEPARATOR;
 
             snap.jobs.push(KnownStoppedJob {
                 job_id,
                 project_id: proj_id.clone(),
                 project_name: project_name.clone(),
                 title,
-                subtitle: format!("{project_name} › ...\\{dir_name}"),
+                subtitle: format!("{project_name} › ...{sep}{dir_name}"),
                 icon: rule.icon.clone(),
                 color: rule.color.clone(),
                 root: dir.to_path_buf(),
                 match_hint: fname,
                 last_log,
+                log_path: effective_log,
+                custom_command: rule.command.clone(),
+                is_watched: rule.watch.unwrap_or(false),
             });
         }
     }
@@ -304,24 +306,18 @@ fn query_scheduled_task_note(dir: &Path, task_name: &str, lang: Language) -> Opt
     #[cfg(target_os = "windows")]
     {
         // Fallback: query Windows Task Scheduler once per 60s without creating a console window,
-        // bounded by a hard 1500ms timeout so a stalled Task Scheduler never blocks the engine.
+        // using `/FO CSV /NH /V` so the "Last Run Time" column (index 5) is locale-independent
+        // and immune to Turkish/OEM CP857 codepage garbling.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut cmd = Command::new("schtasks.exe");
-        cmd.args(["/Query", "/TN", task_name.trim(), "/FO", "LIST", "/V"])
+        cmd.args(["/Query", "/TN", task_name.trim(), "/FO", "CSV", "/NH", "/V"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW);
 
         if let Some(stdout_bytes) = run_command_bounded(cmd, Duration::from_millis(1500)) {
             let text = String::from_utf8_lossy(&stdout_bytes);
-            let hhmm = text.lines().find_map(|line| {
-                let lower = line.to_ascii_lowercase();
-                if lower.contains("last run time") || lower.contains("son çalışma") {
-                    extract_hhmm_from_str(line)
-                } else {
-                    None
-                }
-            });
+            let hhmm = parse_schtasks_last_run_hhmm(&text);
             return Some(format_watchdog_note(lang, hhmm));
         }
     }
@@ -339,11 +335,60 @@ fn query_scheduled_task_note(dir: &Path, task_name: &str, lang: Language) -> Opt
         }
     }
 
-    if dir.join("watchdog.py").is_file() {
+    if dir.join("watchdog.py").is_file() || dir.join("watchdog.js").is_file() {
         Some(format_watchdog_note(lang, None))
     } else {
         None
     }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_schtasks_last_run_hhmm(text: &str) -> Option<String> {
+    // 1. Locale-independent CSV `/FO CSV /NH /V`: column 5 is always "Last Run Time".
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('"') {
+            let cols = split_csv_quoted_line(trimmed);
+            if let Some(col) = cols.get(5) {
+                if let Some(hhmm) = extract_hhmm_from_str(col) {
+                    return Some(hhmm);
+                }
+            }
+        }
+    }
+    // 2. Fallback for LIST format (with Turkish-safe folding).
+    text.lines().find_map(|line| {
+        let folded = crate::model::fold_search_lower(line);
+        if folded.contains("last run time") || folded.contains("son calisma") || folded.contains("son çalışma") {
+            extract_hhmm_from_str(line)
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn split_csv_quoted_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                if in_q && chars.peek() == Some(&'"') {
+                    chars.next();
+                    cur.push('"');
+                } else {
+                    in_q = !in_q;
+                }
+            }
+            ',' if !in_q => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]

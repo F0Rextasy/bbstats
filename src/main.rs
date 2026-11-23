@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "windows")]
 mod app;
+mod cli;
 mod config;
 mod engine;
 mod model;
@@ -60,6 +61,7 @@ fn start_engine_and_wait_first_snapshot(
 #[cfg(target_os = "windows")]
 fn attach_parent_console() {
     use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    // SAFETY: Best-effort attachment to parent console before CLI stdout/stderr output.
     unsafe {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
@@ -72,6 +74,7 @@ fn fatal_startup_error(msg: &str) {
     use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
     let title: Vec<u16> = "bbstats — Startup Error\0".encode_utf16().collect();
     let body: Vec<u16> = format!("{msg}\0").encode_utf16().collect();
+    // SAFETY: Null-terminated UTF-16 dialog strings live for the call duration.
     unsafe {
         MessageBoxW(
             None,
@@ -102,7 +105,21 @@ fn windows_main() {
     use std::sync::Arc;
     use windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED};
 
-    let mut args = std::env::args().skip(1);
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(
+        raw_args.first().map(|s| s.as_str()),
+        Some("run" | "port" | "launch")
+    ) {
+        attach_parent_console();
+        if let Some(code) = cli::try_handle_cli(&raw_args) {
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return;
+        }
+    }
+
+    let mut args = raw_args.into_iter();
     if let Some(arg) = args.next() {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -113,13 +130,16 @@ fn windows_main() {
             "--help" | "-h" => {
                 attach_parent_console();
                 println!(
-                    "bbstats {} — developer project & background process telemetry",
+                    "bbstats {} — local developer project & background process monitor",
                     env!("CARGO_PKG_VERSION")
                 );
                 println!();
                 println!("USAGE:");
                 println!("  bbstats                         Launch the desktop Dynamic Island overlay");
-                println!("  bbstats --dump-snapshot [FILE]  Print or write plain-text telemetry snapshot");
+                println!("  bbstats run [--cwd DIR] -- CMD  Run a command inheriting env with live stdio");
+                println!("  bbstats port PORT [--kill]      Inspect or stop process listening on PORT");
+                println!("  bbstats launch [DIR] [--list]   Launch jobs from bbstats.toml/Procfile/package.json");
+                println!("  bbstats --dump-snapshot [FILE]  Print or write plain-text process snapshot");
                 println!("  bbstats --dump-shot [DIR]       Render overlay PNG screenshots (requires 'screenshots' feature)");
                 println!("  bbstats --version               Print version information");
                 println!("  bbstats --help                  Print this help message");
@@ -128,8 +148,11 @@ fn windows_main() {
             "--dump-snapshot" => {
                 attach_parent_console();
                 let out_file = args.next().map(std::path::PathBuf::from);
-                let eng =
-                    start_engine_and_wait_first_snapshot(model::PollingMode::ExpandedActive, None);
+                let cfg = AppConfig::load();
+                let eng = start_engine_and_wait_first_snapshot(
+                    model::PollingMode::ExpandedActive,
+                    Some(cfg.to_sync_cmd()),
+                );
                 let snap = eng.latest();
                 let text = engine::format_snapshot_text(&snap);
                 if let Some(path) = out_file {
@@ -159,6 +182,7 @@ fn windows_main() {
                 #[cfg(feature = "screenshots")]
                 {
                     enable_per_monitor_v2();
+                    // SAFETY: Balanced single-threaded WinRT apartment initialization on the main thread.
                     unsafe {
                         if let Err(e) = RoInitialize(RO_INIT_SINGLETHREADED) {
                             eprintln!("RoInitialize failed: {e}");
@@ -215,18 +239,24 @@ fn windows_main() {
                             &monitors,
                         );
                     }
+                    // SAFETY: Balanced single-threaded WinRT apartment initialization on the main thread.
                     unsafe {
                         RoUninitialize();
                     }
                     return;
                 }
             }
-            _ => {}
+            unknown => {
+                attach_parent_console();
+                eprintln!("Unknown argument: {unknown}. Run 'bbstats --help' for usage.");
+                std::process::exit(2);
+            }
         }
     }
 
     enable_per_monitor_v2();
 
+    // SAFETY: Balanced single-threaded WinRT apartment initialization on the main thread.
     unsafe {
         if let Err(e) = RoInitialize(RO_INIT_SINGLETHREADED) {
             fatal_startup_error(&format!("WinRT RoInitialize failed: {e}"));
@@ -242,6 +272,7 @@ fn windows_main() {
     let _single_instance = match acquire_single_instance() {
         Some(g) => g,
         None => {
+            // SAFETY: Balanced single-threaded WinRT apartment initialization on the main thread.
             unsafe { RoUninitialize() };
             return;
         }
@@ -273,6 +304,7 @@ fn windows_main() {
         Ok(h) => h,
         Err(e) => {
             fatal_startup_error(&format!("Failed to create overlay window: {e}"));
+            // SAFETY: Balanced single-threaded WinRT apartment initialization on the main thread.
             unsafe { RoUninitialize() };
             return;
         }
@@ -282,6 +314,7 @@ fn windows_main() {
         Ok(d) => d,
         Err(e) => {
             fatal_startup_error(&format!("Failed to initialize Direct2D/DXGI graphics: {e}"));
+            // SAFETY: Balanced single-threaded WinRT apartment initialization on the main thread.
             unsafe { RoUninitialize() };
             return;
         }
@@ -291,12 +324,13 @@ fn windows_main() {
         Ok(c) => c,
         Err(e) => {
             fatal_startup_error(&format!("Failed to initialize DirectComposition swapchain: {e}"));
+            // SAFETY: Balanced single-threaded WinRT apartment initialization on the main thread.
             unsafe { RoUninitialize() };
             return;
         }
     };
 
-    let tray = TrayIcon::new(hwnd);
+    let tray = TrayIcon::new(hwnd, cfg.language);
 
     let hwnd_raw = hwnd.0 as isize;
     let wake_cb: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
@@ -320,6 +354,7 @@ fn windows_main() {
 
     attach_and_run(hwnd, app);
 
+    // SAFETY: Balanced single-threaded WinRT apartment initialization on the main thread.
     unsafe {
         RoUninitialize();
     }
@@ -335,7 +370,15 @@ fn unix_main() {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
-    let mut args = std::env::args().skip(1);
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = cli::try_handle_cli(&raw_args) {
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return;
+    }
+
+    let mut args = raw_args.into_iter();
     let first = args.next();
     match first.as_deref() {
         Some("--version" | "-V") => {
@@ -344,17 +387,20 @@ fn unix_main() {
         }
         Some("--help" | "-h") => {
             println!(
-                "bbstats {} — developer project & background process telemetry",
+                "bbstats {} — local developer project & background process monitor",
                 env!("CARGO_PKG_VERSION")
             );
             println!();
             println!("USAGE:");
-            println!("  bbstats               Live interactive Dynamic Island terminal monitor (--watch)");
-            println!("  bbstats --watch       Continuously stream grouped project & job telemetry");
-            println!("  bbstats --status      Print a formatted single-shot telemetry overview");
+            println!("  bbstats               Live terminal HUD monitor (--watch)");
+            println!("  bbstats run [--cwd DIR] -- CMD  Run a command inheriting env with live stdio");
+            println!("  bbstats port PORT [--kill]      Inspect or stop process listening on PORT");
+            println!("  bbstats launch [DIR] [--list]   Launch jobs from bbstats.toml/Procfile/package.json");
+            println!("  bbstats --watch       Continuously stream grouped project & job status");
+            println!("  bbstats --status      Print a formatted single-shot overview");
             println!("  bbstats --daemon      Run headless background monitor without terminal UI");
-            println!("  bbstats --dump-snapshot [FILE]  Print or write plain-text telemetry snapshot");
-            println!("  bbstats --autostart <on|off>    Enable or disable login LaunchAgent");
+            println!("  bbstats --dump-snapshot [FILE]  Print or write plain-text process snapshot");
+            println!("  bbstats --autostart <on|off>    Enable or disable login autostart");
             println!("  bbstats --version     Print version information");
             println!("  bbstats --help        Print this help message");
             return;
@@ -387,7 +433,11 @@ fn unix_main() {
         }
         Some("--dump-snapshot") => {
             let out_file = args.next().map(std::path::PathBuf::from);
-            let eng = start_engine_and_wait_first_snapshot(PollingMode::ExpandedActive, None);
+            let cfg = AppConfig::load();
+            let eng = start_engine_and_wait_first_snapshot(
+                PollingMode::ExpandedActive,
+                Some(cfg.to_sync_cmd()),
+            );
             let snap = eng.latest();
             let text = engine::format_snapshot_text(&snap);
             if let Some(path) = out_file {
@@ -407,15 +457,7 @@ fn unix_main() {
             let cfg = AppConfig::load();
             let eng = start_engine_and_wait_first_snapshot(
                 PollingMode::ExpandedActive,
-                Some(EngineCmd::SyncConfigState {
-                    pinned_projects: cfg.pinned_projects.clone(),
-                    hidden_projects: cfg.hidden_projects.clone(),
-                    project_aliases: cfg.project_aliases.clone(),
-                    project_order: cfg.project_order.clone(),
-                    job_order: cfg.job_order.clone(),
-                    sort_mode: cfg.sort_mode,
-                    language: cfg.language,
-                }),
+                Some(cfg.to_sync_cmd()),
             );
             let snap = eng.latest();
             let screen = render_unix_hud(&snap, cfg.language);
@@ -424,7 +466,11 @@ fn unix_main() {
             eng.send(EngineCmd::Shutdown);
             return;
         }
-        _ => {}
+        None | Some("--watch") | Some("--daemon") => {}
+        Some(unknown) => {
+            eprintln!("Unknown argument: {unknown}. Run 'bbstats --help' for usage.");
+            std::process::exit(2);
+        }
     }
 
     let daemon_mode = first.as_deref() == Some("--daemon");
@@ -443,6 +489,7 @@ fn unix_main() {
     extern "C" fn handle_sig(_sig: libc::c_int) {
         STOP.store(true, Ordering::Relaxed);
     }
+    // SAFETY: Registers an async-signal-safe AtomicBool handler for SIGINT/SIGTERM.
     unsafe {
         libc::signal(libc::SIGINT, handle_sig as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, handle_sig as *const () as libc::sighandler_t);
@@ -499,6 +546,7 @@ fn unix_main() {
         *guard = false;
     }
 
+    // SAFETY: POSIX descriptor check against STDOUT_FILENO.
     let is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
     let poll_wait = Duration::from_millis(cfg.expanded_poll_ms.clamp(250, 5000));
 
@@ -507,7 +555,12 @@ fn unix_main() {
         let screen = render_unix_hud(&snap, cfg.language);
         if is_tty {
             print!("\x1b[H\x1b[2J{screen}");
-            println!("\x1b[2mCtrl+C to exit · config: {}\x1b[0m", AppConfig::config_path().display());
+            println!(
+                "\x1b[2m{} · {}: {}\x1b[0m",
+                cfg.language.pick("Ctrl+C to exit", "Çıkmak için Ctrl+C"),
+                cfg.language.pick("config", "ayar"),
+                AppConfig::config_path().display()
+            );
         } else {
             print!("{screen}");
         }
@@ -548,24 +601,21 @@ fn unix_main() {
             Some(ProjectStatus::Healthy) => "\x1b[32m●\x1b[0m",
             _ => "\x1b[90m●\x1b[0m",
         };
-        let jobs_word = match lang {
-            Language::Tr => "iş",
-            Language::En => "jobs",
-        };
-        let proj_word = match lang {
-            Language::Tr => "proje",
-            Language::En => "projects",
-        };
+        let jobs_word = lang.plural(snap.total_jobs as usize, "job", "jobs", "iş");
+        let proj_word = lang.plural(snap.total_projects as usize, "project", "projects", "proje");
+        let dev_cpu_lbl = lang.pick("Dev CPU", "Geliş. CPU");
+        let dev_ram_lbl = lang.pick("Dev RAM", "Geliş. RAM");
+        let sys_cpu_lbl = lang.pick("System CPU", "Sistem CPU");
 
         out.push_str(&format!(
-            "\x1b[1m╭─ bbstats {status_dot} {} {jobs_word} · {} {proj_word} · Dev CPU {:.1}% · Dev RAM {} ─╮\x1b[0m\n",
+            "\x1b[1m╭─ bbstats {status_dot} {} {jobs_word} · {} {proj_word} · {dev_cpu_lbl} {:.1}% · {dev_ram_lbl} {} ─╮\x1b[0m\n",
             snap.total_jobs,
             snap.total_projects,
             snap.total_dev_cpu,
             format_ram(snap.total_dev_ram_bytes),
         ));
         out.push_str(&format!(
-            "  System CPU {:.1}% · RAM {} / {}\n\n",
+            "  {sys_cpu_lbl} {:.1}% · RAM {} / {}\n\n",
             snap.system_cpu,
             format_ram(snap.system_ram_used_bytes),
             format_ram(snap.system_ram_total_bytes),
@@ -573,10 +623,10 @@ fn unix_main() {
 
         let groups = filter_project_jobs(snap, "");
         if groups.is_empty() {
-            let empty_msg = match lang {
-                Language::Tr => "Aktif geliştirici projesi algılanmadı.",
-                Language::En => "No active developer projects detected.",
-            };
+            let empty_msg = lang.pick(
+                "No active developer projects detected.",
+                "Aktif geliştirici projesi algılanmadı.",
+            );
             out.push_str(&format!("  \x1b[2m{empty_msg}\x1b[0m\n"));
             return out;
         }
@@ -587,8 +637,9 @@ fn unix_main() {
                 .as_deref()
                 .map(|b| format!(" \x1b[36m({b})\x1b[0m"))
                 .unwrap_or_default();
+            let p_jobs_word = lang.plural(jobs.len(), "job", "jobs", "iş");
             out.push_str(&format!(
-                "\x1b[1m{}\x1b[0m{branch}  \x1b[2m({} {jobs_word} · CPU {:.1}% · {})\x1b[0m\n",
+                "\x1b[1m{}\x1b[0m{branch}  \x1b[2m({} {p_jobs_word} · CPU {:.1}% · {})\x1b[0m\n",
                 proj.name,
                 jobs.len(),
                 proj.cpu,
