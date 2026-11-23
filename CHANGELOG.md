@@ -5,6 +5,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ---
 
+## [0.4.0] - 2026-11-23
+
+Feature, correctness, platform-parity, and GPU performance release (**v0.4.0**).
+
+### Added & Changed
+
+#### English
+- **GUI Project Stack Launch (`▶`):** Pinned/stopped projects with `bbstats.toml`, `Procfile`, or `package.json` in their root directory can now be launched directly from the Expanded panel via `EngineCmd::LaunchProjectStack` with automatic `.env` loading.
+- **Opt-In WSL2 Process Bridge (Windows):** Added configurable `wsl_bridge_enabled` toggle in Settings and `config.toml`; when enabled and `vmmemWSL` is active, developer runtimes inside WSL2 (`node`, `python`, `uvicorn`, `cargo`, `go`, etc.) surface under a dedicated `WSL2` group.
+- **Port Ready Pill & Quick Port Killer (`Free :PORT`):** Shows a transient `:PORT Ready ↗` badge on the collapsed pill when a watched job opens a new listening port, and adds a `Free :PORT` action button when searching `:port` in the expanded panel (`EngineCmd::KillPort`).
+- **Detail Terminal Log Filters & File Open:** Added `All | Warn | Err` severity filter chips with cached wrapped-line rendering (`TermRenderCache`), plus an `Open` button to launch the bound log file externally.
+- **Configurable Resource Warning Thresholds:** Added `cpu_warn_percent` (`50–100%`) and `ram_warn_mb` (`256–32768 MB`) settings and synced them dynamically with snapshot alert evaluation.
+- **Docker Container Logs & Controls:** Enabled `Stop` and `Restart` controls, accurate container uptime, and live `docker logs` streaming in the Detail view over Windows named pipes and Unix domain sockets.
+- **Linux Native `/proc` & Unix Parity:** Replaced Linux `ps`/`lsof` polling with direct `/proc/<pid>/{stat,cmdline,cwd,exe,environ}` and `/proc/net/{tcp,tcp6,udp,udp6}` reads, added a background Linux `ExitWatcher`, added macOS `host_statistics` system CPU timing and `ps eww` env capture, and updated the Unix TUI HUD with crash/alert badges and title truncation.
+- **Text Cursor Navigation & Packaging Templates:** Added `Left`/`Right`/`Home`/`End`/`Delete` cursor editing with horizontal scrolling in Search/Rename/Add-Job inputs, and added Scoop (`packaging/scoop/bbstats.json`) and Homebrew (`packaging/homebrew/bbstats.rb`) manifests.
+
+#### Türkçe
+- **Arayüzden Proje Yığını Başlatma (`▶`):** Kök dizininde `bbstats.toml`, `Procfile` veya `package.json` bulunan durdurulmuş projeler artık Expanded panelinden tek tıkla (`.env` yüklemeli olarak) başlatılabiliyor.
+- **Opt-In WSL2 Süreç Köprüsü (Windows):** Ayarlar ekranına eklenen WSL2 köprüsü açıkken ve `vmmemWSL` çalışırken WSL içindeki geliştirici süreçleri (`node`, `python`, `uvicorn`, `cargo`, `go` vb.) `WSL2` grubu altında listeleniyor.
+- **Port Hazır Bildirimi ve Hızlı Port Boşaltma (`Free :PORT`):** Yeni port açıldığında daraltılmış hapta geçici `:PORT Ready ↗` göstergesi, arama kutusunda `:port` arandığında tek tıkla `Free :PORT` sonlandırma düğmesi eklendi.
+- **Detay Terminal Log Filtreleri (`All | Warn | Err`) ve Dosya Açma:** Önbellekli satır sarmalama (`TermRenderCache`) ile `Tümü | Uyarı | Hata` seviye filtre çipleri ve log dosyasını dışarıda açan `Aç` düğmesi eklendi.
+- **Özelleştirilebilir Kaynak Uyarı Eşikleri:** Ayarlar üzerinden `cpu_warn_percent` ve `ram_warn_mb` eşikleri yapılandırılabilir hale getirildi.
+- **Docker Konteyner Kontrolleri ve Logları:** Konteyner çalışma süresi, Detail ekranında canlı `docker logs` akışı ve `Stop`/`Restart` kontrolleri aktif edildi.
+- **Linux Doğrudan `/proc` ve Unix Eşitliği:** Linux'ta doğrudan `/proc` süreç/port/ortam okuma, arka plan `ExitWatcher`, macOS `host_statistics` CPU ölçümü, `ps eww` ortam yakalama ve Unix TUI HUD çökme/uyarı rozetleri eklendi.
+- **İmleç Navigasyonu ve Paket Şablonları:** Metin kutularına `Sol`/`Sağ`/`Home`/`End`/`Delete` imleç hareketi, Scoop ve Homebrew manifest şablonları eklendi.
+
+### Fixed & Optimized
+- **CLI `launch` & `run`:** Filtered `package.json` fallback to dev scripts (`dev`, `start`, `serve`, `watch`), added `--only` filter, added `Ctrl+C`/failure process-tree cleanup, and connected `bbstats run`/`launch` logs to the running overlay.
+- **Core Bug Fixes & Direct2D Caching:** Recorded Windows `ManagedJobStore` exit codes on fast crashes, fixed case-insensitive project aliases in `build_snapshot`, fixed `+ Watch` rule specificity (`cmdline`/`cwd` instead of bare runtime name), added `Working Dir` to `+ Add Job`, synced config in `--dump-shot --live`, fixed status dot colors in `HoverPeek`/`Expanded`, cached `ID2D1StrokeStyle1` on `RenderDevice`, tightened `with_transformed_layer` bounds, and extracted `src/app_helpers.rs`.
+
+---
+
 ## [0.3.0] - 2026-11-23
 
 ### Security, Correctness & Architecture

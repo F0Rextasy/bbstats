@@ -37,8 +37,9 @@ use windows::Win32::System::Console::{
 use windows::Win32::System::Pipes::CreatePipe;
 #[cfg(target_os = "windows")]
 use windows::Win32::System::Threading::{
-    CreateProcessW, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CreateProcessW, GetExitCodeProcess, WaitForSingleObject, CREATE_NEW_PROCESS_GROUP,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOW,
 };
 
 use crate::engine::labels::LabelRule;
@@ -223,14 +224,15 @@ impl ManagedJobStore {
         }
 
         let pid = pi.dwProcessId;
-        // SAFETY: Process/thread handles returned by CreateProcessW are owned.
+        // SAFETY: Thread handle returned by CreateProcessW is owned and not needed.
         unsafe {
             let _ = CloseHandle(pi.hThread);
-            let _ = CloseHandle(pi.hProcess);
         }
 
         let ring = self.register_ring(pid);
+        let exited_codes = Arc::clone(&self.exited_codes);
         let pipe_raw = read_pipe.0 as isize;
+        let proc_raw = pi.hProcess.0 as isize;
         let spawned = thread::Builder::new()
             .name(format!("bbstats-pipe-{pid}"))
             .spawn(move || {
@@ -247,14 +249,31 @@ impl ManagedJobStore {
                         }
                     }
                 }
+                drop(pipe_file);
+                // SAFETY: `proc_raw` is an owned process handle from `CreateProcessW`.
+                unsafe {
+                    let proc_handle = HANDLE(proc_raw as *mut core::ffi::c_void);
+                    let _ = WaitForSingleObject(proc_handle, INFINITE);
+                    let mut exit_code = 0u32;
+                    if GetExitCodeProcess(proc_handle, &mut exit_code).is_ok() {
+                        if let Ok(mut q) = exited_codes.lock() {
+                            while q.len() >= 64 {
+                                q.pop_front();
+                            }
+                            q.push_back((pid, exit_code as i32, Instant::now()));
+                        }
+                    }
+                    let _ = CloseHandle(proc_handle);
+                }
             });
         if let Err(err) = spawned {
             if let Ok(mut map) = self.rings.lock() {
                 map.remove(&pid);
             }
-            // SAFETY: Thread spawn failed, so `read_pipe` ownership was not transferred.
+            // SAFETY: Thread spawn failed, so `read_pipe` and `pi.hProcess` ownership was not transferred.
             unsafe {
                 let _ = CloseHandle(read_pipe);
+                let _ = CloseHandle(pi.hProcess);
             }
             return Err(format!("pipe reader thread failed: {err}"));
         }
@@ -430,6 +449,27 @@ pub fn inspect_terminal_output(
     labels: &[LabelRule],
     managed: &ManagedJobStore,
 ) -> TerminalOutput {
+    if let Some(jid) = job_id {
+        if let Some(container_name) = jid
+            .0
+            .strip_prefix("docker:")
+            .and_then(|rest| rest.rsplit(':').next())
+        {
+            let lines = crate::engine::win_nt::query_docker_container_logs(
+                container_name,
+                MAX_TAIL_LINES,
+            );
+            if !lines.is_empty() {
+                return TerminalOutput {
+                    project_id: project_id.clone(),
+                    job_id: job_id.cloned(),
+                    source_kind: TerminalSourceKind::ManagedPipe,
+                    source_hint: Some(format!("docker logs {container_name}")),
+                    lines,
+                };
+            }
+        }
+    }
     if !pids.is_empty() {
         if let Some((matched_pid, lines)) = managed.read_lines_for_pids(pids, MAX_TAIL_LINES) {
             return TerminalOutput {
@@ -439,6 +479,31 @@ pub fn inspect_terminal_output(
                 source_hint: Some(format!("PID {matched_pid}")),
                 lines,
             };
+        }
+        for &pid in pids {
+            let direct_run_log = crate::cli::cli_run_log_path_for_pid(pid);
+            let candidate_path = if direct_run_log.is_file() {
+                Some(direct_run_log)
+            } else {
+                crate::engine::win_nt::inspect_process_peb(pid)
+                    .dev_env
+                    .into_iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("BBSTATS_RUN_LOG"))
+                    .map(|(_, v)| std::path::PathBuf::from(v))
+                    .filter(|p| p.is_file())
+            };
+            if let Some(run_path) = candidate_path {
+                let lines = read_log_tail_lines(&run_path, MAX_TAIL_BYTES, MAX_TAIL_LINES);
+                if !lines.is_empty() {
+                    return TerminalOutput {
+                        project_id: project_id.clone(),
+                        job_id: job_id.cloned(),
+                        source_kind: TerminalSourceKind::LogFile,
+                        source_hint: Some(format!("bbstats run (PID {pid})")),
+                        lines,
+                    };
+                }
+            }
         }
     }
 

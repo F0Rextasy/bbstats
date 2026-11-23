@@ -366,6 +366,77 @@ pub(super) fn render_settings(
         )?;
         y += 36.0;
 
+        draw_toggle_row(
+            ctx,
+            fonts,
+            w,
+            y,
+            vp_top,
+            vp_bot,
+            lang.pick("WSL2 Process Bridge", "WSL2 Süreç Köprüsü"),
+            cfg.wsl_bridge_enabled,
+            lang,
+            state,
+            hit_map,
+            &mut next_id,
+            HitAction::ToggleWslBridge,
+        )?;
+        y += 36.0;
+
+        ctx.draw_text(
+            lang.pick("CPU Alert Threshold", "CPU Uyarı Eşiği"),
+            &fonts.row_primary,
+            rect(16.0, y, 220.0, y + 30.0),
+            TEXT_PRIMARY,
+            false,
+        )?;
+        let minus_cpu = rect(w - 192.0, y + 2.0, w - 158.0, y + 28.0);
+        let val_cpu = rect(w - 154.0, y + 2.0, w - 54.0, y + 28.0);
+        let plus_cpu = rect(w - 50.0, y + 2.0, w - 16.0, y + 28.0);
+        let mc_id = next_id();
+        ctx.fill_rounded(minus_cpu, 6.0, btn_col(state.hovered_hit_id == Some(mc_id)))?;
+        ctx.draw_text("−", &fonts.mono_badge, minus_cpu, TEXT_PRIMARY, false)?;
+        hit_map.push_clipped(mc_id, minus_cpu, vp_top, vp_bot, HitAction::AdjustCpuWarn(-5.0));
+        ctx.draw_text(
+            &format!("{:.0}%", cfg.cpu_warn_percent),
+            &fonts.mono_badge,
+            val_cpu,
+            TEXT_PRIMARY,
+            true,
+        )?;
+        let pc_id = next_id();
+        ctx.fill_rounded(plus_cpu, 6.0, btn_col(state.hovered_hit_id == Some(pc_id)))?;
+        ctx.draw_text("+", &fonts.mono_badge, plus_cpu, TEXT_PRIMARY, false)?;
+        hit_map.push_clipped(pc_id, plus_cpu, vp_top, vp_bot, HitAction::AdjustCpuWarn(5.0));
+        y += 34.0;
+
+        ctx.draw_text(
+            lang.pick("RAM Spike Threshold", "RAM Sıçrama Eşiği"),
+            &fonts.row_primary,
+            rect(16.0, y, 220.0, y + 30.0),
+            TEXT_PRIMARY,
+            false,
+        )?;
+        let minus_ram = rect(w - 192.0, y + 2.0, w - 158.0, y + 28.0);
+        let val_ram = rect(w - 154.0, y + 2.0, w - 54.0, y + 28.0);
+        let plus_ram = rect(w - 50.0, y + 2.0, w - 16.0, y + 28.0);
+        let mr_id = next_id();
+        ctx.fill_rounded(minus_ram, 6.0, btn_col(state.hovered_hit_id == Some(mr_id)))?;
+        ctx.draw_text("−", &fonts.mono_badge, minus_ram, TEXT_PRIMARY, false)?;
+        hit_map.push_clipped(mr_id, minus_ram, vp_top, vp_bot, HitAction::AdjustRamWarn(-256));
+        ctx.draw_text(
+            &format!("{} MB", cfg.ram_warn_mb),
+            &fonts.mono_badge,
+            val_ram,
+            TEXT_PRIMARY,
+            true,
+        )?;
+        let pr_id = next_id();
+        ctx.fill_rounded(plus_ram, 6.0, btn_col(state.hovered_hit_id == Some(pr_id)))?;
+        ctx.draw_text("+", &fonts.mono_badge, plus_ram, TEXT_PRIMARY, false)?;
+        hit_map.push_clipped(pr_id, plus_ram, vp_top, vp_bot, HitAction::AdjustRamWarn(256));
+        y += 36.0;
+
         ctx.draw_text(
             lang.pick("Hover Peek Delay", "Hover Önizleme Gecikmesi"),
             &fonts.row_primary,

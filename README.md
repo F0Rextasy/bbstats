@@ -63,7 +63,7 @@ cargo install --git https://github.com/F0Rextasy/bbstats.git --locked
         <img src="assets/screenshots/en/05-crash-alert.png" alt="Crash alert and red glow" width="100%" />
       </td>
       <td align="center" width="50%">
-        <strong>Settings (v0.2.1, EN / TR Switcher)</strong><br />
+        <strong>Settings (v0.4.0, EN / TR, WSL2 &amp; Thresholds)</strong><br />
         <img src="assets/screenshots/en/06-settings.png" alt="Settings view" width="100%" />
       </td>
     </tr>

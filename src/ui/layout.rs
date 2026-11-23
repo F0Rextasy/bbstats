@@ -36,8 +36,26 @@ pub struct RenameDraft {
 pub struct AddJobDraft {
     pub title: String,
     pub command_or_match: String,
+    pub working_dir: String,
     pub log_file: String,
     pub active_field: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminalLogFilter {
+    #[default]
+    All,
+    WarnAndError,
+    ErrorOnly,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TermRenderCache {
+    pub sig: u64,
+    pub max_cols: usize,
+    pub filter: TerminalLogFilter,
+    /// `(line_text, severity_tag)` where `0 = normal, 1 = live/ok, 2 = warn, 3 = error`.
+    pub wrapped: Vec<(String, u8)>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +67,7 @@ pub struct UiState {
     pub search_query: String,
     pub search_focused: bool,
     pub text_all_selected: bool,
+    pub text_cursor_from_end: usize,
     pub rename_draft: Option<RenameDraft>,
     pub add_job_draft: Option<AddJobDraft>,
     pub selected_index: usize,
@@ -56,6 +75,8 @@ pub struct UiState {
     pub max_scroll: f32,
     pub term_scroll_offset: f32,
     pub term_max_scroll: f32,
+    pub term_filter: TerminalLogFilter,
+    pub term_cache: TermRenderCache,
     pub hovered_hit_id: Option<u32>,
     pub hover_pos_dip: Option<(f32, f32)>,
     pub content_enter_t: f32,
@@ -77,6 +98,7 @@ impl Default for UiState {
             search_query: String::new(),
             search_focused: false,
             text_all_selected: false,
+            text_cursor_from_end: 0,
             rename_draft: None,
             add_job_draft: None,
             selected_index: 0,
@@ -84,6 +106,8 @@ impl Default for UiState {
             max_scroll: 0.0,
             term_scroll_offset: 0.0,
             term_max_scroll: 0.0,
+            term_filter: TerminalLogFilter::All,
+            term_cache: TermRenderCache::default(),
             hovered_hit_id: None,
             hover_pos_dip: None,
             content_enter_t: 1.0,
@@ -202,6 +226,54 @@ pub fn ensure_selected_job_visible(state: &mut UiState, snap: &Snapshot, viewpor
     }
 }
 
+/// Inserts `insert_str` into `buf` at `cursor_from_end` characters before the end of `buf`.
+pub fn insert_text_at_cursor(buf: &mut String, cursor_from_end: &mut usize, insert_str: &str) {
+    let total = buf.chars().count();
+    let clamped_from_end = (*cursor_from_end).min(total);
+    *cursor_from_end = clamped_from_end;
+    if clamped_from_end == 0 {
+        buf.push_str(insert_str);
+        return;
+    }
+    let char_idx = total - clamped_from_end;
+    let byte_idx = buf
+        .char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(buf.len());
+    buf.insert_str(byte_idx, insert_str);
+}
+
+/// Formats `buf` with a `|` caret at `cursor_from_end` and horizontally scrolls to keep the caret visible.
+pub fn format_text_with_cursor(buf: &str, cursor_from_end: usize, max_visible_chars: usize) -> String {
+    let chars: Vec<char> = buf.chars().collect();
+    let total = chars.len();
+    let from_end = cursor_from_end.min(total);
+    let caret_pos = total - from_end;
+    let max_vis = max_visible_chars.max(8);
+
+    if total < max_vis {
+        let left: String = chars[..caret_pos].iter().collect();
+        let right: String = chars[caret_pos..].iter().collect();
+        return format!("{left}|{right}");
+    }
+
+    let half = max_vis / 2;
+    let start = if caret_pos <= half {
+        0
+    } else if caret_pos + half >= total {
+        total.saturating_sub(max_vis.saturating_sub(2))
+    } else {
+        caret_pos - half
+    };
+    let end = (start + max_vis.saturating_sub(2)).min(total);
+    let prefix = if start > 0 { "…" } else { "" };
+    let suffix = if end < total { "…" } else { "" };
+    let left: String = chars[start..caret_pos].iter().collect();
+    let right: String = chars[caret_pos..end].iter().collect();
+    format!("{prefix}{left}|{right}{suffix}")
+}
+
 /// Deletes the trailing whitespace and last word or path segment from a text buffer (`Ctrl+Backspace`).
 pub fn pop_last_word(s: &mut String) {
     while s.chars().last().is_some_and(char::is_whitespace) {
@@ -292,7 +364,7 @@ pub fn target_dimensions(
         ViewMode::Expanded => {
             let alert_h = if active_alert { 48.0 } else { 0.0 };
             let rename_h = if state.rename_draft.is_some() { 42.0 } else { 0.0 };
-            let add_h = if state.add_job_draft.is_some() { 104.0 } else { 0.0 };
+            let add_h = if state.add_job_draft.is_some() { 134.0 } else { 0.0 };
             let content_h = if state.show_all_processes {
                 (snap.all_procs.len().clamp(1, 9) as f32) * 38.0 + 28.0
             } else {

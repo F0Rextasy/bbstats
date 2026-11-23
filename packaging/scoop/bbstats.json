@@ -1,0 +1,23 @@
+{
+  "version": "0.4.0",
+  "description": "Dynamic Island background process & developer project telemetry monitor",
+  "homepage": "https://github.com/F0Rextasy/bbstats",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/F0Rextasy/bbstats/releases/download/v0.4.0/bbstats-v0.4.0-windows-x86_64.zip",
+      "hash": "REPLACE_WITH_SHA256_FROM_RELEASE_SHA256SUMS_TXT"
+    }
+  },
+  "bin": "bbstats.exe",
+  "checkver": {
+    "github": "https://github.com/F0Rextasy/bbstats"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/F0Rextasy/bbstats/releases/download/v$version/bbstats-v$version-windows-x86_64.zip"
+      }
+    }
+  }
+}

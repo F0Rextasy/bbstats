@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "windows")]
 mod app;
+#[cfg(target_os = "windows")]
+mod app_helpers;
 mod cli;
 mod config;
 mod engine;
@@ -219,7 +221,7 @@ fn windows_main() {
                         let (snap, mut shot_cfg) = if use_live {
                             let eng = start_engine_and_wait_first_snapshot(
                                 model::PollingMode::ExpandedActive,
-                                None,
+                                Some(cfg.to_sync_cmd()),
                             );
                             let s = eng.latest();
                             eng.send(model::EngineCmd::Shutdown);
@@ -496,15 +498,7 @@ fn unix_main() {
     }
 
     let eng = engine::start_engine(wake_cb);
-    eng.send(EngineCmd::SyncConfigState {
-        pinned_projects: cfg.pinned_projects.clone(),
-        hidden_projects: cfg.hidden_projects.clone(),
-        project_aliases: cfg.project_aliases.clone(),
-        project_order: cfg.project_order.clone(),
-        job_order: cfg.job_order.clone(),
-        sort_mode: cfg.sort_mode,
-        language: cfg.language,
-    });
+    eng.send(cfg.to_sync_cmd());
     eng.send(EngineCmd::SetInterval {
         collapsed_ms: Some(cfg.collapsed_poll_ms),
         expanded_ms: Some(cfg.expanded_poll_ms),
@@ -615,11 +609,20 @@ fn unix_main() {
             format_ram(snap.total_dev_ram_bytes),
         ));
         out.push_str(&format!(
-            "  {sys_cpu_lbl} {:.1}% · RAM {} / {}\n\n",
+            "  {sys_cpu_lbl} {:.1}% · RAM {} / {}\n",
             snap.system_cpu,
             format_ram(snap.system_ram_used_bytes),
             format_ram(snap.system_ram_total_bytes),
         ));
+        for alert in snap.alerts.iter().filter(|a| !a.dismissed).take(2) {
+            let tag = match alert.kind {
+                AlertKind::Crash { .. } => "\x1b[31m[CRASH]\x1b[0m",
+                AlertKind::HighCpu { .. } => "\x1b[33m[HIGH CPU]\x1b[0m",
+                AlertKind::MemorySpike { .. } => "\x1b[33m[MEM SPIKE]\x1b[0m",
+            };
+            out.push_str(&format!("  {tag} {}\n", alert.message));
+        }
+        out.push('\n');
 
         let groups = filter_project_jobs(snap, "");
         if groups.is_empty() {
@@ -652,13 +655,24 @@ fn unix_main() {
                     let list: Vec<String> = job.ports.iter().map(|p| format!(":{}", p.port)).collect();
                     format!(" \x1b[34m{}\x1b[0m", list.join(" "))
                 };
+                let badge = match job.status {
+                    ProjectStatus::Crashed => " \x1b[31m[CRASHED]\x1b[0m",
+                    ProjectStatus::Stopped => " \x1b[90m[STOPPED]\x1b[0m",
+                    ProjectStatus::HighLoad => " \x1b[33m[HIGH]\x1b[0m",
+                    ProjectStatus::Healthy => "",
+                };
+                let short_title = if job.title.chars().count() > 26 {
+                    let prefix: String = job.title.chars().take(25).collect();
+                    format!("{prefix}…")
+                } else {
+                    job.title.clone()
+                };
                 out.push_str(&format!(
-                    "  ├─ {:<26} {:>5.1}%  {:>8}  {:>6}{}\n",
-                    job.title,
+                    "  ├─ {:<26} {:>5.1}%  {:>8}  {:>6}{badge}{ports}\n",
+                    short_title,
                     job.cpu,
                     format_ram(job.ram),
                     format_uptime(job.uptime),
-                    ports
                 ));
             }
             out.push('\n');

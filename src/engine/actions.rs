@@ -690,24 +690,92 @@ mod watcher_imp {
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 mod watcher_imp {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
 
-    /// Lightweight non-Windows/non-macOS `ExitWatcher` fallback.
+    /// Background process exit watcher for Linux using `/proc/<pid>` status and `kill(pid, 0)`.
     pub struct ExitWatcher {
-        _on_exit: ExitCallback,
+        watched: Arc<Mutex<HashMap<ProcessKey, u64>>>,
+        next_gen: u64,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
     }
 
     impl ExitWatcher {
         pub fn new(on_exit: ExitCallback) -> Self {
-            Self { _on_exit: on_exit }
+            let watched: Arc<Mutex<HashMap<ProcessKey, u64>>> =
+                Arc::new(Mutex::new(HashMap::with_capacity(32)));
+            let stop = Arc::new(AtomicBool::new(false));
+            let watched_bg = Arc::clone(&watched);
+            let stop_bg = Arc::clone(&stop);
+            let worker = thread::Builder::new()
+                .name("bbstats-linux-exit-watch".into())
+                .spawn(move || {
+                    while !stop_bg.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(120));
+                        if stop_bg.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let keys: Vec<ProcessKey> = watched_bg
+                            .lock()
+                            .map(|g| g.keys().copied().collect())
+                            .unwrap_or_default();
+                        for key in keys {
+                            let proc_exists = std::path::Path::new(&format!("/proc/{}", key.pid)).exists();
+                            // SAFETY: `kill(pid, 0)` checks process existence without sending a signal.
+                            let alive = proc_exists
+                                || unsafe { libc::kill(key.pid as i32, 0) == 0 };
+                            if !alive {
+                                if let Ok(mut g) = watched_bg.lock() {
+                                    g.remove(&key);
+                                }
+                                on_exit(ExitEvent { key, exit_code: 1 });
+                            }
+                        }
+                    }
+                })
+                .ok();
+            Self {
+                watched,
+                next_gen: 1,
+                stop,
+                worker,
+            }
         }
 
-        pub fn ensure_watched(&mut self, _key: ProcessKey) {}
+        pub fn ensure_watched(&mut self, key: ProcessKey) {
+            if key.pid <= 1 {
+                return;
+            }
+            if let Ok(mut g) = self.watched.lock() {
+                if !g.contains_key(&key) {
+                    let id = self.next_gen;
+                    self.next_gen += 1;
+                    g.insert(key, id);
+                }
+            }
+        }
 
         pub fn poll_exit_code(&self, _key: &ProcessKey) -> Option<i32> {
             None
         }
 
-        pub fn unwatch(&mut self, _key: &ProcessKey) {}
+        pub fn unwatch(&mut self, key: &ProcessKey) {
+            if let Ok(mut g) = self.watched.lock() {
+                g.remove(key);
+            }
+        }
+    }
+
+    impl Drop for ExitWatcher {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(h) = self.worker.take() {
+                let _ = h.join();
+            }
+        }
     }
 }
 

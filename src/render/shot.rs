@@ -455,6 +455,7 @@ pub fn build_demo_snapshot() -> Snapshot {
         alerts: Vec::new(),
         all_procs: Vec::new(),
         active_terminal: Some(terminal),
+        port_ready_hint: None,
         last_action_error: None,
     }
 }
@@ -969,6 +970,7 @@ pub fn dump_shots(
                     &device.d2d_factory,
                     &device.dwrite_factory,
                     &device.fonts.tabular_typography,
+                    &device.round_stroke_style,
                 )
                 .map_err(|e| e.to_string())?;
                 let mut hit_map = HitMap::default();

@@ -32,7 +32,7 @@ use crate::engine::project_resolver::{
     LogTailCache, ProcessMetadata, ProjectResolver, RestartRecipe,
 };
 use crate::engine::terminal::{inspect_terminal_output, ManagedJobStore};
-use crate::engine::win_nt::current_pid;
+use crate::engine::win_nt::{current_pid, query_wsl_dev_processes, WslProcessSummary};
 use crate::model::{
     Alert, AlertKind, EngineCmd, JobId, Language, PollingMode, ProcInfo, ProcessKey, ProcessRole,
     ProjectId, Snapshot, SortMode,
@@ -40,7 +40,9 @@ use crate::model::{
 
 pub type WakeCallback = Arc<dyn Fn() + Send + Sync>;
 
-use snapshot::{build_snapshot, unix_now_ms, CrashedJobRecord, ProjectRuntimeState};
+use snapshot::{build_snapshot_with_options, unix_now_ms, CrashedJobRecord, ProjectRuntimeState};
+#[cfg(test)]
+use snapshot::build_snapshot;
 
 enum EngineMsg {
     Cmd(EngineCmd),
@@ -168,6 +170,13 @@ struct EngineRuntime {
     vanished_since: HashMap<ProcessKey, Instant>,
     last_action_error: Option<(u64, String)>,
     next_error_id: u64,
+    wsl_bridge_enabled: bool,
+    cpu_warn_percent: f32,
+    ram_warn_mb: u64,
+    last_wsl_procs: Vec<WslProcessSummary>,
+    last_wsl_poll: Option<Instant>,
+    known_listening_ports: HashSet<(JobId, u16)>,
+    port_ready_hint: Option<(u16, String, Instant, u64)>,
 }
 
 impl EngineRuntime {
@@ -221,6 +230,13 @@ impl EngineRuntime {
             vanished_since: HashMap::new(),
             last_action_error: None,
             next_error_id: 0,
+            wsl_bridge_enabled: false,
+            cpu_warn_percent: 85.0,
+            ram_warn_mb: 1536,
+            last_wsl_procs: Vec::new(),
+            last_wsl_poll: None,
+            known_listening_ports: HashSet::new(),
+            port_ready_hint: None,
         }
     }
 
@@ -314,6 +330,28 @@ impl EngineRuntime {
                     true
                 }
                 EngineCmd::KillJob(job_id) => {
+                    if let Some(container_name) = job_id
+                        .0
+                        .strip_prefix("docker:")
+                        .and_then(|rest| rest.rsplit(':').next())
+                        .map(str::to_string)
+                    {
+                        let tx = self.cmd_tx.clone();
+                        let _ = thread::Builder::new()
+                            .name("bbstats-docker-stop".into())
+                            .spawn(move || {
+                                if !crate::engine::win_nt::control_docker_container(
+                                    &container_name,
+                                    "stop",
+                                ) {
+                                    let _ = tx.send(EngineMsg::ActionError(format!(
+                                        "Docker stop failed for {container_name}"
+                                    )));
+                                }
+                                let _ = tx.send(EngineMsg::Cmd(EngineCmd::ForceRescan));
+                            });
+                        return true;
+                    }
                     let keys: Vec<ProcessKey> = self
                         .watched_meta
                         .iter()
@@ -324,6 +362,35 @@ impl EngineRuntime {
                     true
                 }
                 EngineCmd::KillProject(project_id) => {
+                    if let Some(proj_key) = project_id.0.strip_prefix("docker:") {
+                        let names: Vec<String> = self
+                            .resolver
+                            .docker_containers()
+                            .iter()
+                            .filter(|c| {
+                                c.compose_project
+                                    .as_deref()
+                                    .unwrap_or(&c.name)
+                                    .eq_ignore_ascii_case(proj_key)
+                            })
+                            .map(|c| c.name.clone())
+                            .collect();
+                        if !names.is_empty() {
+                            let tx = self.cmd_tx.clone();
+                            let _ = thread::Builder::new()
+                                .name("bbstats-docker-stop-all".into())
+                                .spawn(move || {
+                                    for name in names {
+                                        let _ = crate::engine::win_nt::control_docker_container(
+                                            &name,
+                                            "stop",
+                                        );
+                                    }
+                                    let _ = tx.send(EngineMsg::Cmd(EngineCmd::ForceRescan));
+                                });
+                            return true;
+                        }
+                    }
                     let keys: Vec<ProcessKey> = self
                         .watched_meta
                         .iter()
@@ -331,6 +398,24 @@ impl EngineRuntime {
                         .map(|(k, _)| *k)
                         .collect();
                     execute_safe_kill_many(&keys, &self.last_procs, true, &mut self.user_kills);
+                    true
+                }
+                EngineCmd::KillPort(port) => {
+                    let keys: Vec<ProcessKey> = self
+                        .last_procs
+                        .iter()
+                        .filter(|p| {
+                            self.last_ports.get(&p.key.pid).is_some_and(|net| {
+                                net.ports.iter().any(|b| b.port == port && b.is_listening)
+                            })
+                        })
+                        .map(|p| p.key)
+                        .collect();
+                    if keys.is_empty() {
+                        self.record_action_error(format!("No listening process found on :{port}"));
+                    } else {
+                        execute_safe_kill_many(&keys, &self.last_procs, true, &mut self.user_kills);
+                    }
                     true
                 }
                 EngineCmd::Restart(key) => {
@@ -350,6 +435,28 @@ impl EngineRuntime {
                     true
                 }
                 EngineCmd::RestartJob(job_id) => {
+                    if let Some(container_name) = job_id
+                        .0
+                        .strip_prefix("docker:")
+                        .and_then(|rest| rest.rsplit(':').next())
+                        .map(str::to_string)
+                    {
+                        let tx = self.cmd_tx.clone();
+                        let _ = thread::Builder::new()
+                            .name("bbstats-docker-restart".into())
+                            .spawn(move || {
+                                if !crate::engine::win_nt::control_docker_container(
+                                    &container_name,
+                                    "restart",
+                                ) {
+                                    let _ = tx.send(EngineMsg::ActionError(format!(
+                                        "Docker restart failed for {container_name}"
+                                    )));
+                                }
+                                let _ = tx.send(EngineMsg::Cmd(EngineCmd::ForceRescan));
+                            });
+                        return true;
+                    }
                     let managed = Arc::clone(&self.managed_jobs);
                     let _ = self.execute_restart_target_with(
                         RestartTarget::Job(job_id),
@@ -366,6 +473,35 @@ impl EngineRuntime {
                     true
                 }
                 EngineCmd::RestartProject(project_id) => {
+                    if let Some(proj_key) = project_id.0.strip_prefix("docker:") {
+                        let names: Vec<String> = self
+                            .resolver
+                            .docker_containers()
+                            .iter()
+                            .filter(|c| {
+                                c.compose_project
+                                    .as_deref()
+                                    .unwrap_or(&c.name)
+                                    .eq_ignore_ascii_case(proj_key)
+                            })
+                            .map(|c| c.name.clone())
+                            .collect();
+                        if !names.is_empty() {
+                            let tx = self.cmd_tx.clone();
+                            let _ = thread::Builder::new()
+                                .name("bbstats-docker-restart-all".into())
+                                .spawn(move || {
+                                    for name in names {
+                                        let _ = crate::engine::win_nt::control_docker_container(
+                                            &name,
+                                            "restart",
+                                        );
+                                    }
+                                    let _ = tx.send(EngineMsg::Cmd(EngineCmd::ForceRescan));
+                                });
+                            return true;
+                        }
+                    }
                     let managed = Arc::clone(&self.managed_jobs);
                     let _ = self.execute_restart_target_with(
                         RestartTarget::Project(project_id),
@@ -381,6 +517,10 @@ impl EngineRuntime {
                     );
                     true
                 }
+                EngineCmd::LaunchProjectStack(project_id) => {
+                    self.launch_project_stack(&project_id);
+                    true
+                }
                 EngineCmd::SyncConfigState {
                     pinned_projects,
                     hidden_projects,
@@ -389,8 +529,17 @@ impl EngineRuntime {
                     job_order,
                     sort_mode,
                     language,
+                    wsl_bridge_enabled,
+                    cpu_warn_percent,
+                    ram_warn_mb,
                 } => {
                     self.language = language;
+                    self.wsl_bridge_enabled = wsl_bridge_enabled;
+                    if !wsl_bridge_enabled {
+                        self.last_wsl_procs.clear();
+                    }
+                    self.cpu_warn_percent = cpu_warn_percent.clamp(50.0, 100.0);
+                    self.ram_warn_mb = ram_warn_mb.clamp(256, 32_768);
                     self.resolver.set_language(language);
                     self.pinned_keys = pinned_projects
                         .into_iter()
@@ -784,7 +933,24 @@ impl EngineRuntime {
             self.system_ram_history[23] = sys_ram_pct;
         }
 
-        let mut snapshot = build_snapshot(
+        if self.wsl_bridge_enabled
+            && collected
+                .processes
+                .iter()
+                .any(|p| p.image_name.to_ascii_lowercase().starts_with("vmmem"))
+        {
+            if self
+                .last_wsl_poll
+                .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(5))
+            {
+                self.last_wsl_poll = Some(now);
+                self.last_wsl_procs = query_wsl_dev_processes();
+            }
+        } else {
+            self.last_wsl_procs.clear();
+        }
+
+        let mut snapshot = build_snapshot_with_options(
             &collected.processes,
             collected.system_cpu_percent,
             collected.system_ram_used_bytes,
@@ -809,7 +975,43 @@ impl EngineRuntime {
             self_pid,
             &ancestors,
             self.language,
+            self.cpu_warn_percent,
+            self.ram_warn_mb.saturating_mul(1024 * 1024),
+            &self.last_wsl_procs,
         );
+
+        let had_hint_before = self.port_ready_hint.is_some();
+        if let Some((_, _, exp_inst, _)) = self.port_ready_hint {
+            if now >= exp_inst {
+                self.port_ready_hint = None;
+            }
+        }
+        let mut current_ports = HashSet::new();
+        for p in &snapshot.projects {
+            for j in &p.jobs {
+                for b in &j.ports {
+                    if b.is_listening {
+                        let key = (j.id.clone(), b.port);
+                        if self.tick_counter > 2 && !self.known_listening_ports.contains(&key) {
+                            let expires_ms = unix_now_ms().saturating_add(4000);
+                            self.port_ready_hint = Some((
+                                b.port,
+                                j.title.clone(),
+                                now + Duration::from_secs(4),
+                                expires_ms,
+                            ));
+                        }
+                        current_ports.insert(key);
+                    }
+                }
+            }
+        }
+        self.known_listening_ports = current_ports;
+        snapshot.port_ready_hint = self
+            .port_ready_hint
+            .as_ref()
+            .map(|(port, title, _, exp_ms)| (*port, title.clone(), *exp_ms));
+        let hint_changed = had_hint_before != snapshot.port_ready_hint.is_some();
 
         if self.project_states.len() > 64 {
             let active_ids: HashSet<ProjectId> =
@@ -931,7 +1133,9 @@ impl EngineRuntime {
         );
         let should_wake = match self.mode {
             PollingMode::ExpandedActive | PollingMode::HoverPeek => true,
-            PollingMode::CollapsedIdle => sig != self.last_summary_sig || self.tick_counter <= 2,
+            PollingMode::CollapsedIdle => {
+                hint_changed || sig != self.last_summary_sig || self.tick_counter <= 2
+            }
             PollingMode::LowPowerLocked => !snapshot.alerts.is_empty() && sig != self.last_summary_sig,
         };
         self.last_summary_sig = sig;
@@ -1241,16 +1445,67 @@ impl EngineRuntime {
                             .map(PathBuf::from)
                     })
                     .unwrap_or_else(|| PathBuf::from("."));
-                let extra_env = rule
-                    .env_file
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(|p| crate::engine::labels::load_env_file_vars(&PathBuf::from(expand_win_env_vars(p))))
-                    .unwrap_or_default();
+                let dotenv_path = cwd.join(".env");
+                let mut extra_env = if dotenv_path.is_file() {
+                    crate::engine::labels::load_env_file_vars(&dotenv_path)
+                } else {
+                    Vec::new()
+                };
+                if let Some(ref ef) = rule.env_file {
+                    let t = ef.trim();
+                    if !t.is_empty() {
+                        extra_env.extend(crate::engine::labels::load_env_file_vars(&PathBuf::from(
+                            expand_win_env_vars(t),
+                        )));
+                    }
+                }
                 if let Err(err) = self.managed_jobs.spawn_with_capture_env(cmd, &cwd, &extra_env, true) {
                     self.record_action_error(err);
                 }
+            }
+        }
+    }
+
+    fn launch_project_stack(&mut self, project_id: &ProjectId) {
+        let root_opt = self
+            .project_states
+            .get(project_id)
+            .and_then(|st| st.last_known_root.clone())
+            .or_else(|| {
+                self.watched_meta
+                    .values()
+                    .find(|w| &w.meta.project_id == project_id)
+                    .and_then(|w| w.meta.project_root.clone())
+            });
+        let Some(root) = root_opt else {
+            self.record_action_error("Project root directory not found for stack launch".into());
+            return;
+        };
+        let jobs = match crate::cli::discover_launch_jobs(&root) {
+            Ok((_, jobs)) => jobs,
+            Err(err) => {
+                self.record_action_error(err);
+                return;
+            }
+        };
+        let dotenv_path = root.join(".env");
+        let base_env = if dotenv_path.is_file() {
+            crate::engine::labels::load_env_file_vars(&dotenv_path)
+        } else {
+            Vec::new()
+        };
+        for job in jobs {
+            let cwd = job.cwd.unwrap_or_else(|| root.clone());
+            let mut job_env = base_env.clone();
+            let job_dotenv = cwd.join(".env");
+            if job_dotenv != dotenv_path && job_dotenv.is_file() {
+                job_env.extend(crate::engine::labels::load_env_file_vars(&job_dotenv));
+            }
+            if let Err(err) =
+                self.managed_jobs
+                    .spawn_with_capture_env(&job.command, &cwd, &job_env, true)
+            {
+                self.record_action_error(format!("[{}] {err}", job.name));
             }
         }
     }
@@ -2020,6 +2275,9 @@ mod tests {
             job_order: Vec::new(),
             sort_mode: SortMode::Custom,
             language: Language::En,
+            wsl_bridge_enabled: false,
+            cpu_warn_percent: 85.0,
+            ram_warn_mb: 1536,
         }));
         let snap_hidden = build_snapshot(
             &[],
@@ -2058,6 +2316,9 @@ mod tests {
             job_order: Vec::new(),
             sort_mode: SortMode::Custom,
             language: Language::En,
+            wsl_bridge_enabled: false,
+            cpu_warn_percent: 85.0,
+            ram_warn_mb: 1536,
         }));
         let snap_restored = build_snapshot(
             &[],

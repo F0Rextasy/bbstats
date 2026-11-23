@@ -1,13 +1,19 @@
 //! Developer-facing CLI subcommands: `bbstats run`, `bbstats port`, and `bbstats launch`.
 
+use crate::config::AppConfig;
 use crate::engine::actions::execute_safe_kill_many;
 use crate::engine::collector::ProcessCollector;
 use crate::engine::project_resolver::{sanitize_cmdline, ProjectResolver};
 use crate::engine::win_nt::{current_pid, inspect_process_peb};
 use crate::model::{ProcessKey, TransportProto};
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+
+static ACTIVE_CLI_PIDS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliSubcommand {
@@ -23,6 +29,7 @@ pub enum CliSubcommand {
     Launch {
         dir: PathBuf,
         list_only: bool,
+        only: Vec<String>,
     },
 }
 
@@ -114,13 +121,34 @@ fn parse_port_args(rest: &[String]) -> Result<CliSubcommand, String> {
 fn parse_launch_args(rest: &[String]) -> Result<CliSubcommand, String> {
     let mut dir: Option<PathBuf> = None;
     let mut list_only = false;
-    for tok in rest {
+    let mut only: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < rest.len() {
+        let tok = &rest[i];
         if tok == "--list" || tok == "-l" {
             list_only = true;
+            i += 1;
+        } else if tok == "--only" || tok == "-o" {
+            let val = rest
+                .get(i + 1)
+                .ok_or_else(|| format!("{tok} requires a comma-separated list of job names"))?;
+            for item in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                only.push(item.to_string());
+            }
+            i += 2;
+        } else if let Some(val) = tok.strip_prefix("--only=") {
+            for item in val.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                only.push(item.to_string());
+            }
+            if only.is_empty() {
+                return Err("--only= requires at least one job name".to_string());
+            }
+            i += 1;
         } else if tok.starts_with('-') {
             return Err(format!("Unknown flag for 'launch': {tok}"));
         } else if dir.is_none() {
             dir = Some(PathBuf::from(tok));
+            i += 1;
         } else {
             return Err(format!("Unexpected extra argument for 'launch': {tok}"));
         }
@@ -129,7 +157,11 @@ fn parse_launch_args(rest: &[String]) -> Result<CliSubcommand, String> {
         Some(d) => d,
         None => std::env::current_dir().map_err(|e| format!("Failed to read cwd: {e}"))?,
     };
-    Ok(CliSubcommand::Launch { dir, list_only })
+    Ok(CliSubcommand::Launch {
+        dir,
+        list_only,
+        only,
+    })
 }
 
 /// Runs a subcommand if `args` matches `run | port | launch`, returning `Some(exit_code)`.
@@ -148,18 +180,106 @@ fn execute_subcommand(cmd: CliSubcommand) -> i32 {
     match cmd {
         CliSubcommand::Run { cwd, program, args } => run_direct(cwd.as_deref(), &program, &args),
         CliSubcommand::Port { port, kill } => inspect_port(port, kill),
-        CliSubcommand::Launch { dir, list_only } => launch_project(&dir, list_only),
+        CliSubcommand::Launch {
+            dir,
+            list_only,
+            only,
+        } => launch_project(&dir, list_only, &only),
     }
 }
 
-fn spawn_inherited_command(program: &str, args: &[String], cwd: Option<&Path>) -> std::io::Result<Child> {
+/// Directory where CLI `bbstats run` and `bbstats launch` write live log files for the desktop overlay.
+pub fn cli_logs_dir() -> PathBuf {
+    AppConfig::config_path()
+        .parent()
+        .map(|p| p.join("logs"))
+        .unwrap_or_else(|| std::env::temp_dir().join("bbstats_logs"))
+}
+
+pub fn cli_run_log_path_for_pid(pid: u32) -> PathBuf {
+    cli_logs_dir().join(format!("run-{pid}.log"))
+}
+
+fn install_ctrl_c_tree_cleanup() {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::BOOL;
+        use windows::Win32::System::Console::SetConsoleCtrlHandler;
+        unsafe extern "system" fn handler(_ctrl_type: u32) -> BOOL {
+            let pids = ACTIVE_CLI_PIDS
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
+            terminate_process_trees(&pids);
+            BOOL(0)
+        }
+        // SAFETY: Registers a valid console control handler function pointer.
+        unsafe {
+            let _ = SetConsoleCtrlHandler(Some(handler), true);
+        }
+    }
+}
+
+fn register_active_cli_pid(pid: u32) {
+    if let Ok(mut g) = ACTIVE_CLI_PIDS.lock() {
+        if !g.contains(&pid) {
+            g.push(pid);
+        }
+    }
+}
+
+fn unregister_active_cli_pid(pid: u32) {
+    if let Ok(mut g) = ACTIVE_CLI_PIDS.lock() {
+        g.retain(|&p| p != pid);
+    }
+}
+
+fn terminate_process_trees(root_pids: &[u32]) {
+    if root_pids.is_empty() {
+        return;
+    }
+    let mut collector = ProcessCollector::new();
+    let tick = collector.collect_processes();
+    let roots: Vec<ProcessKey> = tick
+        .processes
+        .iter()
+        .filter(|p| root_pids.contains(&p.key.pid))
+        .map(|p| p.key)
+        .collect();
+    if !roots.is_empty() {
+        let mut user_kills = HashMap::new();
+        let _ = execute_safe_kill_many(&roots, &tick.processes, false, &mut user_kills);
+    }
+    #[cfg(not(target_os = "windows"))]
+    for &pid in root_pids {
+        if pid > 1 {
+            // SAFETY: Negative PID sends signal to the child's process group created via process_group(0).
+            unsafe {
+                let _ = libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+        }
+    }
+}
+
+fn spawn_piped_command_with_log(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    log_path: &Path,
+) -> std::io::Result<Child> {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("BBSTATS_RUN_LOG", log_path);
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
     match cmd.spawn() {
         Ok(child) => Ok(child),
@@ -169,8 +289,9 @@ fn spawn_inherited_command(program: &str, args: &[String], cwd: Option<&Path>) -
             let mut sh = Command::new("cmd.exe");
             sh.arg("/D").arg("/C").arg(program).args(args);
             sh.stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env("BBSTATS_RUN_LOG", log_path);
             if let Some(dir) = cwd {
                 sh.current_dir(dir);
             }
@@ -180,6 +301,37 @@ fn spawn_inherited_command(program: &str, args: &[String], cwd: Option<&Path>) -
     }
 }
 
+fn tee_stream_to_console_and_log<R: Read + Send + 'static>(
+    mut reader: R,
+    log_file: Option<Arc<Mutex<File>>>,
+    is_stderr: bool,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            if is_stderr {
+                let mut err = std::io::stderr();
+                let _ = err.write_all(chunk);
+                let _ = err.flush();
+            } else {
+                let mut out = std::io::stdout();
+                let _ = out.write_all(chunk);
+                let _ = out.flush();
+            }
+            if let Some(ref f_arc) = log_file {
+                if let Ok(mut f) = f_arc.lock() {
+                    let _ = f.write_all(chunk);
+                    let _ = f.flush();
+                }
+            }
+        }
+    })
+}
+
 fn run_direct(cwd: Option<&Path>, program: &str, args: &[String]) -> i32 {
     if let Some(dir) = cwd {
         if !dir.is_dir() {
@@ -187,14 +339,48 @@ fn run_direct(cwd: Option<&Path>, program: &str, args: &[String]) -> i32 {
             return 2;
         }
     }
-    match spawn_inherited_command(program, args, cwd) {
-        Ok(mut child) => match child.wait() {
-            Ok(status) => status.code().unwrap_or(1),
-            Err(e) => {
-                eprintln!("Failed while waiting for '{program}': {e}");
-                1
+    install_ctrl_c_tree_cleanup();
+    let logs_dir = cli_logs_dir();
+    let _ = std::fs::create_dir_all(&logs_dir);
+    let temp_log = logs_dir.join(format!("run-cli-{}.log", current_pid()));
+    match spawn_piped_command_with_log(program, args, cwd, &temp_log) {
+        Ok(mut child) => {
+            let child_pid = child.id();
+            register_active_cli_pid(child_pid);
+            let pid_log_path = cli_run_log_path_for_pid(child_pid);
+            let log_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_log)
+                .ok()
+                .map(|f| Arc::new(Mutex::new(f)));
+            let _ = std::fs::remove_file(&pid_log_path);
+            let _ = std::fs::hard_link(&temp_log, &pid_log_path);
+            let out_handle = child
+                .stdout
+                .take()
+                .map(|out| tee_stream_to_console_and_log(out, log_file.clone(), false));
+            let err_handle = child
+                .stderr
+                .take()
+                .map(|err| tee_stream_to_console_and_log(err, log_file, true));
+            let res = match child.wait() {
+                Ok(status) => status.code().unwrap_or(1),
+                Err(e) => {
+                    eprintln!("Failed while waiting for '{program}': {e}");
+                    1
+                }
+            };
+            unregister_active_cli_pid(child_pid);
+            if let Some(h) = out_handle {
+                let _ = h.join();
             }
-        },
+            if let Some(h) = err_handle {
+                let _ = h.join();
+            }
+            res
+        }
         Err(e) => {
             eprintln!("Failed to start '{program}': {e}");
             1
@@ -432,9 +618,30 @@ pub fn parse_procfile(content: &str, base_dir: &Path) -> Vec<LaunchJob> {
     out
 }
 
+pub fn is_dev_script_name(name: &str) -> bool {
+    let low = name.trim().to_ascii_lowercase();
+    matches!(low.as_str(), "dev" | "start" | "serve" | "watch" | "preview")
+        || low.starts_with("dev:")
+        || low.starts_with("start:")
+        || low.starts_with("serve:")
+        || low.starts_with("watch:")
+        || low.ends_with(":dev")
+        || low.ends_with(":start")
+        || low.ends_with(":serve")
+        || low.ends_with(":watch")
+}
+
 pub fn parse_package_json_scripts(
     content: &str,
     base_dir: &Path,
+) -> Result<Vec<LaunchJob>, String> {
+    parse_package_json_scripts_filtered(content, base_dir, &[])
+}
+
+pub fn parse_package_json_scripts_filtered(
+    content: &str,
+    base_dir: &Path,
+    only: &[String],
 ) -> Result<Vec<LaunchJob>, String> {
     let v: serde_json::Value =
         serde_json::from_str(content).map_err(|e| format!("Invalid package.json: {e}"))?;
@@ -452,10 +659,19 @@ pub fn parse_package_json_scripts(
         "npm"
     };
     for (name, _) in scripts {
-        if !name.trim().is_empty() {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let matches_filter = if only.is_empty() {
+            is_dev_script_name(trimmed)
+        } else {
+            only.iter().any(|o| o.eq_ignore_ascii_case(trimmed))
+        };
+        if matches_filter {
             out.push(LaunchJob {
-                name: name.clone(),
-                command: format!("{runner} run {name}"),
+                name: trimmed.to_string(),
+                command: format!("{runner} run {trimmed}"),
                 cwd: Some(base_dir.to_path_buf()),
             });
         }
@@ -463,7 +679,7 @@ pub fn parse_package_json_scripts(
     Ok(out)
 }
 
-fn spawn_shell_job(job: &LaunchJob) -> std::io::Result<Child> {
+fn spawn_shell_job(job: &LaunchJob, log_path: &Path) -> std::io::Result<Child> {
     #[cfg(target_os = "windows")]
     let mut cmd = {
         let mut c = Command::new("cmd.exe");
@@ -472,27 +688,58 @@ fn spawn_shell_job(job: &LaunchJob) -> std::io::Result<Child> {
     };
     #[cfg(not(target_os = "windows"))]
     let mut cmd = {
+        use std::os::unix::process::CommandExt;
         let mut c = Command::new("sh");
         c.arg("-c").arg(&job.command);
+        c.process_group(0);
         c
     };
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("BBSTATS_RUN_LOG", log_path);
     if let Some(ref cwd) = job.cwd {
         cmd.current_dir(cwd);
     }
     cmd.spawn()
 }
 
-fn launch_project(dir: &Path, list_only: bool) -> i32 {
-    let (source, jobs) = match discover_launch_jobs(dir) {
+fn launch_project(dir: &Path, list_only: bool, only: &[String]) -> i32 {
+    let (source, mut jobs) = match discover_launch_jobs(dir) {
         Ok(res) => res,
         Err(msg) => {
-            eprintln!("{msg}");
-            return 1;
+            // If discover_launch_jobs failed only because package.json had no default dev scripts,
+            // allow explicit `--only` script names from package.json.
+            let pkg_path = dir.join("package.json");
+            if !only.is_empty() && pkg_path.is_file() {
+                match std::fs::read_to_string(&pkg_path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|c| parse_package_json_scripts_filtered(&c, dir, only))
+                {
+                    Ok(j) if !j.is_empty() => (pkg_path, j),
+                    _ => {
+                        eprintln!("{msg}");
+                        return 1;
+                    }
+                }
+            } else {
+                eprintln!("{msg}");
+                return 1;
+            }
         }
     };
+
+    if !only.is_empty() {
+        jobs.retain(|j| only.iter().any(|o| o.eq_ignore_ascii_case(&j.name)));
+        if jobs.is_empty() {
+            eprintln!(
+                "No jobs matched --only filter ({}) in {}",
+                only.join(", "),
+                source.display()
+            );
+            return 1;
+        }
+    }
 
     println!("Discovered {} job(s) from {}", jobs.len(), source.display());
     for job in &jobs {
@@ -502,17 +749,48 @@ fn launch_project(dir: &Path, list_only: bool) -> i32 {
         return 0;
     }
 
-    let mut running: Vec<(String, Child)> = Vec::new();
-    for job in jobs {
-        match spawn_shell_job(&job) {
-            Ok(child) => {
-                println!("[{}] started (PID {})", job.name, child.id());
-                running.push((job.name, child));
+    install_ctrl_c_tree_cleanup();
+    let logs_dir = cli_logs_dir();
+    let _ = std::fs::create_dir_all(&logs_dir);
+
+    let mut running: Vec<(String, Child, Vec<std::thread::JoinHandle<()>>)> = Vec::new();
+    for (idx, job) in jobs.into_iter().enumerate() {
+        let hint_log = logs_dir.join(format!("launch-{}-{idx}.log", current_pid()));
+        match spawn_shell_job(&job, &hint_log) {
+            Ok(mut child) => {
+                let pid = child.id();
+                register_active_cli_pid(pid);
+                let pid_log_path = cli_run_log_path_for_pid(pid);
+                let log_file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&hint_log)
+                    .ok()
+                    .map(|f| Arc::new(Mutex::new(f)));
+                let _ = std::fs::remove_file(&pid_log_path);
+                let _ = std::fs::hard_link(&hint_log, &pid_log_path);
+                let mut handles = Vec::new();
+                if let Some(out) = child.stdout.take() {
+                    handles.push(tee_stream_to_console_and_log(out, log_file.clone(), false));
+                }
+                if let Some(err) = child.stderr.take() {
+                    handles.push(tee_stream_to_console_and_log(err, log_file, true));
+                }
+                println!("[{}] started (PID {pid})", job.name);
+                running.push((job.name, child, handles));
             }
             Err(e) => {
                 eprintln!("[{}] failed to start: {e}", job.name);
-                for (_, mut child) in running {
+                let pids: Vec<u32> = running.iter().map(|(_, c, _)| c.id()).collect();
+                terminate_process_trees(&pids);
+                for (_, mut child, handles) in running {
+                    unregister_active_cli_pid(child.id());
                     let _ = child.kill();
+                    let _ = child.wait();
+                    for h in handles {
+                        let _ = h.join();
+                    }
                 }
                 return 1;
             }
@@ -520,7 +798,8 @@ fn launch_project(dir: &Path, list_only: bool) -> i32 {
     }
 
     let mut exit_code = 0;
-    for (name, mut child) in running {
+    for (name, mut child, handles) in running {
+        let pid = child.id();
         match child.wait() {
             Ok(status) => {
                 let code = status.code().unwrap_or(1);
@@ -535,6 +814,10 @@ fn launch_project(dir: &Path, list_only: bool) -> i32 {
                     exit_code = 1;
                 }
             }
+        }
+        unregister_active_cli_pid(pid);
+        for h in handles {
+            let _ = h.join();
         }
     }
     exit_code
@@ -582,12 +865,13 @@ mod tests {
         assert!(parse_subcommand(&a(&["port", "0"])).is_err());
         assert!(parse_subcommand(&a(&["run", "--bogus"])).is_err());
 
-        let launch = parse_subcommand(&a(&["launch", ".", "--list"])).unwrap();
+        let launch = parse_subcommand(&a(&["launch", ".", "--list", "--only", "web,api"])).unwrap();
         assert_eq!(
             launch,
             Some(CliSubcommand::Launch {
                 dir: PathBuf::from("."),
                 list_only: true,
+                only: a(&["web", "api"]),
             })
         );
     }
@@ -598,13 +882,16 @@ mod tests {
 
         std::fs::write(
             dir.join("package.json"),
-            r#"{"name":"demo","scripts":{"dev":"vite","build":"vite build"}}"#,
+            r#"{"name":"demo","scripts":{"dev":"vite","dev:api":"nodemon","build":"vite build","test":"vitest","deploy":"ship"}}"#,
         )
         .unwrap();
         std::fs::write(dir.join("pnpm-lock.yaml"), "").unwrap();
         let (src, pkg_jobs) = discover_launch_jobs(&dir).unwrap();
         assert!(src.ends_with("package.json"));
+        assert_eq!(pkg_jobs.len(), 2);
         assert!(pkg_jobs.iter().any(|j| j.name == "dev" && j.command == "pnpm run dev"));
+        assert!(pkg_jobs.iter().any(|j| j.name == "dev:api" && j.command == "pnpm run dev:api"));
+        assert!(!pkg_jobs.iter().any(|j| j.name == "build" || j.name == "test" || j.name == "deploy"));
 
         std::fs::write(
             dir.join("Procfile"),

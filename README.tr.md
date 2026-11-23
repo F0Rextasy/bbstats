@@ -63,7 +63,7 @@ cargo install --git https://github.com/F0Rextasy/bbstats.git --locked
         <img src="assets/screenshots/tr/05-crash-alert.png" alt="Çökme uyarısı ve kırmızı üst parıltı" width="100%" />
       </td>
       <td align="center" width="50%">
-        <strong>Ayarlar (v0.2.1, TR / EN Dil Seçimi)</strong><br />
+        <strong>Ayarlar (v0.4.0, TR / EN, WSL2 ve Eşikler)</strong><br />
         <img src="assets/screenshots/tr/06-settings.png" alt="Ayarlar ekranı" width="100%" />
       </td>
     </tr>

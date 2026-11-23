@@ -39,6 +39,7 @@ pub struct DockerContainerSummary {
     pub name: String,
     pub compose_project: Option<String>,
     pub ports: Vec<u16>,
+    pub uptime_secs: u64,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +52,10 @@ struct DockerApiContainer {
     labels: HashMap<String, String>,
     #[serde(rename = "Ports", default)]
     ports: Vec<DockerApiPort>,
+    #[serde(rename = "Created")]
+    created: Option<i64>,
+    #[serde(rename = "Status")]
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -59,11 +64,48 @@ struct DockerApiPort {
     public_port: Option<u16>,
 }
 
+pub fn parse_docker_status_uptime_secs(status: &str) -> Option<u64> {
+    let low = status.trim().to_ascii_lowercase();
+    let rest = low.strip_prefix("up ")?.trim();
+    if rest.starts_with("less than a second") || rest.starts_with("about a second") {
+        return Some(1);
+    }
+    if rest.starts_with("about a minute") {
+        return Some(60);
+    }
+    if rest.starts_with("about an hour") {
+        return Some(3600);
+    }
+    let mut parts = rest.split_whitespace();
+    let num: u64 = parts.next()?.parse().ok()?;
+    let unit = parts.next()?;
+    let mult = if unit.starts_with("sec") {
+        1
+    } else if unit.starts_with("min") {
+        60
+    } else if unit.starts_with("hour") {
+        3600
+    } else if unit.starts_with("day") {
+        86_400
+    } else if unit.starts_with("week") {
+        7 * 86_400
+    } else if unit.starts_with("month") {
+        30 * 86_400
+    } else {
+        return None;
+    };
+    Some(num.saturating_mul(mult))
+}
+
 /// Parses Docker Engine `/containers/json` response body using `serde_json`.
 pub fn parse_docker_containers_json(body: &str) -> Vec<DockerContainerSummary> {
     let Ok(items) = serde_json::from_str::<Vec<DockerApiContainer>>(body) else {
         return Vec::new();
     };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     items
         .into_iter()
         .filter_map(|c| {
@@ -88,13 +130,63 @@ pub fn parse_docker_containers_json(body: &str) -> Vec<DockerContainerSummary> {
                     }
                 }
             }
+            let uptime_secs = c
+                .status
+                .as_deref()
+                .and_then(parse_docker_status_uptime_secs)
+                .or_else(|| {
+                    c.created
+                        .filter(|&ts| ts > 0 && (ts as u64) <= now_secs)
+                        .map(|ts| now_secs.saturating_sub(ts as u64))
+                })
+                .unwrap_or(0);
             Some(DockerContainerSummary {
                 name,
                 compose_project,
                 ports,
+                uptime_secs,
             })
         })
         .collect()
+}
+
+/// Decodes Docker Engine `/containers/{id}/logs` HTTP response body (supporting both 8-byte multiplexed frames and plain TTY text).
+pub fn parse_docker_logs_payload(raw_http: &[u8], max_lines: usize) -> Vec<String> {
+    let Some(sep_pos) = raw_http.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Vec::new();
+    };
+    let head = std::str::from_utf8(&raw_http[..sep_pos]).unwrap_or("");
+    let status_line = head.lines().next().unwrap_or("");
+    if !(status_line.starts_with("HTTP/1.") && status_line.contains(" 200 ")) {
+        return Vec::new();
+    }
+    let body = &raw_http[sep_pos + 4..];
+    let mut text = String::new();
+    if body.len() >= 8 && matches!(body[0], 0..=2) && body[1..4] == [0, 0, 0] {
+        let mut cursor = 0usize;
+        while cursor + 8 <= body.len() {
+            let frame_len = u32::from_be_bytes([
+                body[cursor + 4],
+                body[cursor + 5],
+                body[cursor + 6],
+                body[cursor + 7],
+            ]) as usize;
+            cursor += 8;
+            let end = (cursor + frame_len).min(body.len());
+            text.push_str(&String::from_utf8_lossy(&body[cursor..end]));
+            cursor = end;
+        }
+    } else {
+        text.push_str(&String::from_utf8_lossy(body));
+    }
+    let all_lines: Vec<String> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let skip = all_lines.len().saturating_sub(max_lines);
+    all_lines.into_iter().skip(skip).collect()
 }
 
 fn parse_http_200_body(raw_http: &[u8]) -> Option<String> {
@@ -1061,6 +1153,103 @@ mod platform_imp {
         }
         rx.recv_timeout(Duration::from_millis(250)).unwrap_or_default()
     }
+
+    fn docker_pipe_http_request(req_bytes: Vec<u8>, timeout_ms: u64) -> Option<Vec<u8>> {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let pipe_name_wide: Vec<u16> = "\\\\.\\pipe\\docker_engine\0".encode_utf16().collect();
+        // SAFETY: Null-terminated UTF-16 pipe path lives across WaitNamedPipeW.
+        let ready = unsafe { WaitNamedPipeW(PCWSTR(pipe_name_wide.as_ptr()), 40) };
+        if !ready.as_bool() {
+            return None;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("bbstats-docker-op".to_string())
+            .spawn(move || {
+                let res = (|| {
+                    let mut pipe = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(r"\\.\pipe\docker_engine")
+                        .ok()?;
+                    pipe.write_all(&req_bytes).ok()?;
+                    let mut raw = Vec::with_capacity(8192);
+                    let mut chunk = [0u8; 4096];
+                    while raw.len() < 1024 * 1024 {
+                        match pipe.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                            Err(_) => break,
+                        }
+                    }
+                    Some(raw)
+                })();
+                let _ = tx.send(res);
+            })
+            .ok()?;
+        rx.recv_timeout(Duration::from_millis(timeout_ms)).ok().flatten()
+    }
+
+    pub fn query_docker_container_logs(container_name: &str, max_lines: usize) -> Vec<String> {
+        let Some(safe_name) = sanitize_docker_container_name(container_name) else {
+            return Vec::new();
+        };
+        let tail = max_lines.clamp(10, 200);
+        let req = format!(
+            "GET /containers/{safe_name}/logs?stdout=1&stderr=1&tail={tail} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        );
+        let Some(raw) = docker_pipe_http_request(req.into_bytes(), 300) else {
+            return Vec::new();
+        };
+        parse_docker_logs_payload(&raw, max_lines)
+    }
+
+    pub fn control_docker_container(container_name: &str, action: &str) -> bool {
+        let Some(safe_name) = sanitize_docker_container_name(container_name) else {
+            return false;
+        };
+        if !matches!(action, "stop" | "restart") {
+            return false;
+        }
+        let req = format!(
+            "POST /containers/{safe_name}/{action}?t=5 HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let Some(raw) = docker_pipe_http_request(req.into_bytes(), 6000) else {
+            return false;
+        };
+        let head = std::str::from_utf8(&raw).unwrap_or("");
+        head.lines()
+            .next()
+            .is_some_and(|l| l.contains(" 204 ") || l.contains(" 200 ") || l.contains(" 304 "))
+    }
+
+    pub fn query_wsl_dev_processes() -> Vec<WslProcessSummary> {
+        use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let Ok(out) = Command::new("wsl.exe")
+            .args([
+                "-e",
+                "sh",
+                "-c",
+                "ps -eo pid=,pcpu=,rss=,comm=,args= | head -n 96",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        parse_wsl_ps_output(&String::from_utf8_lossy(&out.stdout))
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1102,7 +1291,39 @@ mod platform_imp {
             }
             None
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            const HOST_CPU_LOAD_INFO: i32 = 3;
+            const HOST_CPU_LOAD_INFO_COUNT: u32 = 4;
+            extern "C" {
+                fn mach_host_self() -> u32;
+                fn host_statistics(
+                    host_priv: u32,
+                    flavor: i32,
+                    host_info_out: *mut u32,
+                    host_info_out_cnt: *mut u32,
+                ) -> i32;
+            }
+            let mut ticks = [0u32; 4]; // [USER, SYSTEM, IDLE, NICE]
+            let mut count = HOST_CPU_LOAD_INFO_COUNT;
+            // SAFETY: Mach host_statistics fills the 4-u32 cpu load info array on macOS.
+            let kr = unsafe {
+                host_statistics(
+                    mach_host_self(),
+                    HOST_CPU_LOAD_INFO,
+                    ticks.as_mut_ptr(),
+                    &mut count,
+                )
+            };
+            if kr == 0 && count >= 4 {
+                let user = (ticks[0] as u64) + (ticks[3] as u64);
+                let sys = ticks[1] as u64;
+                let idle = ticks[2] as u64;
+                return Some((idle * 100_000, sys * 100_000, user * 100_000));
+            }
+            None
+        }
+        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         {
             None
         }
@@ -1234,6 +1455,60 @@ mod platform_imp {
 
     pub fn enumerate_processes(_scratch_buf: &mut Vec<u64>, out: &mut Vec<RawProcessEntry>) {
         out.clear();
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(entries) = std::fs::read_dir("/proc") {
+                let uptime_secs = std::fs::read_to_string("/proc/uptime")
+                    .ok()
+                    .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                // SAFETY: sysconf with standard POSIX constants returns positive scalar values.
+                let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+                // SAFETY: sysconf with standard POSIX constants returns positive scalar values.
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+                let now_100ns = current_system_time_100ns();
+                let mut active_pids = std::collections::HashSet::with_capacity(256);
+
+                for entry in entries.flatten() {
+                    let fname = entry.file_name();
+                    let Some(pid_str) = fname.to_str() else {
+                        continue;
+                    };
+                    if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+                        continue;
+                    }
+                    let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                        continue;
+                    };
+                    let Some(parsed) = parse_proc_stat_entry(&stat) else {
+                        continue;
+                    };
+                    active_pids.insert(parsed.pid);
+                    let cpu_100ns =
+                        ((parsed.cpu_ticks as f64 / clk_tck) * 10_000_000.0) as i64;
+                    let start_secs = parsed.starttime_ticks as f64 / clk_tck;
+                    let etime_100ns =
+                        ((uptime_secs - start_secs).max(0.0) * 10_000_000.0) as i64;
+                    let create_time_100ns =
+                        stable_create_time_100ns(parsed.pid, etime_100ns, now_100ns);
+                    let private_ram_bytes = parsed.rss_pages.saturating_mul(page_size);
+                    out.push(RawProcessEntry {
+                        pid: parsed.pid,
+                        parent_pid: parsed.ppid,
+                        session_id: if parsed.pid <= 1 { 0 } else { 1 },
+                        create_time_100ns,
+                        cpu_time_100ns: cpu_100ns,
+                        private_ram_bytes,
+                        image_name: parsed.comm,
+                    });
+                }
+                if !out.is_empty() {
+                    prune_stale_anchors(&active_pids);
+                    return;
+                }
+            }
+        }
+
         let Ok(output) = Command::new("ps")
             .args(["-axo", "pid=,ppid=,rss=,etime=,time=,comm="])
             .stdout(Stdio::piped())
@@ -1275,7 +1550,7 @@ mod platform_imp {
         prune_stale_anchors(&active_pids);
     }
 
-    /// Batch-prefetches `comm`, `args`, and `cwd` for many PIDs at once to avoid per-PID subprocess storms.
+    /// Batch-prefetches `comm`, `args`, `cwd`, and safe developer env vars.
     pub fn prefetch_unix_pebs(pids: &[u32]) -> HashMap<u32, PebInspection> {
         let mut map: HashMap<u32, PebInspection> = HashMap::with_capacity(pids.len());
         let unique: Vec<u32> = {
@@ -1285,6 +1560,48 @@ mod platform_imp {
                 .filter(|&p| p > 1 && seen.insert(p))
                 .collect()
         };
+
+        #[cfg(target_os = "linux")]
+        {
+            for &pid in &unique {
+                let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+                if !proc_dir.is_dir() {
+                    continue;
+                }
+                let mut peb = PebInspection::default();
+                if let Ok(exe) = std::fs::read_link(proc_dir.join("exe")) {
+                    peb.image_path = Some(exe);
+                }
+                if let Ok(cwd) = std::fs::read_link(proc_dir.join("cwd")) {
+                    peb.working_dir = Some(cwd);
+                }
+                if let Ok(raw_cmd) = std::fs::read(proc_dir.join("cmdline")) {
+                    let args: Vec<String> = raw_cmd
+                        .split(|&b| b == 0)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| String::from_utf8_lossy(s).into_owned())
+                        .collect();
+                    if !args.is_empty() {
+                        peb.cmdline = Some(args.join(" "));
+                    }
+                }
+                if let Ok(raw_env) = std::fs::read(proc_dir.join("environ")) {
+                    for entry in raw_env.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+                        let s = String::from_utf8_lossy(entry);
+                        if let Some((k, v)) = s.split_once('=') {
+                            apply_captured_env_entry(k, v, &mut peb);
+                        }
+                    }
+                }
+                peb.peb_readable =
+                    peb.cmdline.is_some() || peb.working_dir.is_some() || peb.image_path.is_some();
+                map.insert(pid, peb);
+            }
+            if !map.is_empty() {
+                return map;
+            }
+        }
+
         for chunk in unique.chunks(64) {
             let csv = chunk
                 .iter()
@@ -1324,6 +1641,28 @@ mod platform_imp {
                             let val = rest.trim();
                             if !val.is_empty() {
                                 map.entry(pid).or_default().cmdline = Some(val.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Capture developer env vars (VIRTUAL_ENV, PORT, NODE_ENV, etc.) via `ps eww`.
+            if let Ok(envs) = Command::new("ps")
+                .args(["eww", "-p", &csv, "-o", "pid=,command="])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+            {
+                for line in String::from_utf8_lossy(&envs.stdout).lines() {
+                    let t = line.trim();
+                    if let Some((pid_s, rest)) = t.split_once(char::is_whitespace) {
+                        if let Ok(pid) = pid_s.parse::<u32>() {
+                            let peb = map.entry(pid).or_default();
+                            for tok in rest.split_whitespace() {
+                                if let Some((k, v)) = tok.split_once('=') {
+                                    apply_captured_env_entry(k, v, peb);
+                                }
                             }
                         }
                     }
@@ -1417,6 +1756,196 @@ mod platform_imp {
         }
         Vec::new()
     }
+
+    fn docker_unix_http_request(req_bytes: &[u8], timeout_ms: u64) -> Option<Vec<u8>> {
+        for sock in docker_socket_candidates() {
+            if !sock.exists() {
+                continue;
+            }
+            let Ok(mut stream) = UnixStream::connect(&sock) else {
+                continue;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(timeout_ms)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(timeout_ms)));
+            if stream.write_all(req_bytes).is_err() {
+                continue;
+            }
+            let mut raw = Vec::with_capacity(8192);
+            let mut chunk = [0u8; 4096];
+            while raw.len() < 1024 * 1024 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                    Err(_) => break,
+                }
+            }
+            if !raw.is_empty() {
+                return Some(raw);
+            }
+        }
+        None
+    }
+
+    pub fn query_docker_container_logs(container_name: &str, max_lines: usize) -> Vec<String> {
+        let Some(safe_name) = sanitize_docker_container_name(container_name) else {
+            return Vec::new();
+        };
+        let tail = max_lines.clamp(10, 200);
+        let req = format!(
+            "GET /containers/{safe_name}/logs?stdout=1&stderr=1&tail={tail} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        );
+        let Some(raw) = docker_unix_http_request(req.as_bytes(), 300) else {
+            return Vec::new();
+        };
+        parse_docker_logs_payload(&raw, max_lines)
+    }
+
+    pub fn control_docker_container(container_name: &str, action: &str) -> bool {
+        let Some(safe_name) = sanitize_docker_container_name(container_name) else {
+            return false;
+        };
+        if !matches!(action, "stop" | "restart") {
+            return false;
+        }
+        let req = format!(
+            "POST /containers/{safe_name}/{action}?t=5 HTTP/1.0\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let Some(raw) = docker_unix_http_request(req.as_bytes(), 6000) else {
+            return false;
+        };
+        let head = std::str::from_utf8(&raw).unwrap_or("");
+        head.lines()
+            .next()
+            .is_some_and(|l| l.contains(" 204 ") || l.contains(" 200 ") || l.contains(" 304 "))
+    }
+
+    pub fn query_wsl_dev_processes() -> Vec<WslProcessSummary> {
+        Vec::new()
+    }
+}
+
+/// Summary of an active developer runtime discovered inside WSL2 (`bbstats` opt-in WSL bridge).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WslProcessSummary {
+    pub pid: u32,
+    pub cpu_percent: f32,
+    pub ram_bytes: u64,
+    pub comm: String,
+    pub cmdline: String,
+}
+
+pub fn parse_wsl_ps_output(text: &str) -> Vec<WslProcessSummary> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let mut parts = t.split_whitespace();
+        let Some(Ok(pid)) = parts.next().map(|s| s.parse::<u32>()) else {
+            continue;
+        };
+        let Some(Ok(cpu)) = parts.next().map(|s| s.parse::<f32>()) else {
+            continue;
+        };
+        let Some(Ok(rss_kb)) = parts.next().map(|s| s.parse::<u64>()) else {
+            continue;
+        };
+        let Some(comm) = parts.next() else {
+            continue;
+        };
+        let low = comm.to_ascii_lowercase();
+        let is_dev = matches!(
+            low.as_str(),
+            "node" | "python" | "python3" | "cargo" | "rustc" | "go" | "ruby" | "java" | "vite"
+                | "next-server" | "uvicorn" | "gunicorn" | "deno" | "bun" | "postgres"
+                | "redis-server" | "mongod" | "dockerd"
+        );
+        if !is_dev {
+            continue;
+        }
+        let rest_args: Vec<&str> = parts.collect();
+        let cmdline = if rest_args.is_empty() {
+            comm.to_string()
+        } else {
+            rest_args.join(" ")
+        };
+        out.push(WslProcessSummary {
+            pid,
+            cpu_percent: cpu.clamp(0.0, 100.0),
+            ram_bytes: rss_kb.saturating_mul(1024),
+            comm: comm.to_string(),
+            cmdline,
+        });
+    }
+    out
+}
+
+fn sanitize_docker_container_name(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_start_matches('/');
+    if trimmed.is_empty()
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) struct ParsedProcStat {
+    pub pid: u32,
+    pub ppid: u32,
+    pub comm: String,
+    pub cpu_ticks: u64,
+    pub starttime_ticks: u64,
+    pub rss_pages: u64,
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn parse_proc_stat_entry(stat: &str) -> Option<ParsedProcStat> {
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let pid: u32 = stat[..open].trim().parse().ok()?;
+    let comm = stat[open + 1..close].to_string();
+    let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // Fields after `(comm)` start at index 0 = state (field 3 in proc(5)):
+    // ppid=1, utime=11, stime=12, starttime=19, rss=21
+    if rest.len() <= 21 {
+        return None;
+    }
+    let ppid: u32 = rest[1].parse().ok()?;
+    let utime: u64 = rest[11].parse().ok()?;
+    let stime: u64 = rest[12].parse().ok()?;
+    let starttime_ticks: u64 = rest[19].parse().ok()?;
+    let rss_pages: u64 = rest[21].parse().ok()?;
+    Some(ParsedProcStat {
+        pid,
+        ppid,
+        comm,
+        cpu_ticks: utime.saturating_add(stime),
+        starttime_ticks,
+        rss_pages,
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn apply_captured_env_entry(k: &str, v: &str, out: &mut PebInspection) {
+    if v.is_empty() {
+        return;
+    }
+    if k.eq_ignore_ascii_case("VIRTUAL_ENV") {
+        out.virtual_env = Some(v.to_string());
+    } else if k.eq_ignore_ascii_case("COMPOSE_PROJECT_NAME") {
+        out.compose_project_env = Some(v.to_string());
+    }
+    if is_safe_restart_env_key(k) && out.dev_env.len() < 16 {
+        out.dev_env.push((k.to_string(), v.to_string()));
+    }
 }
 
 fn is_safe_restart_env_key(k: &str) -> bool {
@@ -1435,6 +1964,7 @@ fn is_safe_restart_env_key(k: &str) -> bool {
             | "ASPNETCORE_ENVIRONMENT"
             | "FLASK_ENV"
             | "DJANGO_SETTINGS_MODULE"
+            | "BBSTATS_RUN_LOG"
             | "PATH"
     )
 }
@@ -1492,5 +2022,51 @@ Pages occupied by compressor:            25000.
         assert_eq!(etime, 10_000_000);
         assert_eq!(cpu, 10_000_000);
         assert_eq!(comm, "/Applications/My App/node");
+    }
+
+    #[test]
+    fn parses_docker_status_uptime_and_multiplexed_logs() {
+        assert_eq!(parse_docker_status_uptime_secs("Up 12 minutes"), Some(720));
+        assert_eq!(parse_docker_status_uptime_secs("Up About an hour (healthy)"), Some(3600));
+        assert_eq!(parse_docker_status_uptime_secs("Up 2 days"), Some(172_800));
+
+        let msg1 = b"server listening on :3000\n";
+        let msg2 = b"warn: slow query\n";
+        let mut raw = b"HTTP/1.0 200 OK\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n".to_vec();
+        for (stream_id, msg) in [(1u8, msg1.as_slice()), (2u8, msg2.as_slice())] {
+            raw.push(stream_id);
+            raw.extend_from_slice(&[0, 0, 0]);
+            raw.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+            raw.extend_from_slice(msg);
+        }
+        let lines = parse_docker_logs_payload(&raw, 10);
+        assert_eq!(lines, vec!["server listening on :3000", "warn: slow query"]);
+    }
+
+    #[test]
+    fn parses_linux_proc_stat_entry_with_spaces_in_comm() {
+        let stat = "1234 (node worker) S 100 1234 100 0 -1 4194304 10 0 0 0 150 45 0 0 20 0 4 0 98765 1000000 4096 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        let parsed = parse_proc_stat_entry(stat).unwrap();
+        assert_eq!(parsed.pid, 1234);
+        assert_eq!(parsed.ppid, 100);
+        assert_eq!(parsed.comm, "node worker");
+        assert_eq!(parsed.cpu_ticks, 195);
+        assert_eq!(parsed.starttime_ticks, 98765);
+        assert_eq!(parsed.rss_pages, 4096);
+    }
+
+    #[test]
+    fn parses_wsl_ps_dev_runtimes_and_ignores_system_daemons() {
+        let sample = "\
+  101  0.0  4200 systemd /sbin/init
+  245  4.2 98304 node node /home/dev/app/server.js --port 3000
+  310  1.5 32768 python3 python3 -m uvicorn main:app --reload
+";
+        let procs = parse_wsl_ps_output(sample);
+        assert_eq!(procs.len(), 2);
+        assert_eq!(procs[0].pid, 245);
+        assert_eq!(procs[0].comm, "node");
+        assert_eq!(procs[0].ram_bytes, 98304 * 1024);
+        assert!(procs[1].cmdline.contains("uvicorn"));
     }
 }

@@ -1,5 +1,9 @@
 //! Core application state machine coordinating Win32 events, springs, Direct2D rendering, and the engine.
 
+use crate::app_helpers::{
+    copy_to_clipboard, derive_match_hint, derive_workdir_from_cmd, handle_text_edit_shortcut,
+    is_runnable_command, shell_open,
+};
 use crate::config::{autostart, AppConfig, DockPosition, HotkeyPreset};
 use crate::engine::EngineHandle;
 use crate::model::{Alert, AlertKind, EngineCmd, PollingMode, Snapshot, SortMode};
@@ -17,8 +21,8 @@ use crate::render::primitives::DrawCtx;
 use crate::render::theme::{SPRING_ALERT, SPRING_MORPH};
 use crate::ui::hit_test::{HitAction, HitMap};
 use crate::ui::layout::{
-    ensure_selected_job_visible, filter_project_jobs, format_ram, pop_last_word, target_dimensions,
-    AddJobDraft, PendingKill, RenameDraft, UiState, ViewMode,
+    ensure_selected_job_visible, filter_project_jobs, format_ram, insert_text_at_cursor,
+    target_dimensions, AddJobDraft, PendingKill, RenameDraft, UiState, ViewMode,
 };
 use crate::ui::spring::SpringVal;
 use crate::ui::views::{render_ui, MorphParams};
@@ -26,8 +30,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use windows::core::{HRESULT, PCWSTR};
-use windows::Win32::Foundation::{GlobalFree, HWND};
+use windows::core::HRESULT;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET};
 
@@ -55,20 +59,13 @@ fn collect_unnotified_crash_alerts<'a>(
     }
     out
 }
-use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
-};
-use windows::Win32::System::Memory::{
-    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, SetProcessWorkingSetSizeEx, GMEM_MOVEABLE,
-    SETPROCESSWORKINGSETSIZEEX_FLAGS,
-};
+use windows::Win32::System::Memory::{SetProcessWorkingSetSizeEx, SETPROCESSWORKINGSETSIZEEX_FLAGS};
 use windows::Win32::System::Threading::GetCurrentProcess;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_A, VK_BACK, VK_C,
-    VK_CONTROL, VK_DELETE, VK_DOWN, VK_ESCAPE, VK_K, VK_LEFT, VK_MENU, VK_NEXT, VK_P, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_TAB, VK_U, VK_UP, VK_V,
+    GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_BACK, VK_CONTROL,
+    VK_DELETE, VK_DOWN, VK_ESCAPE, VK_K, VK_LEFT, VK_MENU, VK_NEXT, VK_P, VK_PRIOR, VK_RETURN,
+    VK_RIGHT, VK_TAB, VK_UP, VK_V,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     KillTimer, PostQuitMessage, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
     SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
@@ -775,6 +772,7 @@ impl App {
                 &device.d2d_factory,
                 &device.dwrite_factory,
                 &device.fonts.tabular_typography,
+                &device.round_stroke_style,
             )?;
             render_ui(
                 &ctx,
@@ -995,9 +993,10 @@ impl App {
                 }
                 v if v == VK_TAB.0 => {
                     if let Some(ref mut a) = self.ui.add_job_draft {
-                        a.active_field = (a.active_field + 1) % 3;
+                        a.active_field = (a.active_field + 1) % 4;
                     }
                     self.ui.text_all_selected = false;
+                    self.ui.text_cursor_from_end = 0;
                     let _ = self.render_frame();
                 }
                 _ => {
@@ -1005,11 +1004,13 @@ impl App {
                         let target = match a.active_field {
                             0 => &mut a.title,
                             1 => &mut a.command_or_match,
+                            2 => &mut a.working_dir,
                             _ => &mut a.log_file,
                         };
                         handle_text_edit_shortcut(
                             target,
                             &mut self.ui.text_all_selected,
+                            &mut self.ui.text_cursor_from_end,
                             vk,
                             ctrl_down,
                             self.hwnd,
@@ -1039,6 +1040,7 @@ impl App {
                         handle_text_edit_shortcut(
                             &mut d.input,
                             &mut self.ui.text_all_selected,
+                            &mut self.ui.text_cursor_from_end,
                             vk,
                             ctrl_down,
                             self.hwnd,
@@ -1063,6 +1065,7 @@ impl App {
             if handle_text_edit_shortcut(
                 &mut self.ui.search_query,
                 &mut self.ui.text_all_selected,
+                &mut self.ui.text_cursor_from_end,
                 vk,
                 ctrl_down,
                 self.hwnd,
@@ -1272,18 +1275,22 @@ impl App {
         if !matches!(self.ui.mode, ViewMode::Expanded) {
             return;
         }
+        let mut ch_buf = [0u8; 4];
+        let ch_str = ch.encode_utf8(&mut ch_buf);
         if let Some(ref mut add) = self.ui.add_job_draft {
             if !ch.is_control() {
                 let target = match add.active_field {
                     0 => &mut add.title,
                     1 => &mut add.command_or_match,
+                    2 => &mut add.working_dir,
                     _ => &mut add.log_file,
                 };
                 if self.ui.text_all_selected {
                     target.clear();
                     self.ui.text_all_selected = false;
+                    self.ui.text_cursor_from_end = 0;
                 }
-                target.push(ch);
+                insert_text_at_cursor(target, &mut self.ui.text_cursor_from_end, ch_str);
                 let _ = self.render_frame();
             }
             return;
@@ -1293,8 +1300,9 @@ impl App {
                 if self.ui.text_all_selected {
                     draft.input.clear();
                     self.ui.text_all_selected = false;
+                    self.ui.text_cursor_from_end = 0;
                 }
-                draft.input.push(ch);
+                insert_text_at_cursor(&mut draft.input, &mut self.ui.text_cursor_from_end, ch_str);
                 let _ = self.render_frame();
             }
             return;
@@ -1302,6 +1310,7 @@ impl App {
         if ch == '/' && !self.ui.search_focused {
             self.ui.search_focused = true;
             self.ui.text_all_selected = false;
+            self.ui.text_cursor_from_end = 0;
             let _ = self.render_frame();
             return;
         }
@@ -1310,8 +1319,13 @@ impl App {
             if self.ui.text_all_selected {
                 self.ui.search_query.clear();
                 self.ui.text_all_selected = false;
+                self.ui.text_cursor_from_end = 0;
             }
-            self.ui.search_query.push(ch);
+            insert_text_at_cursor(
+                &mut self.ui.search_query,
+                &mut self.ui.text_cursor_from_end,
+                ch_str,
+            );
             self.ui.selected_index = 0;
             self.recompute_targets(false);
             let _ = self.render_frame();
@@ -1600,6 +1614,7 @@ impl App {
                     a.active_field = idx;
                 }
                 self.ui.text_all_selected = false;
+                self.ui.text_cursor_from_end = 0;
                 let _ = self.render_frame();
             }
             HitAction::SaveAddJob => {
@@ -1613,7 +1628,12 @@ impl App {
                     if !raw_cmd.is_empty() {
                         let match_substr = derive_match_hint(&raw_cmd);
                         let is_cmd = is_runnable_command(&raw_cmd);
-                        let working_dir = derive_workdir_from_cmd(&raw_cmd);
+                        let explicit_wd = add.working_dir.trim();
+                        let working_dir = if !explicit_wd.is_empty() {
+                            Some(explicit_wd.to_string())
+                        } else {
+                            derive_workdir_from_cmd(&raw_cmd)
+                        };
                         let log_file = {
                             let lf = add.log_file.trim();
                             if lf.is_empty() {
@@ -1689,6 +1709,34 @@ impl App {
                 self.ui.term_scroll_offset = 0.0;
                 let _ = self.render_frame();
             }
+            HitAction::SetTerminalFilter(flt) => {
+                if self.ui.term_filter != flt {
+                    self.ui.term_filter = flt;
+                    self.ui.term_scroll_offset = 0.0;
+                    let _ = self.render_frame();
+                }
+            }
+            HitAction::OpenTerminalLogFile => {
+                if let ViewMode::Detail { project_id, job_id } = &self.ui.mode {
+                    let log_path = self
+                        .snap
+                        .projects
+                        .iter()
+                        .find(|p| &p.id == project_id)
+                        .and_then(|p| {
+                            job_id
+                                .as_ref()
+                                .and_then(|jid| p.jobs.iter().find(|j| &j.id == jid))
+                                .or_else(|| p.jobs.first())
+                        })
+                        .and_then(|j| j.log_path.clone());
+                    if let Some(p) = log_path {
+                        shell_open(&p.to_string_lossy());
+                    } else {
+                        self.execute_hit_action(HitAction::CopyTerminalOutput);
+                    }
+                }
+            }
             HitAction::RequestKillProject(id) => {
                 self.ui.pending_kill = Some(PendingKill::Project(id));
                 let _ = self.render_frame();
@@ -1709,8 +1757,14 @@ impl App {
                 self.ui.pending_kill = None;
                 self.engine.send(EngineCmd::Kill { key, tree: true });
             }
+            HitAction::KillPort(port) => {
+                self.engine.send(EngineCmd::KillPort(port));
+            }
             HitAction::RestartProject(id) => {
                 self.engine.send(EngineCmd::RestartProject(id));
+            }
+            HitAction::LaunchProjectStack(id) => {
+                self.engine.send(EngineCmd::LaunchProjectStack(id));
             }
             HitAction::DismissAlert(aid) => {
                 self.engine.send(EngineCmd::DismissAlert(aid));
@@ -1750,6 +1804,14 @@ impl App {
                 if self.cfg.idle_opacity < 0.03 {
                     self.cfg.idle_opacity = 0.0;
                 }
+                if matches!(self.ui.mode, ViewMode::Collapsed) {
+                    self.bg_alpha.snap(self.cfg.idle_opacity);
+                } else {
+                    // Brief live preview pulse from new idle_opacity back to glass_opacity
+                    self.bg_alpha.value = self.cfg.idle_opacity;
+                    self.bg_alpha.set_target(self.cfg.glass_opacity);
+                    self.start_anim_timer();
+                }
                 self.save_cfg_or_toast();
                 let _ = self.render_frame();
             }
@@ -1771,6 +1833,26 @@ impl App {
             HitAction::ToggleCrashNotify => {
                 self.cfg.notify_on_crash = !self.cfg.notify_on_crash;
                 self.save_cfg_or_toast();
+                let _ = self.render_frame();
+            }
+            HitAction::ToggleWslBridge => {
+                self.cfg.wsl_bridge_enabled = !self.cfg.wsl_bridge_enabled;
+                self.save_cfg_or_toast();
+                self.sync_config_to_engine();
+                let _ = self.render_frame();
+            }
+            HitAction::AdjustCpuWarn(delta) => {
+                self.cfg.cpu_warn_percent =
+                    (self.cfg.cpu_warn_percent + delta).clamp(50.0, 100.0);
+                self.save_cfg_or_toast();
+                self.sync_config_to_engine();
+                let _ = self.render_frame();
+            }
+            HitAction::AdjustRamWarn(delta_mb) => {
+                let next = (self.cfg.ram_warn_mb as i64 + delta_mb).clamp(256, 32_768) as u64;
+                self.cfg.ram_warn_mb = next;
+                self.save_cfg_or_toast();
+                self.sync_config_to_engine();
                 let _ = self.render_frame();
             }
             HitAction::ToggleHotkeyPreset => {
@@ -1956,168 +2038,6 @@ fn reorder_vec(order: &mut Vec<String>, visible_ids: &[String], target: &str, de
     false
 }
 
-fn is_runnable_command(raw: &str) -> bool {
-    let low = raw.to_ascii_lowercase();
-    raw.contains(' ')
-        || raw.contains('\\')
-        || raw.contains('/')
-        || [
-            ".py", ".pyw", ".js", ".mjs", ".ts", ".bat", ".cmd", ".ps1", ".exe",
-        ]
-        .iter()
-        .any(|ext| low.ends_with(ext))
-}
-
-fn derive_match_hint(raw: &str) -> String {
-    let tokens = crate::engine::project_resolver::split_cmdline_args(raw);
-    if tokens.is_empty() {
-        return String::new();
-    }
-    for tok in &tokens {
-        let clean = tok.trim_matches(|c| c == '"' || c == '\'');
-        let low = clean.to_ascii_lowercase();
-        if low.ends_with(".py")
-            || low.ends_with(".pyw")
-            || low.ends_with(".js")
-            || low.ends_with(".mjs")
-            || low.ends_with(".ts")
-            || low.ends_with(".bat")
-            || low.ends_with(".cmd")
-            || low.ends_with(".ps1")
-        {
-            if let Some(name) = std::path::Path::new(clean).file_name().and_then(|s| s.to_str()) {
-                return name.to_string();
-            }
-        }
-    }
-    let first = tokens[0].trim_matches(|c| c == '"' || c == '\'');
-    std::path::Path::new(first)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(first)
-        .to_string()
-}
-
-fn derive_workdir_from_cmd(raw: &str) -> Option<String> {
-    for tok in crate::engine::project_resolver::split_cmdline_args(raw) {
-        let clean = tok.trim_matches(|c| c == '"' || c == '\'');
-        let p = std::path::Path::new(clean);
-        if p.is_absolute() {
-            if let Some(parent) = p.parent() {
-                if parent.is_dir() {
-                    return Some(parent.to_string_lossy().into_owned());
-                }
-            }
-        }
-    }
-    None
-}
-
-pub fn paste_from_clipboard(hwnd: HWND) -> Option<String> {
-    // SAFETY: Clipboard and HGLOBAL lock/unlock stay balanced on the UI thread; read length is bounded by GlobalSize.
-    unsafe {
-        if OpenClipboard(hwnd).is_err() {
-            return None;
-        }
-        let mut out = None;
-        if let Ok(hdata) = GetClipboardData(13u32 /* CF_UNICODETEXT */) {
-            let hmem = windows::Win32::Foundation::HGLOBAL(hdata.0);
-            let max_chars = (GlobalSize(hmem) / 2).min(4096);
-            let ptr = GlobalLock(hmem) as *const u16;
-            if !ptr.is_null() && max_chars > 0 {
-                let mut len = 0usize;
-                while len < max_chars && *ptr.add(len) != 0 {
-                    len += 1;
-                }
-                let slice = std::slice::from_raw_parts(ptr, len);
-                let sanitized: String = String::from_utf16_lossy(slice)
-                    .chars()
-                    .filter_map(|c| match c {
-                        '\r' | '\n' | '\t' => Some(' '),
-                        c if c.is_control() => None,
-                        c => Some(c),
-                    })
-                    .collect();
-                out = Some(sanitized);
-                let _ = GlobalUnlock(hmem);
-            } else if !ptr.is_null() {
-                let _ = GlobalUnlock(hmem);
-            }
-        }
-        let _ = CloseClipboard();
-        out
-    }
-}
-
-fn apply_text_edit_key(
-    buf: &mut String,
-    all_selected: &mut bool,
-    vk: u16,
-    ctrl_down: bool,
-) -> Option<bool> {
-    if ctrl_down && vk == VK_A.0 {
-        *all_selected = !buf.is_empty();
-        return Some(true);
-    }
-    if ctrl_down && (vk == VK_U.0 || vk == VK_DELETE.0) {
-        buf.clear();
-        *all_selected = false;
-        return Some(true);
-    }
-    if ctrl_down && vk == VK_BACK.0 {
-        if *all_selected {
-            buf.clear();
-            *all_selected = false;
-        } else {
-            pop_last_word(buf);
-        }
-        return Some(true);
-    }
-    if vk == VK_BACK.0 {
-        if *all_selected {
-            buf.clear();
-            *all_selected = false;
-            return Some(true);
-        }
-        return Some(buf.pop().is_some());
-    }
-    if vk == VK_DELETE.0 && *all_selected {
-        buf.clear();
-        *all_selected = false;
-        return Some(true);
-    }
-    None
-}
-
-fn handle_text_edit_shortcut(
-    buf: &mut String,
-    all_selected: &mut bool,
-    vk: u16,
-    ctrl_down: bool,
-    hwnd: HWND,
-) -> bool {
-    if let Some(changed) = apply_text_edit_key(buf, all_selected, vk, ctrl_down) {
-        return changed;
-    }
-    if ctrl_down && vk == VK_C.0 {
-        if !buf.is_empty() {
-            copy_to_clipboard(hwnd, buf);
-        }
-        return true;
-    }
-    if ctrl_down && vk == VK_V.0 {
-        if let Some(clip) = paste_from_clipboard(hwnd) {
-            if *all_selected {
-                buf.clear();
-                *all_selected = false;
-            }
-            buf.push_str(clip.trim());
-            return true;
-        }
-    }
-    false
-}
-
 fn collapsed_visual_sig(snap: &Snapshot) -> u64 {
     let mut h = DefaultHasher::new();
     let active_alert = snap.alerts.iter().find(|a| !a.dismissed);
@@ -2136,6 +2056,7 @@ fn collapsed_visual_sig(snap: &Snapshot) -> u64 {
     crashed_count.hash(&mut h);
     any_high.hash(&mut h);
     snap.total_jobs.hash(&mut h);
+    snap.port_ready_hint.as_ref().map(|p| p.0).hash(&mut h);
     snap.system_cpu_history[14..24].hash(&mut h);
 
     let cpu_disp = if snap.total_dev_cpu > 0.05 {
@@ -2182,51 +2103,6 @@ fn collapsed_visual_sig(snap: &Snapshot) -> u64 {
     h.finish()
 }
 
-fn shell_open(target: &str) {
-    let op: Vec<u16> = "open\0".encode_utf16().collect();
-    let tgt: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: Null-terminated UTF-16 verb and target strings remain live across the call.
-    unsafe {
-        let _ = ShellExecuteW(
-            None,
-            PCWSTR(op.as_ptr()),
-            PCWSTR(tgt.as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOW,
-        );
-    }
-}
-
-pub fn copy_to_clipboard(hwnd: HWND, text: &str) {
-    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: Clipboard handle and HGLOBAL memory remain valid and balanced on the UI thread.
-    unsafe {
-        if OpenClipboard(hwnd).is_err() {
-            return;
-        }
-        let _ = EmptyClipboard();
-        if let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2) {
-            let ptr = GlobalLock(hmem) as *mut u16;
-            if !ptr.is_null() {
-                core::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
-                let _ = GlobalUnlock(hmem);
-                if SetClipboardData(
-                    13u32, /* CF_UNICODETEXT */
-                    windows::Win32::Foundation::HANDLE(hmem.0),
-                )
-                .is_err()
-                {
-                    let _ = GlobalFree(hmem);
-                }
-            } else {
-                let _ = GlobalFree(hmem);
-            }
-        }
-        let _ = CloseClipboard();
-    }
-}
-
 pub fn compute_envelope_rect(
     cur: (f32, f32, i32, i32),
     tgt: (f32, f32, i32, i32),
@@ -2242,6 +2118,8 @@ pub fn compute_envelope_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app_helpers::apply_text_edit_key;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_A, VK_U};
 
     #[test]
     fn collapsed_visual_sig_ignores_tiny_jitter_but_tracks_visible_changes() {
@@ -2345,23 +2223,24 @@ mod tests {
     fn text_edit_shortcuts_support_ctrl_backspace_ctrl_a_and_ctrl_u() {
         let mut buf = r"python C:\dev\api\server.py".to_string();
         let mut sel = false;
+        let mut cur = 0usize;
 
         // Ctrl+Backspace pops last word/segment
-        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, VK_BACK.0, true), Some(true));
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_BACK.0, true), Some(true));
         assert_eq!(buf, r"python C:\dev\api\server.");
-        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, VK_BACK.0, true), Some(true));
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_BACK.0, true), Some(true));
         assert_eq!(buf, r"python C:\dev\api\");
 
         // Ctrl+A followed by Backspace clears entire field
-        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, VK_A.0, true), Some(true));
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_A.0, true), Some(true));
         assert!(sel);
-        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, VK_BACK.0, false), Some(true));
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_BACK.0, false), Some(true));
         assert!(buf.is_empty());
         assert!(!sel);
 
         // Ctrl+U clears immediately
         buf = "some query".to_string();
-        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, VK_U.0, true), Some(true));
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_U.0, true), Some(true));
         assert!(buf.is_empty());
     }
 
@@ -2415,10 +2294,20 @@ mod tests {
     fn apply_text_edit_key_handles_delete_and_leaves_regular_keys() {
         let mut buf = "hello".to_string();
         let mut sel = true;
-        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, VK_DELETE.0, false), Some(true));
+        let mut cur = 0usize;
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_DELETE.0, false), Some(true));
         assert!(buf.is_empty());
         assert!(!sel);
 
-        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, VK_RETURN.0, false), None);
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_RETURN.0, false), None);
+
+        buf = "hello".to_string();
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_LEFT.0, false), Some(true));
+        assert_eq!(cur, 1);
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_BACK.0, false), Some(true));
+        assert_eq!(buf, "helo");
+        assert_eq!(apply_text_edit_key(&mut buf, &mut sel, &mut cur, VK_DELETE.0, false), Some(true));
+        assert_eq!(buf, "hel");
+        assert_eq!(cur, 0);
     }
 }

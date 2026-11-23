@@ -1,11 +1,13 @@
-use super::{project_swatch_color, rect, status_color};
+use super::{overall_status_dot_color, project_swatch_color, rect, status_color};
 use crate::config::AppConfig;
-use crate::model::{fold_search_lower, AlertKind, Job, Language, ProjectStatus, Snapshot};
+use crate::model::{fold_search_lower, AlertKind, Job, Language, ProcInfo, ProjectStatus, Snapshot};
 use crate::render::device::FontSet;
 use crate::render::primitives::DrawCtx;
 use crate::render::theme::*;
 use crate::ui::hit_test::{HitAction, HitMap};
-use crate::ui::layout::{filter_project_jobs, format_ram, format_uptime, PendingKill, UiState};
+use crate::ui::layout::{
+    filter_project_jobs, format_ram, format_text_with_cursor, format_uptime, PendingKill, UiState,
+};
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 
 #[allow(clippy::too_many_arguments)]
@@ -29,7 +31,14 @@ pub(super) fn render_expanded(
     let lang = cfg.language;
 
     // 1. Minimal macOS Popover Top Header (y = 6..36, borderless controls)
-    ctx.draw_status_dot(18.0, 21.0, 3.8, ACCENT_LIVE, snap.total_jobs > 0)?;
+    let dot_col = overall_status_dot_color(snap);
+    ctx.draw_status_dot(
+        18.0,
+        21.0,
+        3.8,
+        dot_col,
+        snap.total_jobs > 0 || dot_col != ACCENT_LIVE,
+    )?;
     ctx.draw_text(
         "bbstats",
         &fonts.row_secondary,
@@ -307,16 +316,26 @@ pub(super) fn render_expanded(
             )?;
         }
     }
-    let search_txt = if state.search_query.is_empty() {
+    let search_focused_active =
+        state.search_focused && state.rename_draft.is_none() && state.add_job_draft.is_none();
+    let max_search_chars = (((w - 68.0) / 7.2) as usize).max(16);
+    let search_txt = if state.search_query.is_empty() && !search_focused_active {
         lang.pick("Search job, project or :port...", "İş, proje veya :port ara...")
+            .to_string()
+    } else if search_focused_active {
+        format_text_with_cursor(
+            &state.search_query,
+            state.text_cursor_from_end,
+            max_search_chars,
+        )
     } else {
-        &state.search_query
+        state.search_query.clone()
     };
     ctx.draw_text(
-        search_txt,
+        &search_txt,
         &fonts.row_secondary,
         rect(26.0, 206.0, w - 42.0, 234.0),
-        if state.search_query.is_empty() {
+        if state.search_query.is_empty() && !search_focused_active {
             TEXT_MUTED
         } else {
             TEXT_PRIMARY
@@ -326,6 +345,40 @@ pub(super) fn render_expanded(
     hit_map.push(next_id(), search_rect, HitAction::FocusSearch);
 
     if !state.search_query.is_empty() {
+        let port_match = state
+            .search_query
+            .trim()
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|&p| {
+                p > 0
+                    && snap
+                        .projects
+                        .iter()
+                        .flat_map(|proj| proj.jobs.iter())
+                        .any(|j| j.ports.iter().any(|b| b.port == p && b.is_listening))
+            });
+        if let Some(p) = port_match {
+            let kill_p = rect(w - 118.0, 209.0, w - 42.0, 231.0);
+            let kpid = next_id();
+            ctx.fill_rounded(
+                kill_p,
+                5.0,
+                if state.hovered_hit_id == Some(kpid) {
+                    rgba(255, 69, 58, 0.28)
+                } else {
+                    ACCENT_DANGER_BG
+                },
+            )?;
+            ctx.draw_text(
+                &format!("Free :{p}"),
+                &fonts.mono_badge,
+                kill_p,
+                ACCENT_DANGER,
+                true,
+            )?;
+            hit_map.push(kpid, kill_p, HitAction::KillPort(p));
+        }
         let clr = rect(w - 38.0, 208.0, w - 18.0, 232.0);
         ctx.draw_text("×", &fonts.mono_badge, clr, TEXT_SECONDARY, false)?;
         hit_map.push(next_id(), clr, HitAction::ClearSearch);
@@ -368,8 +421,9 @@ pub(super) fn render_expanded(
                 ACCENT_INFO_BG,
             )?;
         }
+        let max_rename_chars = (((w - 218.0) / 7.2) as usize).max(12);
         ctx.draw_text(
-            &format!("{}|", draft.input),
+            &format_text_with_cursor(&draft.input, state.text_cursor_from_end, max_rename_chars),
             &fonts.row_primary,
             rect(78.0, list_top + 5.0, w - 140.0, list_top + 31.0),
             TEXT_PRIMARY,
@@ -403,11 +457,11 @@ pub(super) fn render_expanded(
 
     // 2b. Inline Add Custom Job Card (+ Add)
     if let Some(ref add) = state.add_job_draft {
-        let box_r = rect(12.0, list_top, w - 12.0, list_top + 96.0);
+        let box_r = rect(12.0, list_top, w - 12.0, list_top + 126.0);
         ctx.fill_rounded(box_r, 8.0, BG_OVERLAY)?;
         ctx.stroke_rounded(box_r, 8.0, BORDER_FOCUS, 1.2)?;
 
-        let fields: [(&str, &str, &str, u8, f32); 3] = [
+        let fields: [(&str, &str, &str, u8, f32); 4] = [
             (
                 lang.pick("Name", "Ad"),
                 &add.title,
@@ -418,16 +472,23 @@ pub(super) fn render_expanded(
             (
                 lang.pick("Cmd/Match", "Komut/Eş"),
                 &add.command_or_match,
-                lang.pick("Ex: python bot.py or redis.exe", "Örn: python bot.py veya redis.exe"),
+                lang.pick("Ex: npm run dev or python bot.py", "Örn: npm run dev veya python bot.py"),
                 1,
                 list_top + 36.0,
+            ),
+            (
+                lang.pick("Work Dir", "Dizin"),
+                &add.working_dir,
+                lang.pick("Optional: C:\\projects\\app", "Opsiyonel: C:\\projeler\\app"),
+                2,
+                list_top + 66.0,
             ),
             (
                 "Log",
                 &add.log_file,
                 lang.pick("Optional: C:\\logs\\app.log", "Opsiyonel: C:\\logs\\app.log"),
-                2,
-                list_top + 66.0,
+                3,
+                list_top + 96.0,
             ),
         ];
 
@@ -452,8 +513,9 @@ pub(super) fn render_expanded(
                     )?;
                 }
             }
+            let max_field_chars = (((right_edge - 94.0) / 7.0) as usize).max(12);
             let shown = if add.active_field == idx {
-                format!("{val}|")
+                format_text_with_cursor(val, state.text_cursor_from_end, max_field_chars)
             } else if val.is_empty() {
                 ph.to_string()
             } else {
@@ -495,7 +557,7 @@ pub(super) fn render_expanded(
         )?;
         hit_map.push(next_id(), can_btn, HitAction::CancelAddJob);
 
-        list_top += 104.0;
+        list_top += 134.0;
     }
 
     // 3. Alert Banner (if active)
@@ -679,7 +741,8 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                 stagger_idx += 1;
 
                 if grp_alpha > 0.01 {
-                    ctx.with_transformed_layer(0.0, grp_dy, 1.0, 1.0, grp_alpha, || {
+                    let grp_bound_h = (y + block_h + 24.0).max(list_bot);
+                    ctx.with_transformed_layer(0.0, grp_dy, 1.0, 1.0, grp_alpha, w, grp_bound_h, || {
                         // Flat exelban/stats Project Row Header (30 DIP, NO outer card border!)
                         let pin_r = rect(14.0, y + 4.0, 32.0, y + 26.0);
                         if proj.pinned {
@@ -811,7 +874,27 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                             )?;
                         }
 
-                        // Borderless Folder + Detail icons (hover pill only)
+                        // Borderless Stack Launch + Folder + Detail icons
+                        let can_stack = proj.root.as_deref().is_some_and(|r| {
+                            r.join("bbstats.toml").is_file()
+                                || r.join("Procfile").is_file()
+                                || r.join("package.json").is_file()
+                        });
+                        if can_stack && proj.status == ProjectStatus::Stopped {
+                            let l_r = rect(w - 72.0, y + 4.0, w - 54.0, y + 25.0);
+                            let lid = next_id();
+                            if state.hovered_hit_id == Some(lid) {
+                                ctx.fill_rounded(l_r, 5.0, ACCENT_INFO_BG)?;
+                            }
+                            ctx.draw_text("▶", &fonts.mono_badge, l_r, ACCENT_LIVE, false)?;
+                            hit_map.push_clipped(
+                                lid,
+                                l_r,
+                                list_top,
+                                list_bot,
+                                HitAction::LaunchProjectStack(proj.id.clone()),
+                            );
+                        }
                         if proj.root.is_some() {
                             let f_r = rect(w - 52.0, y + 4.0, w - 34.0, y + 25.0);
                             let fid = next_id();
@@ -868,7 +951,8 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                         crate::ui::layout::stagger_row_progress(enter_t, stagger_idx);
                     stagger_idx += 1;
                     if row_alpha > 0.01 {
-                        ctx.with_transformed_layer(0.0, row_dy, 1.0, 1.0, row_alpha, || {
+                        let row_bound_h = (jy + 44.0).max(list_bot);
+                        ctx.with_transformed_layer(0.0, row_dy, 1.0, 1.0, row_alpha, w, row_bound_h, || {
                             render_job_row(
                                 ctx,
                                 fonts,
@@ -889,7 +973,8 @@ fn render_project_job_cards<F: FnMut() -> u32>(
                 }
 
                 if g_idx + 1 < group_count && grp_alpha > 0.01 {
-                    ctx.with_transformed_layer(0.0, grp_dy, 1.0, 1.0, grp_alpha, || {
+                    let line_bound_h = (y + block_h + 24.0).max(list_bot);
+                    ctx.with_transformed_layer(0.0, grp_dy, 1.0, 1.0, grp_alpha, w, line_bound_h, || {
                         ctx.draw_hairline(16.0, y + block_h + 2.0, w - 16.0)
                     })?;
                 }
@@ -1450,14 +1535,15 @@ fn render_all_procs_list<F: FnMut() -> u32>(
                         ACCENT_INFO,
                         false,
                     )?;
+                    let (watch_match, watch_title) = derive_watch_rule_from_proc(pr, &short_exe);
                     hit_map.push_clipped(
                         add_id,
                         add_r,
                         list_top,
                         list_bot,
                         HitAction::WatchProcessFromAll {
-                            match_substr: pr.name.clone(),
-                            title: short_exe,
+                            match_substr: watch_match,
+                            title: watch_title,
                             working_dir: pr
                                 .working_dir
                                 .as_ref()
@@ -1527,10 +1613,74 @@ fn alert_banner_meta(kind: &AlertKind, lang: Language) -> (&'static str, bool) {
     }
 }
 
+fn derive_watch_rule_from_proc(pr: &ProcInfo, short_exe: &str) -> (String, String) {
+    if let Some(cmd) = pr.cmdline.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        let tokens = crate::engine::project_resolver::split_cmdline_args(cmd);
+        if tokens.len() > 1 {
+            for tok in tokens.iter().skip(1) {
+                let clean = tok.trim_matches(|c| c == '"' || c == '\'');
+                if clean.is_empty() || clean.starts_with('-') {
+                    continue;
+                }
+                let leaf = std::path::Path::new(clean)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(clean);
+                return (cmd.to_string(), format!("{short_exe} ({leaf})"));
+            }
+            return (cmd.to_string(), short_exe.to_string());
+        }
+    }
+    if let Some(ref wd) = pr.working_dir {
+        let wd_str = wd.to_string_lossy().into_owned();
+        let low = short_exe.to_ascii_lowercase();
+        let is_generic_runtime = matches!(
+            low.as_str(),
+            "node" | "python" | "python3" | "ruby" | "java" | "javaw" | "dotnet" | "deno" | "bun"
+                | "pwsh" | "powershell" | "cmd" | "bash" | "sh" | "zsh"
+        );
+        if is_generic_runtime && !wd_str.is_empty() {
+            let folder = wd
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&wd_str);
+            let title = format!("{short_exe} ({folder})");
+            return (wd_str, title);
+        }
+    }
+    (pr.name.clone(), short_exe.to_string())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::alert_banner_meta;
-    use crate::model::{AlertKind, Language};
+    use super::{alert_banner_meta, derive_watch_rule_from_proc};
+    use crate::model::{AlertKind, Language, ProcInfo, ProcessKey, ProcessRole};
+    use std::path::PathBuf;
+
+    #[test]
+    fn derive_watch_rule_from_proc_avoids_bare_runtime_name_when_cmdline_exists() {
+        let pr = ProcInfo {
+            key: ProcessKey::new(42, 1),
+            parent_pid: 1,
+            name: "node.exe".into(),
+            role: ProcessRole::DevServer,
+            role_label: "Dev".into(),
+            cmdline: Some("node C:\\apps\\dashboard\\server.js --port 3000".into()),
+            working_dir: Some(PathBuf::from(r"C:\apps\dashboard")),
+            cpu: 1.0,
+            ram: 1024,
+            ports: Vec::new(),
+            uptime_secs: 10,
+            is_helper_collapsed: false,
+            is_critical_system: false,
+            can_kill: true,
+            can_restart: true,
+            access_limited: false,
+        };
+        let (m, title) = derive_watch_rule_from_proc(&pr, "node");
+        assert_eq!(m, "node C:\\apps\\dashboard\\server.js --port 3000");
+        assert_eq!(title, "node (server.js)");
+    }
 
     #[test]
     fn alert_banner_meta_matches_restart_capability_across_variants() {

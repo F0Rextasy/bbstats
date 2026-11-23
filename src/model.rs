@@ -343,6 +343,8 @@ pub struct Snapshot {
     pub all_procs: Vec<ProcInfo>,
     /// Populated only when a Detail view is actively inspecting a job/project.
     pub active_terminal: Option<TerminalOutput>,
+    /// Optional transient `:PORT` live announcement `(port, job_title, expires_epoch_ms)`.
+    pub port_ready_hint: Option<(u16, String, u64)>,
     /// Monotonically-numbered latest action/spawn error surfaced to the UI.
     pub last_action_error: Option<(u64, String)>,
 }
@@ -366,6 +368,8 @@ pub enum EngineCmd {
     KillJob(JobId),
     /// Kill all killable processes belonging to a project group.
     KillProject(ProjectId),
+    /// Kill listening processes on a specific local port.
+    KillPort(u16),
     /// Restart a previously tracked process (or container) if a restart recipe is available.
     #[allow(dead_code)]
     Restart(ProcessKey),
@@ -373,7 +377,9 @@ pub enum EngineCmd {
     RestartJob(JobId),
     /// Restart the primary restartable process(es) of a project.
     RestartProject(ProjectId),
-    /// Sync persisted UI ordering, pins, hidden projects, aliases, sort mode, and language to the engine.
+    /// Launch all stack jobs discovered from `bbstats.toml`, `Procfile`, or `package.json` in project root.
+    LaunchProjectStack(ProjectId),
+    /// Sync persisted UI ordering, pins, hidden projects, aliases, sort mode, thresholds, and language to the engine.
     SyncConfigState {
         pinned_projects: Vec<String>,
         hidden_projects: Vec<String>,
@@ -382,6 +388,9 @@ pub enum EngineCmd {
         job_order: Vec<String>,
         sort_mode: SortMode,
         language: Language,
+        wsl_bridge_enabled: bool,
+        cpu_warn_percent: f32,
+        ram_warn_mb: u64,
     },
     /// Pin or unpin a project to keep it at the top of the list.
     SetPinned {

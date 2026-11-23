@@ -7,6 +7,7 @@ use crate::engine::collector::{CollectedProcess, PidNetworkInfo};
 use crate::engine::known_jobs::KnownJobsSnapshot;
 use crate::engine::labels::expand_win_env_vars;
 use crate::engine::project_resolver::{LogTailCache, ProjectResolver};
+use crate::engine::win_nt::WslProcessSummary;
 use crate::model::{
     Alert, AlertKind, BindScope, Job, JobId, Language, PollingMode, PortBinding, ProcInfo,
     ProcessKey, ProcessRole, ProjectGroup, ProjectId, ProjectStatus, Snapshot, SortMode,
@@ -54,6 +55,7 @@ pub(super) struct CrashedJobRecord {
 }
 
 /// Pure Job-first grouping, 8s debounce, log tailing, known-stopped merging, and alert evaluation.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_snapshot(
     procs: &[CollectedProcess],
@@ -80,6 +82,67 @@ pub(super) fn build_snapshot(
     self_pid: u32,
     ancestors: &HashSet<u32>,
     lang: Language,
+) -> Snapshot {
+    build_snapshot_with_options(
+        procs,
+        system_cpu,
+        system_ram_used_bytes,
+        system_ram_total_bytes,
+        system_cpu_history,
+        system_ram_history,
+        ports_by_pid,
+        resolver,
+        known_snap,
+        log_tail_cache,
+        job_crashes,
+        project_states,
+        pinned_keys,
+        hidden_keys,
+        alias_keys,
+        sort_mode,
+        project_order,
+        job_order,
+        alerts,
+        next_alert_id,
+        polling_mode,
+        self_pid,
+        ancestors,
+        lang,
+        85.0,
+        1536 * 1024 * 1024,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_snapshot_with_options(
+    procs: &[CollectedProcess],
+    system_cpu: f32,
+    system_ram_used_bytes: u64,
+    system_ram_total_bytes: u64,
+    system_cpu_history: [u8; 24],
+    system_ram_history: [u8; 24],
+    ports_by_pid: &HashMap<u32, PidNetworkInfo>,
+    resolver: &ProjectResolver,
+    known_snap: &KnownJobsSnapshot,
+    log_tail_cache: &mut LogTailCache,
+    job_crashes: &HashMap<JobId, CrashedJobRecord>,
+    project_states: &mut HashMap<ProjectId, ProjectRuntimeState>,
+    pinned_keys: &HashSet<String>,
+    hidden_keys: &HashSet<String>,
+    alias_keys: &HashMap<String, String>,
+    sort_mode: SortMode,
+    project_order: &[String],
+    job_order: &[String],
+    alerts: &mut Vec<Alert>,
+    next_alert_id: &mut u64,
+    polling_mode: PollingMode,
+    self_pid: u32,
+    ancestors: &HashSet<u32>,
+    lang: Language,
+    cpu_warn_percent: f32,
+    ram_warn_bytes: u64,
+    wsl_procs: &[WslProcessSummary],
 ) -> Snapshot {
     let now = Instant::now();
     let now_ms = unix_now_ms();
@@ -669,7 +732,11 @@ pub(super) fn build_snapshot(
             })
             .collect();
         for pb in &container_ports {
-            if !pacc.ports.iter().any(|p| p.port == pb.port) {
+            if !pacc
+                .ports
+                .iter()
+                .any(|p| p.port == pb.port && p.protocol == pb.protocol)
+            {
                 pacc.ports.push(pb.clone());
             }
         }
@@ -685,7 +752,7 @@ pub(super) fn build_snapshot(
             cpu: 0.0,
             ram: 0,
             ports: container_ports,
-            uptime: 0,
+            uptime: container.uptime_secs,
             status: ProjectStatus::Healthy,
             last_log: None,
             crash_summary: None,
@@ -695,9 +762,60 @@ pub(super) fn build_snapshot(
             log_path: None,
             custom_command: None,
             is_watched: false,
-            can_kill: false,
-            can_restart: false,
+            can_kill: true,
+            can_restart: true,
         });
+    }
+
+    // Add opt-in WSL2 inside-distro developer processes under `wsl:wsl2` group.
+    if !wsl_procs.is_empty() {
+        let id = ProjectId("wsl:wsl2".to_string());
+        if !is_hidden(&id, project_states) {
+            let pacc = proj_map.entry(id.clone()).or_insert_with(|| ProjectAcc {
+                name: "WSL2".to_string(),
+                root: None,
+                git_branch: None,
+                icon: None,
+                color: None,
+                jobs: Vec::new(),
+                procs: Vec::new(),
+                ports: Vec::new(),
+                cpu: 0.0,
+                ram: 0,
+                proc_count: 0,
+                has_non_compiler: true,
+            });
+            for wp in wsl_procs {
+                pacc.cpu += wp.cpu_percent;
+                pacc.ram = pacc.ram.saturating_add(wp.ram_bytes);
+                pacc.proc_count += 1;
+                pacc.jobs.push(Job {
+                    id: JobId(format!("wsl:{}:{}", wp.comm, wp.pid)),
+                    project: id.clone(),
+                    project_name: "WSL2".to_string(),
+                    title: format!("{} ({})", wp.comm, wp.pid),
+                    subtitle: wp.cmdline.clone(),
+                    icon: None,
+                    color: None,
+                    procs: Vec::new(),
+                    cpu: wp.cpu_percent,
+                    ram: wp.ram_bytes,
+                    ports: Vec::new(),
+                    uptime: 0,
+                    status: ProjectStatus::Healthy,
+                    last_log: Some(wp.cmdline.clone()),
+                    crash_summary: None,
+                    root: None,
+                    primary_key: ProcessKey::new(0, 0),
+                    match_hint: wp.comm.clone(),
+                    log_path: None,
+                    custom_command: None,
+                    is_watched: false,
+                    can_kill: false,
+                    can_restart: false,
+                });
+            }
+        }
     }
 
     let mut total_dev_cpu = 0.0f32;
@@ -720,7 +838,7 @@ pub(super) fn build_snapshot(
         let key_l = id.0.to_ascii_lowercase();
         st.pinned = pinned_keys.contains(&key_l);
         st.hidden = hidden_keys.contains(&key_l);
-        st.display_name_override = alias_keys.get(&id.0).cloned();
+        st.display_name_override = alias_keys.get(&key_l).cloned();
         st.last_known_name = pacc.name.clone();
         st.last_seen = Some(now);
         if pacc.root.is_some() {
@@ -739,7 +857,7 @@ pub(super) fn build_snapshot(
 
         let has_only_compilers = pacc.proc_count > 0 && !pacc.has_non_compiler;
         let mut high_load = false;
-        if pacc.cpu > 85.0 && !has_only_compilers {
+        if pacc.cpu > cpu_warn_percent && !has_only_compilers {
             high_load = true;
             let since = *st.high_cpu_since.get_or_insert(now);
             let dur = now.saturating_duration_since(since);
@@ -781,10 +899,10 @@ pub(super) fn build_snapshot(
             st.high_cpu_since = None;
         }
 
-        const TWO_GB: u64 = 2 * 1024 * 1024 * 1024;
+        let ram_threshold = ram_warn_bytes.max(256 * 1024 * 1024);
         match st.ram_baseline {
             Some((t0, base_ram)) if now.saturating_duration_since(t0) <= Duration::from_secs(30) => {
-                if pacc.ram > TWO_GB && base_ram > 0 && pacc.ram >= base_ram.saturating_mul(2) {
+                if pacc.ram > ram_threshold && base_ram > 0 && pacc.ram >= base_ram.saturating_mul(2) {
                     high_load = true;
                     let cooldown_ok = st
                         .last_mem_alert
@@ -913,6 +1031,7 @@ pub(super) fn build_snapshot(
         alerts: alerts.clone(),
         all_procs: Vec::new(),
         active_terminal: None,
+        port_ready_hint: None,
         last_action_error: None,
     }
 }

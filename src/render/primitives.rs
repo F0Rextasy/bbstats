@@ -9,14 +9,14 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     ID2D1DeviceContext, ID2D1Factory1, ID2D1Geometry, ID2D1LinearGradientBrush,
-    ID2D1RadialGradientBrush, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL, D2D1_BRUSH_PROPERTIES,
-    D2D1_BUFFER_PRECISION_8BPC_UNORM, D2D1_CAP_STYLE_ROUND,
+    ID2D1RadialGradientBrush, ID2D1SolidColorBrush, ID2D1StrokeStyle1,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE,
+    D2D1_ARC_SIZE_SMALL, D2D1_BRUSH_PROPERTIES, D2D1_BUFFER_PRECISION_8BPC_UNORM,
     D2D1_COLOR_INTERPOLATION_MODE_PREMULTIPLIED, D2D1_COLOR_SPACE_SRGB,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_ELLIPSE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_LAYER_OPTIONS1_NONE, D2D1_LAYER_PARAMETERS1,
     D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES,
-    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES1, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+    D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE,
 };
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, IDWriteTypography, DWRITE_TEXT_METRICS,
@@ -28,6 +28,7 @@ pub struct DrawCtx<'a> {
     pub d2d_factory: &'a ID2D1Factory1,
     pub dw_factory: &'a IDWriteFactory,
     pub tabular: &'a IDWriteTypography,
+    pub round_stroke: &'a ID2D1StrokeStyle1,
     brush: ID2D1SolidColorBrush,
     wide_buf: RefCell<Vec<u16>>,
 }
@@ -38,6 +39,7 @@ impl<'a> DrawCtx<'a> {
         d2d_factory: &'a ID2D1Factory1,
         dw_factory: &'a IDWriteFactory,
         tabular: &'a IDWriteTypography,
+        round_stroke: &'a ID2D1StrokeStyle1,
     ) -> windows::core::Result<Self> {
         // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         let brush = unsafe { dc.CreateSolidColorBrush(&BORDER_SUBTLE, None)? };
@@ -46,6 +48,7 @@ impl<'a> DrawCtx<'a> {
             d2d_factory,
             dw_factory,
             tabular,
+            round_stroke,
             brush,
             wide_buf: RefCell::new(Vec::with_capacity(128)),
         })
@@ -182,6 +185,7 @@ impl<'a> DrawCtx<'a> {
     }
 
     /// Executes `f()` under a scaled/translated layer with unified opacity (`opacity` in `0.0..=1.0`).
+    #[allow(clippy::too_many_arguments)]
     pub fn with_transformed_layer<F>(
         &self,
         offset_x: f32,
@@ -189,6 +193,8 @@ impl<'a> DrawCtx<'a> {
         scale_x: f32,
         scale_y: f32,
         opacity: f32,
+        bounds_w: f32,
+        bounds_h: f32,
         f: F,
     ) -> windows::core::Result<()>
     where
@@ -210,10 +216,10 @@ impl<'a> DrawCtx<'a> {
             let res = if opacity < 0.995 {
                 let params = D2D1_LAYER_PARAMETERS1 {
                     contentBounds: D2D_RECT_F {
-                        left: -2000.0,
-                        top: -2000.0,
-                        right: 4000.0,
-                        bottom: 4000.0,
+                        left: -16.0,
+                        top: -16.0,
+                        right: bounds_w.max(64.0) + 16.0,
+                        bottom: bounds_h.max(32.0) + 16.0,
                     },
                     geometricMask: ManuallyDrop::new(None),
                     maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
@@ -939,15 +945,9 @@ impl<'a> DrawCtx<'a> {
             sink.EndFigure(windows::Win32::Graphics::Direct2D::Common::D2D1_FIGURE_END_OPEN);
             sink.Close()?;
 
-            let stroke_props = D2D1_STROKE_STYLE_PROPERTIES1 {
-                startCap: D2D1_CAP_STYLE_ROUND,
-                endCap: D2D1_CAP_STYLE_ROUND,
-                ..Default::default()
-            };
-            let stroke_style = self.d2d_factory.CreateStrokeStyle(&stroke_props, None)?;
             let fill_brush = self.solid(fill_color);
             self.dc
-                .DrawGeometry(&arc_geo, fill_brush, thickness, &stroke_style);
+                .DrawGeometry(&arc_geo, fill_brush, thickness, self.round_stroke);
         }
         Ok(())
     }

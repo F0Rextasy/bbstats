@@ -1,4 +1,4 @@
-use super::rect;
+use super::{overall_status_dot_color, rect};
 use crate::config::AppConfig;
 use crate::model::{ProjectGroup, Snapshot};
 use crate::render::device::FontSet;
@@ -27,7 +27,8 @@ pub(super) fn render_hover_peek(
     let lang = cfg.language;
 
     // Minimal macOS popover header
-    ctx.draw_status_dot(18.0, 19.0, 3.8, ACCENT_LIVE, snap.total_jobs > 0)?;
+    let dot_col = overall_status_dot_color(snap);
+    ctx.draw_status_dot(18.0, 19.0, 3.8, dot_col, snap.total_jobs > 0 || dot_col != ACCENT_LIVE)?;
     let hdr = format!(
         "{} {} · {} {}",
         snap.total_jobs,

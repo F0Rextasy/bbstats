@@ -43,6 +43,30 @@ pub(super) fn status_color(status: ProjectStatus) -> D2D1_COLOR_F {
     }
 }
 
+pub(super) fn overall_status_dot_color(snap: &Snapshot) -> D2D1_COLOR_F {
+    let any_crashed = snap
+        .projects
+        .iter()
+        .flat_map(|p| p.jobs.iter())
+        .any(|j| j.status == ProjectStatus::Crashed)
+        || snap
+            .alerts
+            .iter()
+            .any(|a| !a.dismissed && matches!(a.kind, AlertKind::Crash { .. }));
+    if any_crashed {
+        return ACCENT_DANGER;
+    }
+    let any_warn = snap
+        .projects
+        .iter()
+        .any(|p| p.status == ProjectStatus::HighLoad)
+        || snap.alerts.iter().any(|a| !a.dismissed);
+    if any_warn {
+        return ACCENT_WARN;
+    }
+    ACCENT_LIVE
+}
+
 /// Computes `(color, intensity)` for the top-edge glass ambient glow from current health.
 pub fn status_ambient_glow(
     snap: &Snapshot,
@@ -223,7 +247,7 @@ pub fn render_ui(
                 let mut dummy_hits = HitMap::default();
                 let mut prev_state = state.clone();
                 prev_state.content_enter_t = 1.0;
-                ctx.with_transformed_layer(off_x, 0.0, fit_s, fit_s, out_a, || {
+                ctx.with_transformed_layer(off_x, 0.0, fit_s, fit_s, out_a, pw, ph, || {
                     render_mode_content(
                         ctx,
                         fonts,
@@ -250,7 +274,7 @@ pub fn render_ui(
                 };
                 let off_x = anchor_x(cfg.dock_position, w, tw * fit_s);
                 state.content_enter_t = if expanding { in_a } else { 1.0 };
-                ctx.with_transformed_layer(off_x, 0.0, fit_s, fit_s, in_a, || {
+                ctx.with_transformed_layer(off_x, 0.0, fit_s, fit_s, in_a, tw, th, || {
                     render_mode_content(
                         ctx,
                         fonts,

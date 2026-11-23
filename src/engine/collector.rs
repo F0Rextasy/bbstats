@@ -197,7 +197,17 @@ impl ProcessCollector {
             }
             by_pid
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(linux_ports) = collect_linux_proc_ports() {
+                return linux_ports;
+            }
+            let Some(stdout) = run_lsof_bounded(&["-iTCP", "-iUDP", "-P", "-n", "-F", "pPnT"]) else {
+                return HashMap::new();
+            };
+            parse_lsof_ports(&String::from_utf8_lossy(&stdout))
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
         {
             let Some(stdout) = run_lsof_bounded(&["-iTCP", "-iUDP", "-P", "-n", "-F", "pPnT"]) else {
                 return HashMap::new();
@@ -678,6 +688,134 @@ pub fn suggest_url_for_port(port: u16) -> Option<String> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn parse_proc_net_table(
+    text: &str,
+    proto: TransportProto,
+    is_ipv6: bool,
+) -> HashMap<u64, PortBinding> {
+    let mut by_inode = HashMap::new();
+    for line in text.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 10 {
+            continue;
+        }
+        let Some((addr_hex, port_hex)) = cols[1].rsplit_once(':') else {
+            continue;
+        };
+        let Ok(port) = u16::from_str_radix(port_hex, 16) else {
+            continue;
+        };
+        if port == 0 {
+            continue;
+        }
+        // State 0A = TCP_LISTEN. For UDP, state 07 = unconnected bound socket.
+        let state = cols[3];
+        if matches!(proto, TransportProto::Tcp) && !state.eq_ignore_ascii_case("0A") {
+            continue;
+        }
+        if matches!(proto, TransportProto::Udp) && port >= 49152 {
+            continue;
+        }
+        let Ok(inode) = cols[9].parse::<u64>() else {
+            continue;
+        };
+        if inode == 0 {
+            continue;
+        }
+        let scope = if is_ipv6 {
+            if addr_hex == "00000000000000000000000000000000" {
+                BindScope::AllInterfaces
+            } else if addr_hex == "00000000000000000000000001000000" {
+                BindScope::Localhost
+            } else {
+                BindScope::SpecificIp
+            }
+        } else if addr_hex == "00000000" {
+            BindScope::AllInterfaces
+        } else if addr_hex == "0100007F" {
+            BindScope::Localhost
+        } else {
+            BindScope::SpecificIp
+        };
+        by_inode.insert(
+            inode,
+            PortBinding {
+                port,
+                protocol: proto,
+                scope,
+                is_listening: true,
+                suggested_url: if matches!(proto, TransportProto::Tcp) {
+                    suggest_url_for_port(port)
+                } else {
+                    None
+                },
+            },
+        );
+    }
+    by_inode
+}
+
+#[cfg(target_os = "linux")]
+fn collect_linux_proc_ports() -> Option<HashMap<u32, PidNetworkInfo>> {
+    let mut inode_map: HashMap<u64, PortBinding> = HashMap::new();
+    let tcp_v4 = std::fs::read_to_string("/proc/net/tcp").ok()?;
+    inode_map.extend(parse_proc_net_table(&tcp_v4, TransportProto::Tcp, false));
+    if let Ok(tcp_v6) = std::fs::read_to_string("/proc/net/tcp6") {
+        inode_map.extend(parse_proc_net_table(&tcp_v6, TransportProto::Tcp, true));
+    }
+    if let Ok(udp_v4) = std::fs::read_to_string("/proc/net/udp") {
+        inode_map.extend(parse_proc_net_table(&udp_v4, TransportProto::Udp, false));
+    }
+    if let Ok(udp_v6) = std::fs::read_to_string("/proc/net/udp6") {
+        inode_map.extend(parse_proc_net_table(&udp_v6, TransportProto::Udp, true));
+    }
+    if inode_map.is_empty() {
+        return Some(HashMap::new());
+    }
+
+    let mut by_pid: HashMap<u32, PidNetworkInfo> = HashMap::with_capacity(32);
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(pid_str) = fname.to_str() else {
+            continue;
+        };
+        if !pid_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(link) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(link_str) = link.to_str() else {
+                continue;
+            };
+            if let Some(inode_s) = link_str
+                .strip_prefix("socket:[")
+                .and_then(|s| s.strip_suffix(']'))
+            {
+                if let Ok(inode) = inode_s.parse::<u64>() {
+                    if let Some(binding) = inode_map.get(&inode) {
+                        push_port_unique(by_pid.entry(pid).or_default(), binding.clone());
+                    }
+                }
+            }
+        }
+    }
+    for info in by_pid.values_mut() {
+        info.ports
+            .sort_by_key(|p| (p.port, matches!(p.protocol, TransportProto::Udp)));
+    }
+    Some(by_pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -710,5 +848,23 @@ TST=LISTEN
         let p2 = map.get(&5500).unwrap();
         assert_eq!(p2.ports[0].port, 8080);
         assert_eq!(p2.ports[0].scope, BindScope::AllInterfaces);
+    }
+
+    #[test]
+    fn parses_linux_proc_net_tcp_listening_inodes() {
+        let sample = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 424242 1 00000000 100 0 0 10 0
+   1: 00000000:1435 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 555555 1 00000000 100 0 0 10 0
+   2: 0100007F:9999 0100007F:0BB8 01 00000000:00000000 00:00000000 00000000  1000        0 666666 1 00000000 100 0 0 10 0
+";
+        let map = parse_proc_net_table(sample, TransportProto::Tcp, false);
+        assert_eq!(map.len(), 2);
+        let b1 = map.get(&424242).unwrap();
+        assert_eq!(b1.port, 3000);
+        assert_eq!(b1.scope, BindScope::Localhost);
+        let b2 = map.get(&555555).unwrap();
+        assert_eq!(b2.port, 5173);
+        assert_eq!(b2.scope, BindScope::AllInterfaces);
     }
 }

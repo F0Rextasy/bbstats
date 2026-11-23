@@ -5,7 +5,7 @@ use crate::render::device::FontSet;
 use crate::render::primitives::DrawCtx;
 use crate::render::theme::*;
 use crate::ui::hit_test::{HitAction, HitMap};
-use crate::ui::layout::{format_ram, format_uptime, PendingKill, UiState};
+use crate::ui::layout::{format_ram, format_uptime, PendingKill, TerminalLogFilter, UiState};
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 
 #[allow(clippy::too_many_arguments)]
@@ -374,7 +374,7 @@ pub(super) fn render_detail(
     };
 
     let pre_body_hits = hit_map.regions.len();
-    ctx.with_transformed_layer(slide_x, 0.0, 1.0, 1.0, body_alpha, || {
+    ctx.with_transformed_layer(slide_x, 0.0, 1.0, 1.0, body_alpha, w, h, || {
         render_detail_body(
             ctx,
             fonts,
@@ -550,7 +550,12 @@ fn render_detail_body<F: FnMut() -> u32>(
         })
         .unwrap_or_else(|| term_hdr.to_string());
     let show_live_btn = state.term_scroll_offset > 0.5;
-    let hdr_right = if show_live_btn { w - 196.0 } else { w - 134.0 };
+    let filters_w = 132.0; // All | Warn+ | Err | Open
+    let hdr_right = if show_live_btn {
+        w - 196.0 - filters_w
+    } else {
+        w - 134.0 - filters_w
+    };
     ctx.draw_text(
         &src_label,
         &fonts.section_hdr,
@@ -558,6 +563,60 @@ fn render_detail_body<F: FnMut() -> u32>(
         ACCENT_TEAL,
         true,
     )?;
+
+    let mut fx = hdr_right + 4.0;
+    let filters = [
+        (lang.pick("All", "Tümü"), TerminalLogFilter::All, 28.0),
+        (lang.pick("Warn", "Uyarı"), TerminalLogFilter::WarnAndError, 32.0),
+        (lang.pick("Err", "Hata"), TerminalLogFilter::ErrorOnly, 26.0),
+    ];
+    for (lbl, flt, fw) in filters {
+        let fr = rect(fx, y_cursor, fx + fw, y_cursor + 19.0);
+        let fid = next_id();
+        let active = state.term_filter == flt;
+        ctx.fill_rounded(
+            fr,
+            5.0,
+            if active {
+                ACCENT_INFO_BG
+            } else if state.hovered_hit_id == Some(fid) {
+                BG_ELEVATED_HOVER
+            } else {
+                BG_ELEVATED
+            },
+        )?;
+        ctx.draw_text(
+            lbl,
+            &fonts.micro_lbl,
+            fr,
+            if active { ACCENT_INFO } else { TEXT_SECONDARY },
+            false,
+        )?;
+        hit_map.push(fid, fr, HitAction::SetTerminalFilter(flt));
+        fx += fw + 3.0;
+    }
+
+    if active_job.and_then(|j| j.log_path.as_ref()).is_some() {
+        let open_btn = rect(fx, y_cursor, fx + 34.0, y_cursor + 19.0);
+        let oid = next_id();
+        ctx.fill_rounded(
+            open_btn,
+            5.0,
+            if state.hovered_hit_id == Some(oid) {
+                BG_ELEVATED_HOVER
+            } else {
+                BG_ELEVATED
+            },
+        )?;
+        ctx.draw_text(
+            lang.pick("Open", "Aç"),
+            &fonts.micro_lbl,
+            open_btn,
+            TEXT_SECONDARY,
+            false,
+        )?;
+        hit_map.push(oid, open_btn, HitAction::OpenTerminalLogFile);
+    }
 
     if show_live_btn {
         let live_btn = rect(w - 192.0, y_cursor, w - 134.0, y_cursor + 19.0);
@@ -639,43 +698,20 @@ fn render_detail_body<F: FnMut() -> u32>(
     let max_cols = ((term_box.right - term_box.left - 24.0) / 6.0)
         .floor()
         .max(40.0) as usize;
-    let mut wrapped_lines: Vec<(String, D2D1_COLOR_F)> = Vec::new();
-    for line in raw_term_lines {
-        let low = line.to_ascii_lowercase();
-        let has_ok_word = low
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|tok| tok == "ok");
-        let col = if low.contains("error")
-            || low.contains("fail")
-            || low.contains("exception")
-            || low.contains("traceback")
-        {
-            ACCENT_DANGER
-        } else if low.contains("warn") {
-            ACCENT_WARN
-        } else if low.contains("ready") || low.contains("listening") || has_ok_word {
-            ACCENT_LIVE
-        } else {
-            TEXT_PRIMARY
-        };
-        if line.chars().count() <= max_cols {
-            wrapped_lines.push((line.clone(), col));
-        } else {
-            let mut chunk = String::with_capacity(max_cols);
-            let mut col_cnt = 0usize;
-            for ch in line.chars() {
-                chunk.push(ch);
-                col_cnt += 1;
-                if col_cnt >= max_cols {
-                    wrapped_lines.push((std::mem::take(&mut chunk), col));
-                    col_cnt = 0;
-                }
-            }
-            if !chunk.is_empty() {
-                wrapped_lines.push((chunk, col));
-            }
-        }
+    let lines_sig = compute_term_lines_sig(raw_term_lines);
+    if state.term_cache.sig != lines_sig
+        || state.term_cache.max_cols != max_cols
+        || state.term_cache.filter != state.term_filter
+    {
+        rebuild_term_cache(
+            raw_term_lines,
+            max_cols,
+            state.term_filter,
+            lines_sig,
+            &mut state.term_cache,
+        );
     }
+    let wrapped_lines = &state.term_cache.wrapped;
 
     let line_h = 15.0_f32;
     let inner_h = (term_h - 12.0).max(20.0);
@@ -710,16 +746,17 @@ fn render_detail_body<F: FnMut() -> u32>(
         ctx.with_axis_clip(
             rect(term_box.left + 4.0, term_box.top + 4.0, term_box.right - 4.0, term_box.bottom - 4.0),
             || {
-                for (rev_idx, (line, col)) in wrapped_lines.iter().rev().enumerate() {
+                for (rev_idx, (line, sev)) in wrapped_lines.iter().rev().enumerate() {
                     let ly = bottom_y - (rev_idx as f32 + 1.0) * line_h;
                     if ly + line_h <= term_box.top + 2.0 || ly >= term_box.bottom - 2.0 {
                         continue;
                     }
+                    let col = severity_color(*sev);
                     ctx.draw_text(
                         line,
                         &fonts.term_line,
                         rect(term_box.left + 10.0, ly, text_right, ly + line_h),
-                        *col,
+                        col,
                         true,
                     )?;
                 }
@@ -954,5 +991,118 @@ fn render_detail_body<F: FnMut() -> u32>(
     })?;
 
     Ok(())
+}
+
+fn compute_term_lines_sig(lines: &[String]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    lines.len().hash(&mut h);
+    for l in lines {
+        l.hash(&mut h);
+    }
+    h.finish()
+}
+
+fn classify_term_line_severity(line: &str) -> u8 {
+    let low = line.to_ascii_lowercase();
+    if low.contains("error")
+        || low.contains("fail")
+        || low.contains("exception")
+        || low.contains("traceback")
+        || low.contains("panic")
+    {
+        3
+    } else if low.contains("warn") {
+        2
+    } else if low.contains("ready")
+        || low.contains("listening")
+        || low
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| tok == "ok")
+    {
+        1
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn severity_color(sev: u8) -> D2D1_COLOR_F {
+    match sev {
+        3 => ACCENT_DANGER,
+        2 => ACCENT_WARN,
+        1 => ACCENT_LIVE,
+        _ => TEXT_PRIMARY,
+    }
+}
+
+fn rebuild_term_cache(
+    raw_lines: &[String],
+    max_cols: usize,
+    filter: TerminalLogFilter,
+    sig: u64,
+    cache: &mut crate::ui::layout::TermRenderCache,
+) {
+    cache.sig = sig;
+    cache.max_cols = max_cols;
+    cache.filter = filter;
+    cache.wrapped.clear();
+    for line in raw_lines {
+        let sev = classify_term_line_severity(line);
+        let include = match filter {
+            TerminalLogFilter::All => true,
+            TerminalLogFilter::WarnAndError => sev >= 2,
+            TerminalLogFilter::ErrorOnly => sev >= 3,
+        };
+        if !include {
+            continue;
+        }
+        if line.chars().count() <= max_cols {
+            cache.wrapped.push((line.clone(), sev));
+        } else {
+            let mut chunk = String::with_capacity(max_cols);
+            let mut col_cnt = 0usize;
+            for ch in line.chars() {
+                chunk.push(ch);
+                col_cnt += 1;
+                if col_cnt >= max_cols {
+                    cache.wrapped.push((std::mem::take(&mut chunk), sev));
+                    col_cnt = 0;
+                }
+            }
+            if !chunk.is_empty() {
+                cache.wrapped.push((chunk, sev));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::layout::TermRenderCache;
+
+    #[test]
+    fn rebuild_term_cache_filters_by_severity_and_wraps_long_lines() {
+        let lines = vec![
+            "Server ready on :3000".to_string(),
+            "WARN: slow query detected".to_string(),
+            "ERROR: database connection failed".to_string(),
+        ];
+        let mut cache = TermRenderCache::default();
+        rebuild_term_cache(&lines, 40, TerminalLogFilter::All, 1, &mut cache);
+        assert_eq!(cache.wrapped.len(), 3);
+        assert_eq!(cache.wrapped[0].1, 1);
+        assert_eq!(cache.wrapped[1].1, 2);
+        assert_eq!(cache.wrapped[2].1, 3);
+
+        rebuild_term_cache(&lines, 40, TerminalLogFilter::WarnAndError, 1, &mut cache);
+        assert_eq!(cache.wrapped.len(), 2);
+
+        rebuild_term_cache(&lines, 10, TerminalLogFilter::ErrorOnly, 1, &mut cache);
+        assert!(cache.wrapped.len() >= 3);
+        assert!(cache.wrapped.iter().all(|(_, sev)| *sev == 3));
+    }
 }
 

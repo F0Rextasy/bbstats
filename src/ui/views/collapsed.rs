@@ -187,15 +187,26 @@ pub(super) fn render_collapsed(
 
     ctx.draw_vline(234.0, 7.0, h - 7.0)?;
 
-    // Module 4: System CPU mini readout
-    ctx.draw_text_hud(
-        &format!("S:{:.0}%", snap.system_cpu),
-        &fonts.row_secondary,
-        rect(240.0, 0.0, w - 8.0, h),
-        TEXT_SECONDARY,
-        true,
-        shadow,
-    )?;
+    // Module 4: System CPU mini readout OR transient :PORT Ready announcement
+    if let Some((port, _, _)) = snap.port_ready_hint {
+        ctx.draw_text_hud(
+            &format!(":{port} {} ↗", cfg.language.pick("Ready", "Hazır")),
+            &fonts.micro_lbl,
+            rect(236.0, 0.0, w - 6.0, h),
+            ACCENT_LIVE,
+            true,
+            shadow,
+        )?;
+    } else {
+        ctx.draw_text_hud(
+            &format!("S:{:.0}%", snap.system_cpu),
+            &fonts.row_secondary,
+            rect(240.0, 0.0, w - 8.0, h),
+            TEXT_SECONDARY,
+            true,
+            shadow,
+        )?;
+    }
 
     Ok(())
 }

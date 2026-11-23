@@ -66,6 +66,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_cpu_warn() -> f32 {
+    85.0
+}
+
+fn default_ram_warn_mb() -> u64 {
+    1536
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -82,6 +90,12 @@ pub struct AppConfig {
     pub hide_on_fullscreen: bool,
     #[serde(default = "default_true")]
     pub notify_on_crash: bool,
+    #[serde(default)]
+    pub wsl_bridge_enabled: bool,
+    #[serde(default = "default_cpu_warn")]
+    pub cpu_warn_percent: f32,
+    #[serde(default = "default_ram_warn_mb")]
+    pub ram_warn_mb: u64,
     pub hover_peek_delay_ms: u32,
     pub autostart: bool,
     pub hotkey: HotkeyPreset,
@@ -110,6 +124,9 @@ impl Default for AppConfig {
             glass_opacity: 0.88,
             hide_on_fullscreen: true,
             notify_on_crash: true,
+            wsl_bridge_enabled: false,
+            cpu_warn_percent: default_cpu_warn(),
+            ram_warn_mb: default_ram_warn_mb(),
             hover_peek_delay_ms: 190,
             autostart: false,
             hotkey: HotkeyPreset::AltShiftB,
@@ -222,6 +239,12 @@ impl AppConfig {
         cfg.hover_peek_delay_ms = cfg.hover_peek_delay_ms.clamp(80, 600);
         cfg.collapsed_poll_ms = cfg.collapsed_poll_ms.clamp(500, 30_000);
         cfg.expanded_poll_ms = cfg.expanded_poll_ms.clamp(250, 10_000);
+        cfg.cpu_warn_percent = if cfg.cpu_warn_percent.is_finite() {
+            cfg.cpu_warn_percent.clamp(50.0, 100.0)
+        } else {
+            default_cpu_warn()
+        };
+        cfg.ram_warn_mb = cfg.ram_warn_mb.clamp(256, 32_768);
         cfg
     }
 
@@ -234,6 +257,9 @@ impl AppConfig {
             job_order: self.job_order.clone(),
             sort_mode: self.sort_mode,
             language: self.language,
+            wsl_bridge_enabled: self.wsl_bridge_enabled,
+            cpu_warn_percent: self.cpu_warn_percent,
+            ram_warn_mb: self.ram_warn_mb,
         }
     }
 

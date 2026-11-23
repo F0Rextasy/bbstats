@@ -3,8 +3,8 @@
 use crate::render::theme::{FONT_DISPLAY, FONT_MONO, FONT_TABULAR, FONT_UI};
 use windows::core::{Interface, HSTRING};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Device, ID2D1Factory1, D2D1_FACTORY_OPTIONS,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1CreateFactory, ID2D1Device, ID2D1Factory1, ID2D1StrokeStyle1, D2D1_CAP_STYLE_ROUND,
+    D2D1_FACTORY_OPTIONS, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_STROKE_STYLE_PROPERTIES1,
 };
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_10_0,
@@ -29,6 +29,7 @@ pub struct RenderDevice {
     pub dxgi_device: IDXGIDevice3,
     pub d2d_factory: ID2D1Factory1,
     pub d2d_device: ID2D1Device,
+    pub round_stroke_style: ID2D1StrokeStyle1,
     pub dwrite_factory: IDWriteFactory,
     pub fonts: FontSet,
 }
@@ -64,6 +65,13 @@ impl RenderDevice {
         };
         // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         let d2d_device = unsafe { d2d_factory.CreateDevice(&dxgi_device)? };
+        let stroke_props = D2D1_STROKE_STYLE_PROPERTIES1 {
+            startCap: D2D1_CAP_STYLE_ROUND,
+            endCap: D2D1_CAP_STYLE_ROUND,
+            ..Default::default()
+        };
+        // SAFETY: `d2d_factory` is valid and stroke properties are initialized.
+        let round_stroke_style = unsafe { d2d_factory.CreateStrokeStyle(&stroke_props, None)? };
         // SAFETY: Initialized Direct2D/DirectWrite COM interfaces and valid parameters.
         let dwrite_factory: IDWriteFactory = unsafe {
             DWriteCreateFactory(windows::Win32::Graphics::DirectWrite::DWRITE_FACTORY_TYPE_SHARED)?
@@ -74,6 +82,7 @@ impl RenderDevice {
             dxgi_device,
             d2d_factory,
             d2d_device,
+            round_stroke_style,
             dwrite_factory,
             fonts,
         })
