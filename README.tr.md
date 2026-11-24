@@ -3,7 +3,7 @@
   <h1>bbstats</h1>
   <p><strong>Dynamic Island tarzı arka plan süreç ve geliştirici proje telemetri monitörü</strong></p>
   <p>
-    <a href="README.md">English</a> · <strong>Türkçe</strong> · <a href="CHANGELOG.md">Değişiklik Günlüğü</a> · <a href="SECURITY.md">Güvenlik</a> · <a href="CONTRIBUTING.md">Katkıda Bulun</a>
+    <a href="README.md">English</a> · <strong>Türkçe</strong> · <a href="CHANGELOG.md">Değişiklik Günlüğü</a> · <a href="SECURITY.md">Güvenlik</a> · <a href="CONTRIBUTING.md">Katkıda Bulun</a> · <a href="https://kreosus.com/f0rextasy">Kreosus ile Destek Ol</a>
   </p>
   <p>
     <img src="https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust" alt="Rust 1.88+" />
@@ -11,6 +11,7 @@
     <img src="https://img.shields.io/badge/macOS-arm64%20%26%20x86__64-34D399?logo=apple" alt="macOS Destekleniyor" />
     <img src="https://img.shields.io/badge/Linux-Terminal%20HUD-34D399?logo=linux" alt="Linux Destekleniyor" />
     <img src="https://img.shields.io/badge/Lisans-MIT-34D399" alt="MIT Lisansı" />
+    <a href="https://kreosus.com/f0rextasy"><img src="https://img.shields.io/badge/Kreosus-Destek%20Ol-E91E63" alt="Kreosus üzerinden destek ol" /></a>
   </p>
 </div>
 
@@ -246,3 +247,5 @@ hidden_projects = []
 Windows, macOS ve Linux platformlarındaki tüm katkılar memnuniyetle karşılanır! Katkı adımları için [`CONTRIBUTING.md`](CONTRIBUTING.md), gizlilik ve güvenlik bildirimi için [`SECURITY.md`](SECURITY.md) dosyalarına göz atabilirsiniz.
 
 Sürüm geçmişi için [`CHANGELOG.md`](CHANGELOG.md) dosyasına bakabilirsiniz. [MIT Lisansı](LICENSE) altında açık kaynaklıdır.
+
+`bbstats` günlük iş akışınızda işinize yarıyorsa açık kaynak geliştirmenin sürmesi için [Kreosus üzerinden destek olabilirsiniz](https://kreosus.com/f0rextasy).

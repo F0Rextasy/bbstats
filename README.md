@@ -3,7 +3,7 @@
   <h1>bbstats</h1>
   <p><strong>Dynamic Island background process &amp; developer project telemetry monitor</strong></p>
   <p>
-    <strong>English</strong> · <a href="README.tr.md">Türkçe</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="SECURITY.md">Security</a> · <a href="CONTRIBUTING.md">Contributing</a>
+    <strong>English</strong> · <a href="README.tr.md">Türkçe</a> · <a href="CHANGELOG.md">Changelog</a> · <a href="SECURITY.md">Security</a> · <a href="CONTRIBUTING.md">Contributing</a> · <a href="https://kreosus.com/f0rextasy">Support on Kreosus</a>
   </p>
   <p>
     <img src="https://img.shields.io/badge/Rust-1.88%2B-orange?logo=rust" alt="Rust 1.88+" />
@@ -11,6 +11,7 @@
     <img src="https://img.shields.io/badge/macOS-arm64%20%26%20x86__64-34D399?logo=apple" alt="macOS Supported" />
     <img src="https://img.shields.io/badge/Linux-Terminal%20HUD-34D399?logo=linux" alt="Linux Supported" />
     <img src="https://img.shields.io/badge/License-MIT-34D399" alt="MIT License" />
+    <a href="https://kreosus.com/f0rextasy"><img src="https://img.shields.io/badge/Kreosus-Support-E91E63" alt="Support on Kreosus" /></a>
   </p>
 </div>
 
@@ -246,3 +247,5 @@ Define custom naming rules, JSON PID/state file bindings (`pid_file`), workspace
 Contributions across Windows, macOS, and Linux are warmly welcome! Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) before opening a PR, and [`SECURITY.md`](SECURITY.md) for local privacy guarantees and vulnerability reporting.
 
 See the release history in [`CHANGELOG.md`](CHANGELOG.md). Licensed under the [MIT License](LICENSE).
+
+If `bbstats` helps your daily workflow, you can support ongoing open-source development on [Kreosus](https://kreosus.com/f0rextasy).
